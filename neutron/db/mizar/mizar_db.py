@@ -93,10 +93,7 @@ class Mizar_dbonly_mixin(base_services.WorkerBase):
                 original = self._get_vpc(context, id)
                 original['cidr'] = new['cidr']
 
-        router_db = self._update_router_db(context, id, r)
-        updated = self._make_router_dict(router_db)
-
-        return updated
+        return self.get_vpc(context, id)
 
     @db_api.retry_if_session_inactive()
     def get_vpc(self, context, id, fields=None):
@@ -107,39 +104,6 @@ class Mizar_dbonly_mixin(base_services.WorkerBase):
 @registry.has_registry_receivers
 class MizarRpcNotifierMixin(object):
     """Mixin class to add rpc notifier attribute to db_base_plugin_v2."""
-
-    @staticmethod
-    @registry.receives(resources.PORT, [events.AFTER_DELETE])
-    def _notify_routers_callback(resource, event, trigger, **kwargs):
-        context = kwargs['context']
-        router_ids = kwargs['router_ids']
-        l3plugin = directory.get_plugin(plugin_constants.L3)
-        if l3plugin:
-            l3plugin.notify_routers_updated(context, router_ids)
-        else:
-            LOG.debug('%s not configured', plugin_constants.L3)
-
-    @staticmethod
-    @registry.receives(resources.SUBNET, [events.AFTER_UPDATE])
-    def _notify_subnet_gateway_ip_update(resource, event, trigger, **kwargs):
-        l3plugin = directory.get_plugin(plugin_constants.L3)
-        if not l3plugin:
-            return
-        context = kwargs['context']
-        orig = kwargs['original_subnet']
-        updated = kwargs['subnet']
-        if orig['gateway_ip'] == updated['gateway_ip']:
-            return
-        network_id = updated['network_id']
-        subnet_id = updated['id']
-        query = context.session.query(models_v2.Port.device_id).filter_by(
-                    network_id=network_id,
-                    device_owner=DEVICE_OWNER_ROUTER_GW)
-        query = query.join(models_v2.Port.fixed_ips).filter(
-                    models_v2.IPAllocation.subnet_id == subnet_id)
-        router_ids = set(port.device_id for port in query)
-        for router_id in router_ids:
-            l3plugin.notify_router_updated(context, router_id)
 
     @staticmethod
     @registry.receives(resources.PORT, [events.AFTER_UPDATE])
@@ -157,44 +121,12 @@ class MizarRpcNotifierMixin(object):
             l3plugin.notify_router_updated(kwargs['context'],
                                            new_port['device_id'])
 
-    @staticmethod
-    @registry.receives(resources.SUBNETPOOL_ADDRESS_SCOPE,
-                       [events.AFTER_UPDATE])
-    def _notify_subnetpool_address_scope_update(resource, event,
-                                                trigger, payload=None):
-        context = payload.context
-        subnetpool_id = payload.resource_id
-
-        router_ids = l3_obj.RouterPort.get_router_ids_by_subnetpool(
-            context, subnetpool_id)
-
-        l3plugin = directory.get_plugin(plugin_constants.L3)
-        if l3plugin:
-            l3plugin.notify_routers_updated(context, router_ids)
-        else:
-            LOG.debug('%s not configured', plugin_constants.L3)
 
     @property
-    def l3_rpc_notifier(self):
-        if not hasattr(self, '_l3_rpc_notifier'):
-            self._l3_rpc_notifier = l3_rpc_agent_api.L3AgentNotifyAPI()
-        return self._l3_rpc_notifier
-
-    @l3_rpc_notifier.setter
-    def l3_rpc_notifier(self, value):
-        self._l3_rpc_notifier = value
-
-    def notify_router_updated(self, context, router_id,
-                              operation=None):
-        if router_id:
-            self.l3_rpc_notifier.routers_updated(
-                context, [router_id], operation)
-
-    def notify_routers_updated(self, context, router_ids,
-                               operation=None, data=None):
-        if router_ids:
-            self.l3_rpc_notifier.routers_updated(
-                context, router_ids, operation, data)
+    def mizar_rpc_notifier(self):
+        if not hasattr(self, '_mizar_rpc_notifier'):
+            self._mizar_rpc_notifier = l3_rpc_agent_api.L3AgentNotifyAPI()
+        return self._mizar_rpc_notifier
 
     def notify_router_deleted(self, context, router_id):
         self.l3_rpc_notifier.router_deleted(context, router_id)
