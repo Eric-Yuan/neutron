@@ -12,7 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from neutron_lib import constants as n_const
 import testtools
 import webob
@@ -112,7 +113,17 @@ class _TestMetadataProxyHandlerCacheMixin(object):
                 proxy.return_value = 'value'
 
                 retval = self.handler(req)
-                self.assertEqual(retval, 'value')
+                self.assertEqual('value', retval)
+
+    def test_call_skip_cache(self):
+        req = mock.Mock()
+        with mock.patch.object(self.handler,
+                               '_get_instance_and_tenant_id') as get_ids:
+            get_ids.return_value = ('instance_id', 'tenant_id')
+            with mock.patch.object(self.handler, '_proxy_request') as proxy:
+                proxy.return_value = webob.exc.HTTPNotFound()
+                self.handler(req)
+                get_ids.assert_called_with(req, skip_cache=True)
 
     def test_call_no_instance_match(self):
         req = mock.Mock()
@@ -129,7 +140,7 @@ class _TestMetadataProxyHandlerCacheMixin(object):
             get_ids.side_effect = Exception
             retval = self.handler(req)
             self.assertIsInstance(retval, webob.exc.HTTPInternalServerError)
-            self.assertEqual(len(self.log.mock_calls), 2)
+            self.assertEqual(2, len(self.log.mock_calls))
 
     def test_get_router_networks(self):
         router_id = 'router-id'
@@ -201,7 +212,8 @@ class _TestMetadataProxyHandlerCacheMixin(object):
             ports = self.handler._get_ports(remote_address, network_id,
                                             router_id)
             mock_get_ip_addr.assert_called_once_with(remote_address,
-                                                     networks)
+                                                     networks,
+                                                     skip_cache=False)
             self.assertFalse(mock_get_router_networks.called)
         self.assertEqual(expected, ports)
 
@@ -220,8 +232,10 @@ class _TestMetadataProxyHandlerCacheMixin(object):
                                   ) as mock_get_router_networks:
             ports = self.handler._get_ports(remote_address,
                                             router_id=router_id)
-            mock_get_router_networks.assert_called_once_with(router_id)
-            mock_get_ip_addr.assert_called_once_with(remote_address, networks)
+            mock_get_router_networks.assert_called_once_with(
+                router_id, skip_cache=False)
+            mock_get_ip_addr.assert_called_once_with(
+                remote_address, networks, skip_cache=False)
             self.assertEqual(expected, ports)
 
     def test_get_ports_no_id(self):
@@ -240,6 +254,9 @@ class _TestMetadataProxyHandlerCacheMixin(object):
         instance_id, tenant_id = self.handler._get_instance_and_tenant_id(req)
 
         expected = []
+
+        if networks and router_id:
+            return (instance_id, tenant_id)
 
         if router_id:
             expected.append(
@@ -276,10 +293,10 @@ class _TestMetadataProxyHandlerCacheMixin(object):
         ]
 
         self.assertEqual(
+            ('device_id', 'tenant_id'),
             self._get_instance_and_tenant_id_helper(headers, ports,
                                                     networks=networks,
-                                                    router_id=router_id),
-            ('device_id', 'tenant_id')
+                                                    router_id=router_id)
         )
 
     def test_get_instance_id_router_id_no_match(self):
@@ -294,10 +311,10 @@ class _TestMetadataProxyHandlerCacheMixin(object):
             []
         ]
         self.assertEqual(
+            (None, None),
             self._get_instance_and_tenant_id_helper(headers, ports,
                                                     networks=networks,
-                                                    router_id=router_id),
-            (None, None)
+                                                    router_id=router_id)
         )
 
     def test_get_instance_id_network_id(self):
@@ -313,9 +330,9 @@ class _TestMetadataProxyHandlerCacheMixin(object):
         ]
 
         self.assertEqual(
+            ('device_id', 'tenant_id'),
             self._get_instance_and_tenant_id_helper(headers, ports,
-                                                    networks=('the_id',)),
-            ('device_id', 'tenant_id')
+                                                    networks=('the_id',))
         )
 
     def test_get_instance_id_network_id_no_match(self):
@@ -327,9 +344,31 @@ class _TestMetadataProxyHandlerCacheMixin(object):
         ports = [[]]
 
         self.assertEqual(
+            (None, None),
             self._get_instance_and_tenant_id_helper(headers, ports,
-                                                    networks=('the_id',)),
-            (None, None)
+                                                    networks=('the_id',))
+        )
+
+    def test_get_instance_id_network_id_and_router_id_invalid(self):
+        network_id = 'the_nid'
+        router_id = 'the_rid'
+        headers = {
+            'X-Neutron-Network-ID': network_id,
+            'X-Neutron-Router-ID': router_id
+        }
+
+        # The call should never do a port lookup, but mock it to verify
+        ports = [
+            [{'device_id': 'device_id',
+              'tenant_id': 'tenant_id',
+              'network_id': network_id}]
+        ]
+
+        self.assertEqual(
+            (None, None),
+            self._get_instance_and_tenant_id_helper(headers, ports,
+                                                    networks=(network_id,),
+                                                    router_id=router_id)
         )
 
     def _proxy_request_test_helper(self, response_code=200, method='GET'):
@@ -366,13 +405,13 @@ class _TestMetadataProxyHandlerCacheMixin(object):
 
     def test_proxy_request_post(self):
         response = self._proxy_request_test_helper(method='POST')
-        self.assertEqual(response.content_type, "text/plain")
-        self.assertEqual(response.body, 'content')
+        self.assertEqual('text/plain', response.content_type)
+        self.assertEqual('content', response.body)
 
     def test_proxy_request_200(self):
         response = self._proxy_request_test_helper(200)
-        self.assertEqual(response.content_type, "text/plain")
-        self.assertEqual(response.body, 'content')
+        self.assertEqual('text/plain', response.content_type)
+        self.assertEqual('content', response.body)
 
     def test_proxy_request_400(self):
         self.assertIsInstance(self._proxy_request_test_helper(400),
@@ -400,8 +439,8 @@ class _TestMetadataProxyHandlerCacheMixin(object):
 
     def test_sign_instance_id(self):
         self.assertEqual(
-            self.handler._sign_instance_id('foo'),
-            '773ba44693c7553d6ee20f61ea5d2757a9a4f4a44d2841ae4e95b52e4cd62db4'
+            '773ba44693c7553d6ee20f61ea5d2757a9a4f4a44d2841ae4e95b52e4cd62db4',
+            self.handler._sign_instance_id('foo')
         )
 
 

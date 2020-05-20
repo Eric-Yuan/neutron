@@ -43,8 +43,11 @@ from neutron_lib.api.definitions import port_security as psec
 from neutron_lib.api.definitions import portbindings
 from neutron_lib.api.definitions import portbindings_extended as pbe_ext
 from neutron_lib.api.definitions import provider_net
+from neutron_lib.api.definitions import rbac_address_scope
 from neutron_lib.api.definitions import rbac_security_groups as rbac_sg_apidef
+from neutron_lib.api.definitions import rbac_subnetpool
 from neutron_lib.api.definitions import security_groups_port_filtering
+from neutron_lib.api.definitions import stateful_security_group
 from neutron_lib.api.definitions import subnet as subnet_def
 from neutron_lib.api.definitions import subnet_onboard as subnet_onboard_def
 from neutron_lib.api.definitions import subnetpool_prefix_ops \
@@ -180,7 +183,9 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
     _supported_extension_aliases = [provider_net.ALIAS,
                                     external_net.ALIAS, portbindings.ALIAS,
                                     "quotas", "security-group",
+                                    rbac_address_scope.ALIAS,
                                     rbac_sg_apidef.ALIAS,
+                                    rbac_subnetpool.ALIAS,
                                     agent_apidef.ALIAS,
                                     dhcpagentscheduler.ALIAS,
                                     multiprovidernet.ALIAS,
@@ -203,7 +208,8 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
                                     pbe_ext.ALIAS,
                                     agent_resources_synced.ALIAS,
                                     subnet_onboard_def.ALIAS,
-                                    subnetpool_prefix_ops_def.ALIAS]
+                                    subnetpool_prefix_ops_def.ALIAS,
+                                    stateful_security_group.ALIAS]
 
     # List of agent types for which all binding_failed ports should try to be
     # rebound when agent revive
@@ -1091,14 +1097,8 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
             # relationship can be updated.
             context.session.expire(db_network)
 
-            if (mtuw_apidef.MTU in net_data or
-                # NOTE(ihrachys) mtu may be null for existing networks,
-                # calculate and update it as needed; the conditional can be
-                # removed in Queens when we populate all mtu attributes and
-                # enforce it's not nullable on database level
-                    db_network.mtu is None):
-                db_network.mtu = self._get_network_mtu(db_network,
-                                                       validate=False)
+            if mtuw_apidef.MTU in net_data:
+                db_network.mtu = self._get_network_mtu(db_network)
                 # agents should now update all ports to reflect new MTU
                 need_network_update_notify = True
 
@@ -1150,9 +1150,7 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
     @db_api.retry_if_session_inactive()
     def get_networks(self, context, filters=None, fields=None,
                      sorts=None, limit=None, marker=None, page_reverse=False):
-        # NOTE(ihrachys) use writer manager to be able to update mtu
-        # TODO(ihrachys) remove in Queens when mtu is not nullable
-        with db_api.CONTEXT_WRITER.using(context):
+        with db_api.CONTEXT_READER.using(context):
             nets_db = super(Ml2Plugin, self)._get_networks(
                 context, filters, None, sorts, limit, marker, page_reverse)
 
@@ -1381,8 +1379,8 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
             self._portsec_ext_port_create_processing(context, result, port)
 
             # sgids must be got after portsec checked with security group
-            sgids = self._get_security_groups_on_port(context, port)
-            self._process_port_create_security_group(context, result, sgids)
+            sgs = self._get_security_groups_on_port(context, port)
+            self._process_port_create_security_group(context, result, sgs)
             network = self.get_network(context, result['network_id'])
             binding = db.add_port_binding(context, result['id'])
             mech_context = driver_context.PortContext(self, context, result,
@@ -1433,11 +1431,6 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
 
         return bound_context.current
 
-    def _ensure_security_groups_on_port(self, context, port_dict):
-        port_compat = {'port': port_dict}
-        sgids = self._get_security_groups_on_port(context, port_compat)
-        self._process_port_create_security_group(context, port_dict, sgids)
-
     @utils.transaction_guard
     @db_api.retry_if_session_inactive()
     def create_port_bulk(self, context, ports):
@@ -1472,7 +1465,6 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
                         const.PORT_STATUS_ACTIVE),
                     device_id=pdata.get('device_id'),
                     device_owner=pdata.get('device_owner'),
-                    security_group_ids=security_group_ids,
                     description=pdata.get('description'))
 
                 # Ensure that the networks exist.
@@ -1535,18 +1527,16 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
                                                  process_extensions=False)
                 port_dict[portbindings.HOST_ID] = pdata.get(
                     portbindings.HOST_ID)
-                port_compat = {'port': port_dict}
 
                 # Activities immediately post-port-creation
-                self.extension_manager.process_create_port(context, port_dict,
-                                                           db_port_obj)
+                self.extension_manager.process_create_port(context, pdata,
+                                                           port_dict)
                 self._portsec_ext_port_create_processing(context, port_dict,
-                                                         port_compat)
+                                                         port)
 
-                # Ensure the default security group is assigned, unless one was
-                # specifically requested
-                if security_group_ids is None:
-                    self._ensure_security_groups_on_port(context, port_dict)
+                sgs = self._get_security_groups_on_port(context, port)
+                self._process_port_create_security_group(context, port_dict,
+                                                         sgs)
 
                 # process port binding
                 binding = db.add_port_binding(context, port_dict['id'])
@@ -1562,7 +1552,7 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
                 # process allowed address pairs
                 db_port_obj[addr_apidef.ADDRESS_PAIRS] = (
                     self._process_create_allowed_address_pairs(
-                        context, port_compat,
+                        context, port_dict,
                         port_dict.get(addr_apidef.ADDRESS_PAIRS)))
 
                 # handle DHCP setup
@@ -1590,13 +1580,6 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
         # Perform actions after the transaction is committed
         completed_ports = []
         for port in port_data:
-            # Ensure security groups are assigned to the port, if
-            # specifically requested
-            port_dict = port['port_dict']
-            if port_dict.get('security_group_ids') is not None:
-                with db_api.CONTEXT_WRITER.using(context):
-                    self._ensure_security_groups_on_port(context, port_dict)
-
             resource_extend.apply_funcs('ports',
                                         port['port_dict'],
                                         port['port_obj'].db_obj)
@@ -1965,10 +1948,7 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
     @db_api.retry_if_session_inactive(context_var_name='plugin_context')
     def get_bound_port_context(self, plugin_context, port_id, host=None,
                                cached_networks=None):
-        # NOTE(ihrachys) use writer manager to be able to update mtu when
-        # fetching network
-        # TODO(ihrachys) remove in Queens+ when mtu is not nullable
-        with db_api.CONTEXT_WRITER.using(plugin_context) as session:
+        with db_api.CONTEXT_READER.using(plugin_context) as session:
             try:
                 port_db = (session.query(models_v2.Port).
                            enable_eagerloads(False).
@@ -2022,10 +2002,7 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
     @db_api.retry_if_session_inactive(context_var_name='plugin_context')
     def get_bound_ports_contexts(self, plugin_context, dev_ids, host=None):
         result = {}
-        # NOTE(ihrachys) use writer manager to be able to update mtu when
-        # fetching network
-        # TODO(ihrachys) remove in Queens+ when mtu is not nullable
-        with db_api.CONTEXT_WRITER.using(plugin_context):
+        with db_api.CONTEXT_READER.using(plugin_context):
             dev_to_full_pids = db.partial_port_ids_to_full_ids(
                 plugin_context, dev_ids)
             # get all port objects for IDs
@@ -2057,9 +2034,9 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
                              port_id)
                     result[dev_id] = None
                     continue
-                levels = [l for l in port_db.binding_levels
-                          if l.host == bindlevelhost_match]
-                levels = sorted(levels, key=lambda l: l.level)
+                levels = [bl for bl in port_db.binding_levels
+                          if bl.host == bindlevelhost_match]
+                levels = sorted(levels, key=lambda bl: bl.level)
                 network_ctx = netctxs_by_netid.get(port_db.network_id)
                 port_context = driver_context.PortContext(
                     self, plugin_context, port, network_ctx, binding, levels)
@@ -2178,12 +2155,6 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
             self.mechanism_manager.update_port_postcommit(mech_context)
             kwargs = {'context': context, 'port': mech_context.current,
                       'original_port': original_port}
-            if status == const.PORT_STATUS_ACTIVE:
-                # NOTE(kevinbenton): this kwarg was carried over from
-                # the RPC handler that used to call this. it's not clear
-                # who uses it so maybe it can be removed. added in commit
-                # 3f3874717c07e2b469ea6c6fd52bcb4da7b380c7
-                kwargs['update_device_up'] = True
             registry.notify(resources.PORT, events.AFTER_UPDATE, self,
                             **kwargs)
 

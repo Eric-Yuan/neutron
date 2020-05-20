@@ -62,7 +62,7 @@ class ConfigFixture(config_fixtures.ConfigFileFixture):
 class NeutronConfigFixture(ConfigFixture):
 
     def __init__(self, env_desc, host_desc, temp_dir,
-                 connection, rabbitmq_environment):
+                 connection, rabbitmq_environment, use_local_apipaste=True):
         super(NeutronConfigFixture, self).__init__(
             env_desc, host_desc, temp_dir, base_filename='neutron.conf')
 
@@ -70,7 +70,6 @@ class NeutronConfigFixture(ConfigFixture):
             'DEFAULT': {
                 'host': self._generate_host(),
                 'state_path': self._generate_state_path(self.temp_dir),
-                'api_paste_config': self._generate_api_paste(),
                 'core_plugin': 'ml2',
                 'service_plugins': env_desc.service_plugins,
                 'auth_strategy': 'noauth',
@@ -96,6 +95,11 @@ class NeutronConfigFixture(ConfigFixture):
                 'log_agent_heartbeats': 'True',
             },
         })
+
+        if use_local_apipaste:
+            self.config['DEFAULT']['api_paste_config'] = (
+                self._generate_api_paste())
+
         policy_file = self._generate_policy_json()
         if policy_file:
             self.config['oslo_policy'] = {'policy_file': policy_file}
@@ -173,13 +177,13 @@ class ML2ConfigFixture(ConfigFixture):
                 'mechanism_drivers': mechanism_drivers,
             },
             'ml2_type_vlan': {
-                'network_vlan_ranges': PHYSICAL_NETWORK_NAME + ':1000:2999',
+                'network_vlan_ranges': PHYSICAL_NETWORK_NAME + ':1000:1029',
             },
             'ml2_type_gre': {
-                'tunnel_id_ranges': '1:1000',
+                'tunnel_id_ranges': '1:30',
             },
             'ml2_type_vxlan': {
-                'vni_ranges': '1001:2000',
+                'vni_ranges': '1001:1030',
             },
         })
 
@@ -204,6 +208,7 @@ class OVSConfigFixture(ConfigFixture):
                 'integration_bridge': self._generate_integration_bridge(),
                 'bridge_mappings': '%s:%s' % (PHYSICAL_NETWORK_NAME, ext_dev),
                 'of_inactivity_probe': '0',
+                'ovsdb_debug': 'True',
             },
             'securitygroup': {
                 'firewall_driver': host_desc.firewall_driver,
@@ -405,7 +410,9 @@ class L3ConfigFixture(ConfigFixture):
             'DEFAULT': {
                 'interface_driver': ('neutron.agent.linux.interface.'
                                      'OVSInterfaceDriver'),
-                'ovs_integration_bridge': integration_bridge,
+            },
+            'OVS': {
+                'integration_bridge': integration_bridge,
             }
         })
 
@@ -449,7 +456,9 @@ class DhcpConfigFixture(ConfigFixture):
         self.config.update({
             'DEFAULT': {
                 'interface_driver': 'openvswitch',
-                'ovs_integration_bridge': integration_bridge,
+            },
+            'OVS': {
+                'integration_bridge': integration_bridge,
             }
         })
 

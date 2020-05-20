@@ -15,12 +15,11 @@
 #
 
 import time
+from unittest import mock
 
-import mock
 from neutron_lib import constants as n_const
 from oslo_config import cfg
 from oslo_log import log
-import six
 
 from neutron.agent.common import ip_lib
 from neutron.agent.common import ovs_lib
@@ -29,13 +28,6 @@ from neutron.tests.unit.plugins.ml2.drivers.openvswitch.agent \
     import ovs_test_base
 from neutron.tests.unit.plugins.ml2.drivers.openvswitch.agent \
     import test_vlanmanager
-
-
-def nonzero(f):
-    if six.PY3:
-        return f.__bool__()
-    else:
-        return f.__nonzero__()
 
 
 # Useful global dummy variables.
@@ -88,6 +80,7 @@ class TunnelTest(object):
                              'neutron.agent.firewall.NoopFirewallDriver',
                              group='SECURITYGROUP')
         cfg.CONF.set_override('report_interval', 0, 'AGENT')
+        cfg.CONF.set_override('explicitly_egress_direct', True, 'AGENT')
 
         self.INT_BRIDGE = 'integration_bridge'
         self.TUN_BRIDGE = 'tunnel_bridge'
@@ -256,7 +249,7 @@ class TunnelTest(object):
             mock.call.create(secure_mode=True),
             mock.call.setup_controllers(mock.ANY),
             mock.call.port_exists('patch-int'),
-            nonzero(mock.call.port_exists()),
+            mock.ANY,
             mock.call.add_patch_port('patch-int', 'patch-tun'),
         ]
         self.mock_int_bridge_expected += [
@@ -583,8 +576,14 @@ class TunnelTest(object):
 
         self.mock_int_bridge_expected += [
             mock.call.check_canary_table(),
+            mock.call.deferred(full_ordered=True, use_bundle=True),
+            mock.call.deferred().__enter__(),
+            mock.call.deferred().__exit__(None, None, None),
             mock.call.cleanup_flows(),
-            mock.call.check_canary_table()
+            mock.call.check_canary_table(),
+            mock.call.deferred(full_ordered=True, use_bundle=True),
+            mock.call.deferred().__enter__(),
+            mock.call.deferred().__exit__(None, None, None),
         ]
         self.mock_map_tun_bridge_expected += [
             mock.call.cleanup_flows(),
@@ -712,7 +711,7 @@ class TunnelTestUseVethInterco(TunnelTest):
             mock.call.create(secure_mode=True),
             mock.call.setup_controllers(mock.ANY),
             mock.call.port_exists('patch-int'),
-            nonzero(mock.call.port_exists()),
+            mock.ANY,
             mock.call.add_patch_port('patch-int', 'patch-tun'),
         ]
         self.mock_int_bridge_expected += [
@@ -732,7 +731,7 @@ class TunnelTestUseVethInterco(TunnelTest):
         self.ipdevice_expected = [
             mock.call('int-%s' % self.MAP_TUN_BRIDGE),
             mock.call().exists(),
-            nonzero(mock.call().exists()),
+            mock.ANY,
             mock.call().link.delete()
         ]
         self.ipwrapper_expected = [

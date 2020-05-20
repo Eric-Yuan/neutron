@@ -14,8 +14,8 @@
 #    under the License.
 
 import copy
+from unittest import mock
 
-import mock
 import netaddr
 from neutron_lib import constants
 from neutron_lib import context as ncontext
@@ -406,7 +406,9 @@ class TestDbBasePluginIpam(test_db_base.NeutronDbPluginV2TestCase):
         mocks = self._prepare_mocks_with_pool_mock(pool_mock)
         cfg.CONF.set_override('ipv6_pd_enabled', True)
         cidr = constants.PROVISIONAL_IPV6_PD_PREFIX
-        allocation_pools = [netaddr.IPRange('::2', '::ffff:ffff:ffff:ffff')]
+        cidr_network = netaddr.IPNetwork(cidr)
+        allocation_pools = [netaddr.IPRange(cidr_network.ip + 1,
+                                            cidr_network.last)]
         with self.subnet(cidr=None, ip_version=constants.IP_VERSION_6,
                          subnetpool_id=constants.IPV6_PD_POOL_ID,
                          ipv6_ra_mode=constants.IPV6_SLAAC,
@@ -689,7 +691,8 @@ class TestDbBasePluginIpam(test_db_base.NeutronDbPluginV2TestCase):
         mocks['driver'].get_address_request_factory.assert_called_once_with()
         mocks['ipam']._ipam_get_subnets.assert_called_once_with(
             context, network_id=port_dict['network_id'], fixed_configured=True,
-            host=None, service_type=port_dict['device_owner'])
+            fixed_ips=[ip_dict], host=None,
+            service_type=port_dict['device_owner'])
         # Validate port_dict is passed into address_factory
         address_factory.get_request.assert_called_once_with(context,
                                                             port_dict,

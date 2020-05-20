@@ -14,15 +14,14 @@
 #    under the License.
 
 import copy
-import functools
 from itertools import chain as iter_chain
 from itertools import combinations as iter_combinations
 import os
 import pwd
+from unittest import mock
 
 import eventlet
 import fixtures
-import mock
 import netaddr
 from neutron_lib.agent import constants as agent_consts
 from neutron_lib.api.definitions import portbindings
@@ -2750,35 +2749,59 @@ class TestBasicRouterOperations(BasicRouterOperationsFramework):
         self._test_process_routers_update_rpc_timeout(ext_net_call=True,
                                                       ext_net_call_failed=True)
 
-    @mock.patch.object(pd, 'remove_router')
-    def _test_process_routers_update_router_deleted(self, remove_router,
-                                                    error=False):
+    def test_process_routers_update_router_update(self):
         agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
         agent._queue = mock.Mock()
         update = mock.Mock()
         update.resource = None
-        update.action = 1  # ROUTER_DELETED
+        update.action = l3_agent.ADD_UPDATE_ROUTER
         router_info = mock.MagicMock()
         agent.router_info[update.id] = router_info
         router_processor = mock.Mock()
         agent._queue.each_update_to_next_resource.side_effect = [
             [(router_processor, update)]]
         agent._resync_router = mock.Mock()
+        agent._safe_router_removed = mock.Mock()
+        agent.plugin_rpc = mock.MagicMock()
+        agent.plugin_rpc.get_routers.side_effect = (
+            Exception("Failed to get router info"))
+        # start test
+        agent._process_router_update()
+        router_info.delete.assert_not_called()
+        self.assertFalse(router_info.delete.called)
+        self.assertTrue(agent.router_info)
+        self.assertTrue(agent._resync_router.called)
+        self.assertFalse(agent._safe_router_removed.called)
+
+    def _test_process_routers_update_router_deleted(self,
+                                                    error=False):
+        agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
+        agent._queue = mock.Mock()
+        update = mock.Mock()
+        update.resource = None
+        update.action = l3_agent.DELETE_ROUTER
+        router_info = mock.MagicMock()
+        agent.router_info[update.id] = router_info
+        router_processor = mock.Mock()
+        agent._queue.each_update_to_next_resource.side_effect = [
+            [(router_processor, update)]]
+        agent._resync_router = mock.Mock()
+        agent._safe_router_removed = mock.Mock()
         if error:
-            agent._safe_router_removed = mock.Mock()
             agent._safe_router_removed.return_value = False
         agent._process_router_update()
         if error:
             self.assertFalse(router_processor.fetched_and_processed.called)
             agent._resync_router.assert_called_with(update)
-            self.assertFalse(remove_router.called)
+            self.assertTrue(agent._safe_router_removed.called)
         else:
-            router_info.delete.assert_called_once_with()
-            self.assertFalse(agent.router_info)
+            router_info.delete.assert_not_called()
+            self.assertFalse(router_info.delete.called)
+            self.assertTrue(agent.router_info)
             self.assertFalse(agent._resync_router.called)
             router_processor.fetched_and_processed.assert_called_once_with(
                 update.timestamp)
-            self.assertTrue(remove_router.called)
+            self.assertTrue(agent._safe_router_removed.called)
 
     def test_process_routers_update_router_deleted_success(self):
         self._test_process_routers_update_router_deleted()
@@ -3974,11 +3997,25 @@ class TestBasicRouterOperations(BasicRouterOperationsFramework):
         ri.remove_floating_ip.assert_called_once_with(
             device, need_to_remove_fip[0]['cidr'])
 
-    @mock.patch.object(functools, 'partial')
     @mock.patch.object(common_utils, 'load_interface_driver')
-    def test_interface_driver_init(self, load_driver_mock, funct_partial_mock):
-        agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
+    def test_interface_driver_init(self, load_driver_mock):
+        l3_agent.L3NATAgent(HOSTNAME, self.conf)
         load_driver_mock.assert_called_once_with(
                 self.conf, get_networks_callback=mock.ANY)
-        funct_partial_mock.assert_called_once_with(
-            self.plugin_api.get_networks, agent.context)
+
+    def test_stop_no_cleanup(self):
+        agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
+        router = mock.Mock()
+        agent.router_info[1] = router
+        agent.stop()
+        self.assertFalse(router.delete.called)
+
+    def test_stop_cleanup(self):
+        self.conf.set_override('cleanup_on_shutdown', True)
+        agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
+        router = mock.Mock()
+        agent.router_info[1] = router
+        self.assertFalse(agent._exiting)
+        agent.stop()
+        self.assertTrue(router.delete.called)
+        self.assertTrue(agent._exiting)

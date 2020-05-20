@@ -15,9 +15,8 @@
 
 import copy
 import functools
-import textwrap
+from unittest import mock
 
-import mock
 import netaddr
 from neutron_lib import constants
 from oslo_config import cfg
@@ -46,6 +45,39 @@ from neutron.tests.functional import base
 _uuid = uuidutils.generate_uuid
 
 OVS_INTERFACE_DRIVER = 'neutron.agent.linux.interface.OVSInterfaceDriver'
+
+KEEPALIVED_CONFIG = """\
+global_defs {
+    notification_email_from %(email_from)s
+    router_id %(router_id)s
+}
+vrrp_instance VR_1 {
+    state BACKUP
+    interface %(ha_device_name)s
+    virtual_router_id 1
+    priority 50
+    garp_master_delay 60
+    nopreempt
+    advert_int 2
+    track_interface {
+        %(ha_device_name)s
+    }
+    virtual_ipaddress {
+        169.254.0.1/24 dev %(ha_device_name)s
+    }
+    virtual_ipaddress_excluded {
+        %(floating_ip_cidr)s dev %(ex_device_name)s no_track
+        %(external_device_cidr)s dev %(ex_device_name)s no_track
+        %(internal_device_cidr)s dev %(internal_device_name)s no_track
+        %(ex_port_ipv6)s dev %(ex_device_name)s scope link no_track
+        %(int_port_ipv6)s dev %(internal_device_name)s scope link no_track
+    }
+    virtual_routes {
+        0.0.0.0/0 via %(default_gateway_ip)s dev %(ex_device_name)s no_track
+        8.8.8.0/24 via 19.4.4.4 no_track
+        %(extra_subnet_cidr)s dev %(ex_device_name)s scope link no_track
+    }
+}"""
 
 
 def get_ovs_bridge(br_name):
@@ -80,7 +112,7 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
         conf.set_override('interface_driver', self.INTERFACE_DRIVER)
 
         br_int = self.useFixture(net_helpers.OVSBridgeFixture()).bridge
-        conf.set_override('ovs_integration_bridge', br_int.br_name)
+        conf.set_override('integration_bridge', br_int.br_name, 'OVS')
 
         temp_dir = self.get_new_temp_dir()
         get_temp_file_path = functools.partial(self.get_temp_file_path,
@@ -100,7 +132,7 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
         return conf
 
     def _get_agent_ovs_integration_bridge(self, agent):
-        return get_ovs_bridge(agent.conf.ovs_integration_bridge)
+        return get_ovs_bridge(agent.conf.OVS.integration_bridge)
 
     def generate_router_info(self, enable_ha,
                              ip_version=constants.IP_VERSION_4,
@@ -364,7 +396,7 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
         def new_ovs_plug(self, *args, **kwargs):
             original_plug_new(self, *args, **kwargs)
             bridge = (kwargs.get('bridge') or args[4] or
-                      self.conf.ovs_integration_bridge)
+                      self.conf.OVS.integration_bridge)
             device_name = kwargs.get('device_name') or args[2]
             ovsbr = ovs_lib.OVSBridge(bridge)
             ovsbr.clear_db_attribute('Port', device_name, 'tag')
@@ -442,38 +474,7 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
             router.get_floating_ips()[0]['floating_ip_address'])
         default_gateway_ip = external_port['subnets'][0].get('gateway_ip')
         extra_subnet_cidr = external_port['extra_subnets'][0].get('cidr')
-        return textwrap.dedent("""\
-            global_defs {
-                notification_email_from %(email_from)s
-                router_id %(router_id)s
-            }
-            vrrp_instance VR_1 {
-                state BACKUP
-                interface %(ha_device_name)s
-                virtual_router_id 1
-                priority 50
-                garp_master_delay 60
-                nopreempt
-                advert_int 2
-                track_interface {
-                    %(ha_device_name)s
-                }
-                virtual_ipaddress {
-                    169.254.0.1/24 dev %(ha_device_name)s
-                }
-                virtual_ipaddress_excluded {
-                    %(floating_ip_cidr)s dev %(ex_device_name)s
-                    %(external_device_cidr)s dev %(ex_device_name)s
-                    %(internal_device_cidr)s dev %(internal_device_name)s
-                    %(ex_port_ipv6)s dev %(ex_device_name)s scope link
-                    %(int_port_ipv6)s dev %(internal_device_name)s scope link
-                }
-                virtual_routes {
-                    0.0.0.0/0 via %(default_gateway_ip)s dev %(ex_device_name)s
-                    8.8.8.0/24 via 19.4.4.4
-                    %(extra_subnet_cidr)s dev %(ex_device_name)s scope link
-                }
-            }""") % {
+        return KEEPALIVED_CONFIG % {
             'email_from': keepalived.KEEPALIVED_EMAIL_FROM,
             'router_id': keepalived.KEEPALIVED_ROUTER_ID,
             'ha_device_name': ha_device_name,
@@ -565,7 +566,7 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
             self.assertIn(extra_subnet, routes)
 
     def _assert_interfaces_deleted_from_ovs(self):
-        bridge = ovs_lib.OVSBridge(self.agent.conf.ovs_integration_bridge)
+        bridge = ovs_lib.OVSBridge(self.agent.conf.OVS.integration_bridge)
         self.assertFalse(bridge.get_port_name_list())
 
     def floating_ips_configured(self, router):
@@ -612,7 +613,7 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
         router1 = self._create_router(router_info, self.agent)
         self._add_fip(router1, '192.168.111.12')
 
-        r1_br = ip_lib.IPDevice(router1.driver.conf.ovs_integration_bridge)
+        r1_br = ip_lib.IPDevice(router1.driver.conf.OVS.integration_bridge)
         r1_br.addr.add('19.4.4.1/24')
         r1_br.link.set_up()
 
@@ -622,7 +623,7 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
                                             mac='22:22:22:22:22:22'))
         router2 = self._create_router(router_info_2, self.failover_agent)
 
-        r2_br = ip_lib.IPDevice(router2.driver.conf.ovs_integration_bridge)
+        r2_br = ip_lib.IPDevice(router2.driver.conf.OVS.integration_bridge)
         r2_br.addr.add('19.4.4.1/24')
         r2_br.link.set_up()
 
@@ -664,12 +665,12 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
 
     @staticmethod
     def fail_gw_router_port(router):
-        r_br = ip_lib.IPDevice(router.driver.conf.ovs_integration_bridge)
+        r_br = ip_lib.IPDevice(router.driver.conf.OVS.integration_bridge)
         r_br.link.set_down()
 
     @staticmethod
     def restore_gw_router_port(router):
-        r_br = ip_lib.IPDevice(router.driver.conf.ovs_integration_bridge)
+        r_br = ip_lib.IPDevice(router.driver.conf.OVS.integration_bridge)
         r_br.link.set_up()
 
     @classmethod

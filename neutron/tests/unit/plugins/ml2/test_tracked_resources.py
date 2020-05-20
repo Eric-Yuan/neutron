@@ -10,7 +10,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from neutron_lib import context
 from neutron_lib import fixture
 from oslo_utils import uuidutils
@@ -56,7 +57,12 @@ class BaseTestEventHandler(object):
         get_sec_group_port_patch = mock.patch(
             'neutron.db.securitygroups_db.SecurityGroupDbMixin.'
             '_get_security_groups_on_port')
+
         get_sec_group_port_patch.start()
+        process_port_create_security_group_patch = mock.patch(
+            'neutron.db.securitygroups_db.SecurityGroupDbMixin.'
+            '_process_port_create_security_group')
+        process_port_create_security_group_patch.start()
         handler_patch = mock.patch(
             'neutron.quota.resource.TrackedResource._db_event_handler')
         self.handler_mock = handler_patch.start()

@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest import mock
 
-import mock
 from neutron_lib.api.definitions import portbindings
 from neutron_lib import constants
 from oslo_config import cfg
@@ -54,7 +54,7 @@ class TestSriovAgent(base.BaseTestCase):
                    'FixedIntervalLoopingCall',
                    new=MockFixedIntervalLoopingCall)
 
-        self.agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {})
+        self.agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {}, {})
 
     @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent.eswitch_manager"
                ".ESwitchManager.get_assigned_devices_info", return_value=set())
@@ -75,14 +75,8 @@ class TestSriovAgent(base.BaseTestCase):
         self.agent.scan_devices(set(), set())
         self.assertEqual(2, agent_conf['devices'])
 
-    @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent.pci_lib."
-                "PciDeviceIPWrapper.get_assigned_macs",
-                return_value=[(DEVICE_MAC, PCI_SLOT)])
-    @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent."
-                "eswitch_manager.PciOsWrapper.is_assigned_vf",
-                return_value=True)
     def test_treat_devices_removed_with_existed_device(self, *args):
-        agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {})
+        agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {}, {})
         devices = [(DEVICE_MAC, PCI_SLOT)]
         with mock.patch.object(agent.plugin_rpc,
                                "update_device_down") as fn_udd:
@@ -92,14 +86,8 @@ class TestSriovAgent(base.BaseTestCase):
             self.assertFalse(resync)
             self.assertTrue(fn_udd.called)
 
-    @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent.pci_lib."
-                "PciDeviceIPWrapper.get_assigned_macs",
-                return_value=[(DEVICE_MAC, PCI_SLOT)])
-    @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent."
-                "eswitch_manager.PciOsWrapper.is_assigned_vf",
-                return_value=True)
     def test_treat_devices_removed_with_not_existed_device(self, *args):
-        agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {})
+        agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {}, {})
         devices = [(DEVICE_MAC, PCI_SLOT)]
         with mock.patch.object(agent.plugin_rpc,
                                "update_device_down") as fn_udd:
@@ -112,14 +100,8 @@ class TestSriovAgent(base.BaseTestCase):
                 self.assertFalse(resync)
                 self.assertTrue(fn_udd.called)
 
-    @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent.pci_lib."
-                "PciDeviceIPWrapper.get_assigned_macs",
-                return_value=[(DEVICE_MAC, PCI_SLOT)])
-    @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent."
-                "eswitch_manager.PciOsWrapper.is_assigned_vf",
-                return_value=True)
     def test_treat_devices_removed_failed(self, *args):
-        agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {})
+        agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {}, {})
         devices = [(DEVICE_MAC, PCI_SLOT)]
         with mock.patch.object(agent.plugin_rpc,
                                "update_device_down") as fn_udd:
@@ -546,7 +528,7 @@ class TestSriovAgent(base.BaseTestCase):
     def test_configurations_has_rp_bandwidth(self):
         rp_bandwidth = {'ens7': {'egress': 10000, 'ingress': 10000}}
         agent = sriov_nic_agent.SriovNicSwitchAgent(
-            {}, {}, 0, rp_bandwidth, {})
+            {}, {}, 0, rp_bandwidth, {}, {})
         self.assertIn(constants.RP_BANDWIDTHS,
                       agent.agent_state['configurations'])
 
@@ -562,7 +544,7 @@ class TestSriovAgent(base.BaseTestCase):
             'reserved': 0
         }
         agent = sriov_nic_agent.SriovNicSwitchAgent(
-            {}, {}, 0, {}, rp_inventory_values)
+            {}, {}, 0, {}, rp_inventory_values, {})
         self.assertIn(constants.RP_INVENTORY_DEFAULTS,
                       agent.agent_state['configurations'])
 
@@ -706,7 +688,7 @@ class TestSRIOVAgentExtensionConfig(base.BaseTestCase):
     def test_report_loaded_extension(self, *args):
         with mock.patch.object(agent_rpc.PluginReportStateAPI,
                                'report_state') as mock_report_state:
-            agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {})
+            agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {}, {})
             agent._report_state()
             mock_report_state.assert_called_with(
                 agent.context, agent.agent_state)

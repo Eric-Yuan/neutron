@@ -10,16 +10,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import io
 import re
+import tokenize
 
-from flake8 import engine
-from hacking.tests import test_doctest as hacking_doctest
-import pkg_resources
-import pycodestyle
-import testscenarios
 import testtools
-from testtools import content
-from testtools import matchers
 
 from neutron.hacking import checks
 from neutron.tests import base
@@ -30,19 +25,16 @@ CREATE_DUMMY_MATCH_OBJECT = re.compile('a')
 
 class HackingTestCase(base.BaseTestCase):
 
-    def assertLinePasses(self, func, line):
+    def assertLinePasses(self, func, line, *args, **kwargs):
         with testtools.ExpectedException(StopIteration):
-            next(func(line))
+            next(func(line, *args, **kwargs))
 
-    def assertLineFails(self, func, line):
-        self.assertIsInstance(next(func(line)), tuple)
+    def assertLineFails(self, expected_code, func, line, *args, **kwargs):
+        value = next(func(line, *args, **kwargs))
+        self.assertIsInstance(value, tuple)
+        self.assertIn(expected_code, value[1])
 
     def test_assert_called_once_with(self):
-        fail_code1 = """
-               mock = Mock()
-               mock.method(1, 2, 3, test='wow')
-               mock.method.assert_called_once()
-               """
         fail_code2 = """
                mock = Mock()
                mock.method(1, 2, 3, test='wow')
@@ -68,9 +60,6 @@ class HackingTestCase(base.BaseTestCase):
                mock.method(1, 2, 3, test='wow')
                mock.method.assert_has_calls()
                """
-        self.assertEqual(
-            1, len(list(checks.check_assert_called_once_with(fail_code1,
-                                            "neutron/tests/test_assert.py"))))
         self.assertEqual(
             1, len(list(checks.check_assert_called_once_with(fail_code2,
                                             "neutron/tests/test_assert.py"))))
@@ -195,18 +184,6 @@ class HackingTestCase(base.BaseTestCase):
             0, len(list(checks.check_assertequal_for_httpcode(pass_code,
                                         "neutron/tests/test_assert.py"))))
 
-    def test_unittest_imports(self):
-        f = checks.check_unittest_imports
-
-        self.assertLinePasses(f, 'from unittest2')
-        self.assertLinePasses(f, 'import unittest2')
-        self.assertLinePasses(f, 'from unitest2 import case')
-        self.assertLinePasses(f, 'unittest2.TestSuite')
-
-        self.assertLineFails(f, 'from unittest import case')
-        self.assertLineFails(f, 'from unittest.TestSuite')
-        self.assertLineFails(f, 'import unittest')
-
     def test_check_no_imports_from_tests(self):
         fail_codes = ('from neutron import tests',
                       'from neutron.tests import base',
@@ -221,95 +198,75 @@ class HackingTestCase(base.BaseTestCase):
                     checks.check_no_imports_from_tests(
                         fail_code, "neutron/tests/test_fake.py", None))))
 
-    def test_check_python3_filter(self):
+    def test_check_python3_no_filter(self):
         f = checks.check_python3_no_filter
-        self.assertLineFails(f, "filter(lambda obj: test(obj), data)")
+        self.assertLineFails('N344', f, "filter(lambda obj: test(obj), data)")
         self.assertLinePasses(f, "[obj for obj in data if test(obj)]")
         self.assertLinePasses(f, "filter(function, range(0,10))")
         self.assertLinePasses(f, "lambda x, y: x+y")
 
+    def test_check_no_import_mock(self):
+        pass_line = 'from unittest import mock'
+        fail_lines = ('import mock',
+                      'import mock as mock_lib')
+        self.assertEqual(
+            0, len(list(
+                checks.check_no_import_mock(
+                    pass_line, "neutron/tests/test_fake.py", None))))
+        for fail_line in fail_lines:
+            self.assertEqual(
+                0, len(list(
+                    checks.check_no_import_mock(
+                        fail_line, "neutron/common/utils.py", None))))
+            self.assertEqual(
+                1, len(list(
+                    checks.check_no_import_mock(
+                        fail_line, "neutron/tests/test_fake.py", None))))
 
-# The following is borrowed from hacking/tests/test_doctest.py.
-# Tests defined in docstring is easier to understand
-# in some cases, for example, hacking rules which take tokens as argument.
+    def test_check_oslo_i18n_wrapper(self):
+        def _pass(line, filename, noqa=False):
+            self.assertLinePasses(
+                checks.check_oslo_i18n_wrapper,
+                line, filename, noqa)
 
-# TODO(amotoki): Migrate existing unit tests above to docstring tests.
-# NOTE(amotoki): Is it better to enhance HackingDocTestCase in hacking repo to
-# pass filename to pycodestyle.Checker so that we can reuse it in this test.
-# I am not sure whether unit test class is public.
+        def _fail(line, filename):
+            self.assertLineFails(
+                "N340", checks.check_oslo_i18n_wrapper,
+                line, filename, noqa=False)
 
-SELFTEST_REGEX = re.compile(r'\b(Okay|N\d{3})(\((\S+)\))?:\s(.*)')
+        _pass("from neutron._i18n import _", "neutron/foo/bar.py")
+        _pass("from neutron_fwaas._i18n import _", "neutron_fwaas/foo/bar.py")
+        _fail("from neutron.i18n import _", "neutron/foo/bar.py")
+        _fail("from neutron_fwaas.i18n import _", "neutron_fwaas/foo/bar.py")
+        _fail("from neutron.i18n import _", "neutron_fwaas/foo/bar.py")
+        _fail("from neutron._i18n import _", "neutron_fwaas/foo/bar.py")
+        _pass("from neutron.i18n import _", "neutron/foo/bar.py", noqa=True)
 
+    def test_check_builtins_gettext(self):
+        # NOTE: check_builtins_gettext() takes two additional arguments,
+        # "tokens" and "lines". "tokens" is a list of tokens from the target
+        # logical line, and "lines" is a list of lines of the input file.
+        # Considering this, test functions (_pass and _fail) take "lines"
+        # as an argument and calls the hacking check function line by line
+        # after generating tokens from the target line.
 
-# Each scenario is (name, dict(filename=..., lines=.., options=..., code=...))
-file_cases = []
+        def _get_tokens(line):
+            return tokenize.tokenize(io.BytesIO(line.encode('utf-8')).readline)
 
+        def _pass(lines, filename, noqa=False):
+            for line in lines:
+                self.assertLinePasses(
+                    checks.check_builtins_gettext,
+                    line, _get_tokens(line), filename, lines, noqa)
 
-class HackingDocTestCase(hacking_doctest.HackingTestCase):
+        def _fail(lines, filename):
+            for line in lines:
+                self.assertLineFails(
+                    "N341", checks.check_builtins_gettext,
+                    line, _get_tokens(line), filename, lines, noqa=False)
 
-    scenarios = file_cases
-
-    def test_pycodestyle(self):
-
-        # NOTE(jecarey): Add tests marked as off_by_default to enable testing
-        turn_on = set(['H106'])
-        if self.options.select:
-            turn_on.update(self.options.select)
-        self.options.select = tuple(turn_on)
-        self.options.ignore = ('N530',)
-
-        report = pycodestyle.BaseReport(self.options)
-        checker = pycodestyle.Checker(filename=self.filename, lines=self.lines,
-                               options=self.options, report=report)
-        checker.check_all()
-        self.addDetail('doctest', content.text_content(self.raw))
-        if self.code == 'Okay':
-            self.assertThat(
-                len(report.counters),
-                matchers.Not(matchers.GreaterThan(
-                    len(self.options.benchmark_keys))),
-                "incorrectly found %s" % ', '.join(
-                    [key for key in report.counters
-                     if key not in self.options.benchmark_keys]))
-        else:
-            self.addDetail('reason',
-                           content.text_content("Failed to trigger rule %s" %
-                                                self.code))
-            self.assertIn(self.code, report.counters)
-
-
-def _get_lines(check):
-    for line in check.__doc__.splitlines():
-        line = line.lstrip()
-        match = SELFTEST_REGEX.match(line)
-        if match is None:
-            continue
-        yield (line, match.groups())
-
-
-def load_tests(loader, tests, pattern):
-
-    default_checks = [e.name for e
-                      in pkg_resources.iter_entry_points('flake8.extension')]
-    flake8_style = engine.get_style_guide(
-        parse_argv=False,
-        # We are testing neutron-specific hacking rules, so there is no need
-        # to run the checks registered by hacking or other flake8 extensions.
-        ignore=default_checks)
-    options = flake8_style.options
-
-    for name, check in checks.__dict__.items():
-        if not hasattr(check, 'name'):
-            continue
-        if check.name != checks.__name__:
-            continue
-        if not check.__doc__:
-            continue
-        for (lineno, (raw, line)) in enumerate(_get_lines(check)):
-            code, __, filename, source = line
-            lines = [part.replace(r'\t', '\t') + '\n'
-                     for part in source.split(r'\n')]
-            file_cases.append(("%s-line-%s" % (name, lineno),
-                              dict(lines=lines, raw=raw, options=options,
-                                   code=code, filename=filename)))
-    return testscenarios.load_tests_apply_scenarios(loader, tests, pattern)
+        _pass(["from neutron._i18n import _", "_('foo')"], "neutron/foo.py")
+        _fail(["_('foo')"], "neutron/foo.py")
+        _pass(["_('foo')"], "neutron/_i18n.py")
+        _pass(["_('foo')"], "neutron/i18n.py")
+        _pass(["_('foo')"], "neutron/foo.py", noqa=True)

@@ -13,16 +13,18 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from neutron_lib import constants
-from neutron_lib import exceptions
 from oslo_utils import excutils
+from pyroute2.netlink import exceptions as pyroute2_exc
 
 from neutron.agent.common import ovs_lib
 from neutron.agent.linux import interface
 from neutron.agent.linux import ip_lib
 from neutron.common import utils
 from neutron.conf.agent import common as config
+from neutron.conf.plugins.ml2.drivers import ovs_conf
 from neutron.tests import base
 
 
@@ -60,6 +62,7 @@ class TestBase(base.BaseTestCase):
     def setUp(self):
         super(TestBase, self).setUp()
         self.conf = config.setup_conf()
+        ovs_conf.register_ovs_opts(self.conf)
         config.register_interface_opts(self.conf)
         self.ip_dev_p = mock.patch.object(ip_lib, 'IPDevice')
         self.ip_dev = self.ip_dev_p.start()
@@ -395,8 +398,8 @@ class TestOVSInterfaceDriver(TestBase):
     def test_plug_configured_bridge(self):
         br = 'br-v'
         self.conf.set_override('ovs_use_veth', False)
-        self.conf.set_override('ovs_integration_bridge', br)
-        self.assertEqual(self.conf.ovs_integration_bridge, br)
+        self.conf.set_override('integration_bridge', br, 'OVS')
+        self.assertEqual(self.conf.OVS.integration_bridge, br)
 
         def device_exists(dev, namespace=None):
             return dev == br
@@ -476,28 +479,28 @@ class TestOVSInterfaceDriver(TestBase):
                     reraise = mock.patch.object(
                         excutils, 'save_and_reraise_exception')
                     reraise.start()
-                    proEr = exceptions.ProcessExecutionError('', 2)
-                    processExecutionError = mock.Mock(side_effect=proEr)
-                    ip = self.ip.return_value
-                    ip.ensure_namespace.side_effect = processExecutionError
-                    ovs.plug_new(
-                        '01234567-1234-1234-99',
-                        'port-1234',
-                        'tap0',
-                        'aa:bb:cc:dd:ee:ff',
-                        bridge=bridge,
-                        namespace=namespace,
-                        prefix='veth',
-                        mtu=9000)
-                    delete_port.assert_called_once_with('tap0')
+                    ip_wrapper = mock.Mock()
+                    for exception in (OSError(),
+                                      pyroute2_exc.NetlinkError(22)):
+                        ip_wrapper.ensure_namespace.side_effect = exception
+                        self.ip.return_value = ip_wrapper
+                        delete_port.reset_mock()
+                        ovs.plug_new(
+                            '01234567-1234-1234-99',
+                            'port-1234',
+                            'tap0',
+                            'aa:bb:cc:dd:ee:ff',
+                            bridge=bridge,
+                            namespace=namespace,
+                            prefix='veth',
+                            mtu=9000)
+                        delete_port.assert_called_once_with('tap0')
 
-    def test_unplug(self, bridge=None):
-        if not bridge:
-            bridge = 'br-int'
+    def test_unplug(self):
         with mock.patch('neutron.agent.common.ovs_lib.OVSBridge') as ovs_br:
             ovs = interface.OVSInterfaceDriver(self.conf)
             ovs.unplug('tap0')
-            ovs_br.assert_has_calls([mock.call(bridge),
+            ovs_br.assert_has_calls([mock.call('br-int'),
                                      mock.call().delete_port('tap0')])
 
 
@@ -567,15 +570,14 @@ class TestOVSInterfaceDriverWithVeth(TestOVSInterfaceDriver):
             root_dev.assert_has_calls([mock.call.link.set_up()])
             ns_dev.assert_has_calls([mock.call.link.set_up()])
 
-    def test_plug_new(self, bridge=None, namespace=None):
+    def test_plug_new(self):
         # The purpose of test_plug_new in parent class(TestOVSInterfaceDriver)
         # is to test exception(exceptions.ProcessExecutionError), method here
         # would not go through that code, So just pass
         pass
 
-    def test_unplug(self, bridge=None):
-        if not bridge:
-            bridge = 'br-int'
+    def test_unplug(self):
+        bridge = 'br-int'
         with mock.patch('neutron.agent.common.ovs_lib.OVSBridge') as ovs_br:
             ovs = interface.OVSInterfaceDriver(self.conf)
             ovs.unplug('ns-0', bridge=bridge)

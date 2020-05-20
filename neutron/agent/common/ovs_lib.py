@@ -25,6 +25,7 @@ from neutron_lib import exceptions
 from neutron_lib.services.qos import constants as qos_constants
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import excutils
 from oslo_utils import uuidutils
 from ovsdbapp.backend.ovs_idl import idlutils
 
@@ -120,6 +121,7 @@ class BaseOVS(object):
     def __init__(self):
         self.ovsdb_timeout = cfg.CONF.OVS.ovsdb_timeout
         self.ovsdb = impl_idl.api_factory()
+        self._hw_offload = None
 
     def add_manager(self, connection_uri, timeout=_SENTINEL):
         """Have ovsdb-server listen for manager connections
@@ -200,6 +202,13 @@ class BaseOVS(object):
         _cfg = self.config
         return {k: _cfg.get(k, OVS_DEFAULT_CAPS[k]) for k in OVS_DEFAULT_CAPS}
 
+    @property
+    def is_hw_offload_enabled(self):
+        if self._hw_offload is None:
+            self._hw_offload = self.config.get('other_config',
+                                   {}).get('hw-offload', '').lower() == 'true'
+        return self._hw_offload
+
 
 # Map from version string to on-the-wire protocol version encoding:
 OF_PROTOCOL_TO_VERSION = {
@@ -229,6 +238,12 @@ class OVSBridge(BaseOVS):
         self._default_cookie = generate_random_cookie()
         self._highest_protocol_needed = constants.OPENFLOW10
         self._min_bw_qos_id = uuidutils.generate_uuid()
+        # TODO(jlibosva): Revert initial_protocols once launchpad bug 1852221
+        #                 is fixed and new openvswitch containing the fix is
+        #                 released.
+        self.initial_protocols = {
+            constants.OPENFLOW10, constants.OPENFLOW13, constants.OPENFLOW14}
+        self.initial_protocols.add(self._highest_protocol_needed)
 
     @property
     def default_cookie(self):
@@ -267,6 +282,7 @@ class OVSBridge(BaseOVS):
         self._highest_protocol_needed = max(self._highest_protocol_needed,
                                             protocol,
                                             key=version_from_protocol)
+        self.initial_protocols.add(self._highest_protocol_needed)
 
     def set_igmp_snooping_state(self, state):
         state = bool(state)
@@ -293,7 +309,8 @@ class OVSBridge(BaseOVS):
             # transactions
             txn.add(
                 self.ovsdb.db_add('Bridge', self.br_name,
-                                  'protocols', self._highest_protocol_needed))
+                                  'protocols',
+                                  *self.initial_protocols))
             txn.add(
                 self.ovsdb.db_set('Bridge', self.br_name,
                                   ('other_config', other_config)))
@@ -408,7 +425,7 @@ class OVSBridge(BaseOVS):
         strict = kwargs_list[0].get('strict', False)
 
         for kw in kwargs_list:
-            if action is 'del':
+            if action == 'del':
                 if kw.get('cookie') == COOKIE_ANY:
                     # special value COOKIE_ANY was provided, unset
                     # cookie to match flows whatever their cookie is
@@ -483,8 +500,8 @@ class OVSBridge(BaseOVS):
         return [f for f in self.run_ofctl("dump-flows", []).splitlines()
                 if is_a_flow_line(f)]
 
-    def deferred(self, **kwargs):
-        return DeferredOVSBridge(self, **kwargs)
+    def deferred(self, *args, **kwargs):
+        return DeferredOVSBridge(self, *args, **kwargs)
 
     def add_tunnel_port(self, port_name, remote_ip, local_ip,
                         tunnel_type=p_const.TYPE_GRE,
@@ -506,7 +523,11 @@ class OVSBridge(BaseOVS):
         options['local_ip'] = local_ip
         options['in_key'] = 'flow'
         options['out_key'] = 'flow'
-        options['egress_pkt_mark'] = '0'
+        # NOTE(moshele): pkt_mark is not upported when using ovs hw-offload,
+        # therefore avoid clear mark on encapsulating packets when it's
+        # enabled
+        if not self.is_hw_offload_enabled:
+            options['egress_pkt_mark'] = '0'
         if tunnel_csum:
             options['csum'] = str(tunnel_csum).lower()
         if tos:
@@ -1073,6 +1094,21 @@ class OVSBridge(BaseOVS):
             self.ovsdb.db_destroy('Queue', queue_id).execute(check_error=True)
         except idlutils.RowNotFound:
             LOG.info('OVS Queue %s was already deleted', queue_id)
+        except RuntimeError as exc:
+            with excutils.save_and_reraise_exception():
+                if 'referential integrity violation' not in str(exc):
+                    return
+                qos_regs = self._list_qos()
+                qos_uuids = []
+                for qos_reg in qos_regs:
+                    queue_nums = [num for num, q in qos_reg['queues'].items()
+                                  if q.uuid == queue_id]
+                    if queue_nums:
+                        qos_uuids.append(str(qos_reg['_uuid']))
+                LOG.error('Queue %(queue)s was still in use by the following '
+                          'QoS rules: %(qoses)s',
+                          {'queue': str(queue_id),
+                           'qoses': ', '.join(sorted(qos_uuids))})
 
     def _update_qos(self, qos_id=None, queues=None):
         queues = queues or {}

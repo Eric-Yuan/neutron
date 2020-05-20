@@ -13,7 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
+import netaddr
 from neutron_lib import constants as lib_const
 from neutron_lib import context
 from oslo_utils import uuidutils
@@ -274,7 +276,7 @@ class FipPortForwardingExtensionTestCase(PortForwardingExtensionBaseTestCase):
             self.portforwarding1.external_port,
             protocol=self.portforwarding1.protocol)
         mock_device.delete_addr_and_conntrack_state.assert_called_once_with(
-            str(self.portforwarding1.floating_ip_address))
+            str(netaddr.IPNetwork(self.portforwarding1.floating_ip_address)))
         fip_status = {
             self.portforwarding1.floatingip_id:
                 lib_const.FLOATINGIP_STATUS_DOWN}
@@ -312,25 +314,29 @@ class RouterFipPortForwardingMappingTestCase(base.BaseTestCase):
             external_port=1111, protocol='tcp', internal_port_id=_uuid(),
             internal_ip_address='1.1.1.1', internal_port=11111,
             floating_ip_address='111.111.111.111',
-            router_id=self.router1)
+            router_id=self.router1,
+            description='Some description')
         self.portforwarding2 = pf_obj.PortForwarding(
             context=None, id=_uuid(), floatingip_id=self.floatingip1,
             external_port=1112, protocol='tcp', internal_port_id=_uuid(),
             internal_ip_address='1.1.1.2', internal_port=11112,
             floating_ip_address='111.111.111.111',
-            router_id=self.router1)
+            router_id=self.router1,
+            description='Some description')
         self.portforwarding3 = pf_obj.PortForwarding(
             context=None, id=_uuid(), floatingip_id=self.floatingip2,
             external_port=1113, protocol='tcp', internal_port_id=_uuid(),
             internal_ip_address='1.1.1.3', internal_port=11113,
             floating_ip_address='111.222.111.222',
-            router_id=self.router1)
+            router_id=self.router1,
+            description=None)
         self.portforwarding4 = pf_obj.PortForwarding(
             context=None, id=_uuid(), floatingip_id=self.floatingip3,
             external_port=2222, protocol='tcp', internal_port_id=_uuid(),
             internal_ip_address='2.2.2.2', internal_port=22222,
             floating_ip_address='222.222.222.222',
-            router_id=self.router2)
+            router_id=self.router2,
+            description='')
         self.portforwardings_dict = {
             self.portforwarding1.id: self.portforwarding1,
             self.portforwarding2.id: self.portforwarding2,
@@ -376,6 +382,7 @@ class RouterFipPortForwardingMappingTestCase(base.BaseTestCase):
 
     def test_update_port_forwarding(self):
         self._set_pf()
+        description = 'Some description'
         new_pf1 = pf_obj.PortForwarding(
             context=None, id=self.portforwarding2.id,
             floatingip_id=self.floatingip1,
@@ -383,7 +390,8 @@ class RouterFipPortForwardingMappingTestCase(base.BaseTestCase):
             internal_port_id=self.portforwarding2.internal_port_id,
             internal_ip_address='1.1.1.22', internal_port=11122,
             floating_ip_address='111.111.111.111',
-            router_id=self.router1)
+            router_id=self.router1,
+            description=description)
         self.mapping.update_port_forwardings([new_pf1])
         self.assertEqual(
             new_pf1,

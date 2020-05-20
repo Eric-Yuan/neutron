@@ -17,13 +17,29 @@ from oslo_versionedobjects import fields as obj_fields
 
 from neutron.db.models import address_scope as models
 from neutron.db import models_v2
+from neutron.db import rbac_db_models
 from neutron.objects import base
+from neutron.objects import rbac
+from neutron.objects import rbac_db
+from neutron.objects import subnetpool
 
 
 @base.NeutronObjectRegistry.register
-class AddressScope(base.NeutronDbObject):
+class AddressScopeRBAC(rbac.RBACBaseObject):
     # Version 1.0: Initial version
     VERSION = '1.0'
+
+    db_model = rbac_db_models.AddressScopeRBAC
+
+
+@base.NeutronObjectRegistry.register
+class AddressScope(rbac_db.NeutronRbacObject):
+    # Version 1.0: Initial version
+    # Version 1.1: Add RBAC support
+    VERSION = '1.1'
+
+    # required by RbacNeutronMetaclass
+    rbac_db_cls = AddressScopeRBAC
 
     db_model = models.AddressScope
 
@@ -51,3 +67,10 @@ class AddressScope(base.NeutronDbObject):
             return cls._load_object(context, scope_model_obj)
 
         return None
+
+    @classmethod
+    def get_bound_tenant_ids(cls, context, obj_id):
+        snp_objs = subnetpool.SubnetPool.get_objects(
+            context, address_scope_id=obj_id
+        )
+        return {snp.project_id for snp in snp_objs}

@@ -56,10 +56,14 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
     @staticmethod
     def _gateway_ip_str(subnet, cidr_net):
         if subnet.get('gateway_ip') is const.ATTR_NOT_SPECIFIED:
-            if subnet.get('version') == const.IP_VERSION_6:
-                return str(netaddr.IPNetwork(cidr_net).network)
+            if subnet.get('ip_version') == const.IP_VERSION_6:
+                gateway_ip = netaddr.IPNetwork(cidr_net).network
+                pd_net = netaddr.IPNetwork(const.PROVISIONAL_IPV6_PD_PREFIX)
+                if gateway_ip == pd_net.network:
+                    return
             else:
-                return str(netaddr.IPNetwork(cidr_net).network + 1)
+                gateway_ip = netaddr.IPNetwork(cidr_net).network + 1
+            return str(gateway_ip)
         return subnet.get('gateway_ip')
 
     @staticmethod
@@ -232,14 +236,14 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
             if cidr.prefixlen == 0:
                 err_msg = _("0 is not allowed as CIDR prefix length")
                 raise exc.InvalidInput(error_message=err_msg)
-
         if cfg.CONF.allow_overlapping_ips:
-            subnet_list = network.subnets
+            subnet_list = [{'id': s.id, 'cidr': s.cidr}
+                           for s in network.subnets]
         else:
-            subnet_list = self._get_subnets(context)
+            subnet_list = subnet_obj.Subnet.get_subnet_cidrs(context)
         for subnet in subnet_list:
-            if ((netaddr.IPSet([subnet.cidr]) & new_subnet_ipset) and
-                    str(subnet.cidr) != const.PROVISIONAL_IPV6_PD_PREFIX):
+            if ((netaddr.IPSet([subnet['cidr']]) & new_subnet_ipset) and
+                    str(subnet['cidr']) != const.PROVISIONAL_IPV6_PD_PREFIX):
                 # don't give out details of the overlapping subnet
                 err_msg = ("Requested subnet with cidr: %(cidr)s for "
                            "network: %(network_id)s overlaps with another "
@@ -250,8 +254,8 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
                          "overlaps with subnet %(subnet_id)s "
                          "(CIDR: %(cidr)s)",
                          {'new_cidr': new_subnet_cidr,
-                          'subnet_id': subnet.id,
-                          'cidr': subnet.cidr})
+                          'subnet_id': subnet['id'],
+                          'cidr': subnet['cidr']})
                 raise exc.InvalidInput(error_message=err_msg)
 
     def _validate_network_subnetpools(self, network, subnet_ip_version,
@@ -642,15 +646,22 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
         return fixed_ip_list
 
     def _ipam_get_subnets(self, context, network_id, host, service_type=None,
-                          fixed_configured=False):
+                          fixed_configured=False, fixed_ips=None):
         """Return eligible subnets
 
         If no eligible subnets are found, determine why and potentially raise
         an appropriate error.
         """
         subnets = subnet_obj.Subnet.find_candidate_subnets(
-            context, network_id, host, service_type, fixed_configured)
+            context, network_id, host, service_type, fixed_configured,
+            fixed_ips)
         if subnets:
+            msg = ('This subnet is being modified by another concurrent '
+                   'operation')
+            for subnet in subnets:
+                subnet.lock_register(
+                    context, exc.SubnetInUse(subnet_id=subnet.id, reason=msg),
+                    id=subnet.id)
             subnet_dicts = [self._make_subnet_dict(subnet, context=context)
                             for subnet in subnets]
             # Give priority to subnets with service_types

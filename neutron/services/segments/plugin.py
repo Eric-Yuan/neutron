@@ -33,6 +33,7 @@ from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
 from neutron_lib import constants
 from neutron_lib.db import resource_extend
+from neutron_lib import exceptions as n_exc
 from neutron_lib.exceptions import placement as placement_exc
 from neutron_lib.placement import client as placement_client
 from neutron_lib.plugins import directory
@@ -43,9 +44,11 @@ from oslo_log import log
 from oslo_utils import excutils
 
 from neutron._i18n import _
+from neutron.common import ipv6_utils
 from neutron.extensions import segment
 from neutron.notifiers import batch_notifier
 from neutron.objects import network as net_obj
+from neutron.objects import ports as ports_obj
 from neutron.objects import subnet as subnet_obj
 from neutron.services.segments import db
 from neutron.services.segments import exceptions
@@ -131,6 +134,31 @@ class Plugin(db.SegmentDbMixin, segment.SegmentPluginBase):
                        "%s") % ", ".join(subnet_ids)
             raise exceptions.SegmentInUse(segment_id=segment_id,
                                           reason=reason)
+
+    @registry.receives(
+        resources.SUBNET, [events.PRECOMMIT_DELETE_ASSOCIATIONS])
+    def _validate_auto_address_subnet_delete(self, resource, event, trigger,
+                                             payload):
+        context = payload.context
+        subnet = subnet_obj.Subnet.get_object(context, id=payload.resource_id)
+        is_auto_addr_subnet = ipv6_utils.is_auto_address_subnet(subnet)
+        if not is_auto_addr_subnet or subnet.segment_id is None:
+            return
+
+        ports = ports_obj.Port.get_ports_allocated_by_subnet_id(context,
+                                                                subnet.id)
+        for port in ports:
+            fixed_ips = [f for f in port.fixed_ips if f.subnet_id != subnet.id]
+            if len(fixed_ips) != 0:
+                continue
+
+            LOG.info("Found port %(port_id)s, with IP auto-allocation "
+                     "only on subnet %(subnet)s which is associated with "
+                     "segment %(segment_id)s, cannot delete",
+                     {'port_id': port.id,
+                      'subnet': subnet.id,
+                      'segment_id': subnet.segment_id})
+            raise n_exc.SubnetInUse(subnet_id=subnet.id)
 
 
 class Event(object):
@@ -224,7 +252,7 @@ class NovaSegmentNotifier(object):
                 self.p_client.update_resource_provider_inventory(
                     event.segment_id, ipv4_inventory, IPV4_RESOURCE_CLASS)
                 return
-            except placement_exc.PlacementInventoryUpdateConflict:
+            except placement_exc.PlacementResourceProviderGenerationConflict:
                 LOG.debug('Re-trying to update Nova IPv4 inventory for '
                           'routed network segment: %s', event.segment_id)
         LOG.error('Failed to update Nova IPv4 inventory for routed '
@@ -268,10 +296,10 @@ class NovaSegmentNotifier(object):
             total += int(netaddr.IPAddress(pool['end']) -
                          netaddr.IPAddress(pool['start'])) + 1
         if total:
-            if subnet['gateway_ip']:
+            if subnet.get('gateway_ip'):
                 total += 1
                 reserved += 1
-            if subnet['enable_dhcp']:
+            if subnet.get('enable_dhcp'):
                 reserved += 1
         return total, reserved
 
@@ -553,7 +581,7 @@ class SegmentHostRoutes(object):
             if self._host_routes_need_update(host_routes, calc_host_routes):
                 LOG.debug(
                     "Updating host routes for subnet %s on routed network %s",
-                    (subnet.id, subnet.network_id))
+                    subnet.id, subnet.network_id)
                 plugin = directory.get_plugin()
                 plugin.update_subnet(context, subnet.id,
                                      {'subnet': {
@@ -573,7 +601,7 @@ class SegmentHostRoutes(object):
                 context=context,
                 ip_version=netaddr.IPNetwork(subnet['cidr']).version,
                 network_id=subnet['network_id'],
-                segment_id=subnet['segment_id'],
+                segment_id=segment_id,
                 host_routes=copy.deepcopy(host_routes),
                 gateway_ip=gateway_ip)
             if (not host_routes or
@@ -585,11 +613,14 @@ class SegmentHostRoutes(object):
     def host_routes_before_update(self, resource, event, trigger, **kwargs):
         context = kwargs['context']
         subnet, original_subnet = kwargs['request'], kwargs['original_subnet']
-        segment_id = subnet.get('segment_id', original_subnet['segment_id'])
-        gateway_ip = subnet.get('gateway_ip', original_subnet['gateway_ip'])
-        host_routes = subnet.get('host_routes', original_subnet['host_routes'])
-        if (segment_id and (host_routes != original_subnet['host_routes'] or
-                            gateway_ip != original_subnet['gateway_ip'])):
+        orig_segment_id = original_subnet.get('segment_id')
+        segment_id = subnet.get('segment_id', orig_segment_id)
+        orig_gateway_ip = original_subnet.get('gateway_ip')
+        gateway_ip = subnet.get('gateway_ip', orig_gateway_ip)
+        orig_host_routes = original_subnet.get('host_routes')
+        host_routes = subnet.get('host_routes', orig_host_routes)
+        if (segment_id and (host_routes != orig_host_routes or
+                            gateway_ip != orig_gateway_ip)):
             calc_host_routes = self._calculate_routed_network_host_routes(
                 context=context,
                 ip_version=netaddr.IPNetwork(original_subnet['cidr']).version,
@@ -597,8 +628,8 @@ class SegmentHostRoutes(object):
                 segment_id=segment_id,
                 host_routes=copy.deepcopy(host_routes),
                 gateway_ip=gateway_ip,
-                old_gateway_ip=original_subnet['gateway_ip'] if (
-                        gateway_ip != original_subnet['gateway_ip']) else None)
+                old_gateway_ip=orig_gateway_ip if (
+                        gateway_ip != orig_gateway_ip) else None)
             if self._host_routes_need_update(host_routes, calc_host_routes):
                 subnet['host_routes'] = calc_host_routes
 

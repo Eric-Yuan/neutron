@@ -76,6 +76,13 @@ DEFAULT_GW_PATTERN = re.compile(r"via (\S+)")
 METRIC_PATTERN = re.compile(r"metric (\S+)")
 DEVICE_NAME_PATTERN = re.compile(r"(\d+?): (\S+?):.*")
 
+# NOTE: no metric is interpreted by the kernel as having the highest priority
+# (value 0). "ip route" uses the netlink API to communicate with the kernel. In
+# IPv6, when the metric value is not set is translated as 1024 as default:
+# https://access.redhat.com/solutions/3659171
+IP_ROUTE_METRIC_DEFAULT = {constants.IP_VERSION_4: 0,
+                           constants.IP_VERSION_6: 1024}
+
 
 def remove_interface_suffix(interface):
     """Remove a possible "<if>@<endpoint>" suffix from an interface' name.
@@ -508,6 +515,10 @@ class IpLinkCommand(IpDeviceCommandBase):
     def attributes(self):
         return privileged.get_link_attributes(self.name,
                                               self._parent.namespace)
+
+    @property
+    def exists(self):
+        return privileged.interface_exists(self.name, self._parent.namespace)
 
 
 class IpAddrCommand(IpDeviceCommandBase):
@@ -946,8 +957,8 @@ def ensure_device_is_ready(device_name, namespace=None):
     dev = IPDevice(device_name, namespace=namespace)
     try:
         # Ensure the device has a MAC address and is up, even if it is already
-        # up. If the device doesn't exist, a RuntimeError will be raised.
-        if not dev.link.address:
+        # up.
+        if not dev.link.exists or not dev.link.address:
             LOG.error("Device %s cannot be used as it has no MAC "
                       "address", device_name)
             return False
@@ -1033,7 +1044,8 @@ def _arping(ns_name, iface_name, address, count, log_exception):
 
 
 def send_ip_addr_adv_notif(
-        ns_name, iface_name, address, count=3, log_exception=True):
+        ns_name, iface_name, address, count=3, log_exception=True,
+        use_eventlet=True):
     """Send advance notification of an IP address assignment.
 
     If the address is in the IPv4 family, send gratuitous ARP.
@@ -1051,12 +1063,18 @@ def send_ip_addr_adv_notif(
     :param log_exception: (Optional) True if possible failures should be logged
                           on exception level. Otherwise they are logged on
                           WARNING level. Default is True.
+    :param use_eventlet: (Optional) True if the arping command will be spawned
+                         using eventlet, False to use Python threads
+                         (threading).
     """
     def arping():
         _arping(ns_name, iface_name, address, count, log_exception)
 
     if count > 0 and netaddr.IPAddress(address).version == 4:
-        eventlet.spawn_n(arping)
+        if use_eventlet:
+            eventlet.spawn_n(arping)
+        else:
+            threading.Thread(target=arping).start()
 
 
 def sysctl(cmd, namespace=None, log_fail_as_error=True):
@@ -1497,6 +1515,8 @@ def list_ip_routes(namespace, ip_version, scope=None, via=None, table=None,
         else:
             cidr = constants.IP_ANY[ip_version]
         table = int(get_attr(route, 'RTA_TABLE'))
+        metric = (get_attr(route, 'RTA_PRIORITY') or
+                  IP_ROUTE_METRIC_DEFAULT[ip_version])
         value = {
             'table': IP_RULE_TABLES_NAMES.get(table, table),
             'source_prefix': get_attr(route, 'RTA_PREFSRC'),
@@ -1504,7 +1524,7 @@ def list_ip_routes(namespace, ip_version, scope=None, via=None, table=None,
             'scope': IP_ADDRESS_SCOPE[int(route['scope'])],
             'device': get_device(int(get_attr(route, 'RTA_OIF')), devices),
             'via': get_attr(route, 'RTA_GATEWAY'),
-            'priority': get_attr(route, 'RTA_PRIORITY'),
+            'metric': metric,
         }
 
         ret.append(value)

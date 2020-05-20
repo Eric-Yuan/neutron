@@ -230,11 +230,13 @@ class IpamPluggableBackend(ipam_backend_mixin.IpamBackendMixin):
         """
         p = port['port']
         fixed_configured = p['fixed_ips'] is not constants.ATTR_NOT_SPECIFIED
+        fixed_ips = p['fixed_ips'] if fixed_configured else []
         subnets = self._ipam_get_subnets(context,
                                          network_id=p['network_id'],
                                          host=p.get(portbindings.HOST_ID),
                                          service_type=p.get('device_owner'),
-                                         fixed_configured=fixed_configured)
+                                         fixed_configured=fixed_configured,
+                                         fixed_ips=fixed_ips)
 
         v4, v6_stateful, v6_stateless = self._classify_subnets(
             context, subnets)
@@ -345,7 +347,8 @@ class IpamPluggableBackend(ipam_backend_mixin.IpamBackendMixin):
         try:
             subnets = self._ipam_get_subnets(
                 context, network_id=port['network_id'], host=host,
-                service_type=port.get('device_owner'), fixed_configured=True)
+                service_type=port.get('device_owner'), fixed_configured=True,
+                fixed_ips=changes.add + changes.original)
         except ipam_exc.DeferIpam:
             subnets = []
 
@@ -527,6 +530,22 @@ class IpamPluggableBackend(ipam_backend_mixin.IpamBackendMixin):
             ipam_driver = driver.Pool.get_instance(None, context)
             factory = ipam_driver.get_address_request_factory()
             for port in ports:
+                # Find candidate subnets based on host_id and existing
+                # fixed_ips. This will filter subnets on other segments. Only
+                # allocate if this subnet is a valid candidate.
+                p = self._make_port_dict(port)
+                fixed_configured = (p['fixed_ips'] is not
+                                    constants.ATTR_NOT_SPECIFIED)
+                subnet_candidates = obj_subnet.Subnet.find_candidate_subnets(
+                    context,
+                    network_id,
+                    p.get(portbindings.HOST_ID),
+                    p.get('device_owner'),
+                    fixed_configured,
+                    p.get('fixed_ips'))
+                if subnet['id'] not in [s['id'] for s in subnet_candidates]:
+                    continue
+
                 ip = {'subnet_id': subnet['id'],
                       'subnet_cidr': subnet['cidr'],
                       'eui64_address': True,

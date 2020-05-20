@@ -25,6 +25,7 @@ DEFAULT_TUNNEL_TYPES = []
 
 ovs_opts = [
     cfg.StrOpt('integration_bridge', default='br-int',
+               deprecated_name='ovs_integration_bridge',
                help=_("Integration bridge to use. "
                       "Do not change this parameter unless you have a good "
                       "reason to. This is the name of the OVS integration "
@@ -76,6 +77,15 @@ ovs_opts = [
                        "placement nor report inventories against. An omitted "
                        "direction means we do not report an inventory for the "
                        "corresponding class.")),
+    cfg.DictOpt('resource_provider_hypervisors',
+                default={},
+                help=_("Mapping of bridges to hypervisors: "
+                       "<bridge>:<hypervisor>,... "
+                       "hypervisor name is used to locate the parent of the "
+                       "resource provider tree. Only needs to be set in the "
+                       "rare case when the hypervisor name is different from "
+                       "the DEFAULT.host config option value as known by the "
+                       "nova-compute managing that hypervisor.")),
     cfg.DictOpt('resource_provider_inventory_defaults',
                 default={'allocation_ratio': 1.0,
                          'min_unit': 1,
@@ -143,7 +153,11 @@ agent_opts = [
                        "Requires OVS 2.1 and ML2 l2population driver. "
                        "Allows the switch (when supporting an overlay) "
                        "to respond to an ARP request locally without "
-                       "performing a costly ARP broadcast into the overlay.")),
+                       "performing a costly ARP broadcast into the overlay. "
+                       "NOTE: If enable_distributed_routing is set to True "
+                       "then arp_responder will automatically be set to True "
+                       "in the agent, regardless of the setting in the config "
+                       "file.")),
     cfg.BoolOpt('dont_fragment', default=True,
                 help=_("Set or un-set the don't fragment (DF) bit on "
                        "outgoing IP packet carrying GRE/VXLAN tunnel.")),
@@ -157,9 +171,19 @@ agent_opts = [
                        "outgoing IP packet carrying GRE/VXLAN tunnel.")),
     cfg.BoolOpt('baremetal_smartnic', default=False,
                 help=_("Enable the agent to process Smart NIC ports.")),
+    cfg.BoolOpt('explicitly_egress_direct', default=False,
+                help=_("When set to True, the accepted egress unicast "
+                       "traffic will not use action NORMAL. The accepted "
+                       "egress packets will be taken care of in the final "
+                       "egress tables direct output flows for unicast "
+                       "traffic.")),
 ]
 
 
 def register_ovs_agent_opts(cfg=cfg.CONF):
     cfg.register_opts(ovs_opts, "OVS")
     cfg.register_opts(agent_opts, "AGENT")
+
+
+def register_ovs_opts(cfg=cfg.CONF):
+    cfg.register_opts(ovs_opts, "OVS")

@@ -16,8 +16,8 @@
 
 import contextlib
 import copy
+from unittest import mock
 
-import mock
 import netaddr
 from neutron_lib.api.definitions import dns as dns_apidef
 from neutron_lib.api.definitions import external_net as extnet_apidef
@@ -29,6 +29,7 @@ from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
 from neutron_lib import constants as lib_constants
 from neutron_lib import context
+from neutron_lib.db import api as db_api
 from neutron_lib.db import resource_extend
 from neutron_lib import exceptions as n_exc
 from neutron_lib.exceptions import l3 as l3_exc
@@ -258,8 +259,7 @@ class TestL3NatBasePlugin(TestL3PluginBaseAttributes,
     __native_sorting_support = True
 
     def create_network(self, context, network):
-        session = context.session
-        with session.begin(subtransactions=True):
+        with db_api.CONTEXT_WRITER.using(context):
             net = super(TestL3NatBasePlugin, self).create_network(context,
                                                                   network)
             self._process_l3_create(context, net, network['network'])
@@ -267,8 +267,7 @@ class TestL3NatBasePlugin(TestL3PluginBaseAttributes,
 
     def update_network(self, context, id, network):
 
-        session = context.session
-        with session.begin(subtransactions=True):
+        with db_api.CONTEXT_WRITER.using(context):
             net = super(TestL3NatBasePlugin, self).update_network(context, id,
                                                                   network)
             self._process_l3_update(context, net, network['network'])
@@ -617,7 +616,7 @@ class ExtraAttributesMixinTestCase(testlib_api.SqlTestCase):
         directory.add_plugin(plugin_constants.L3, self.mixin)
         self.ctx = context.get_admin_context()
         self.router = l3_models.Router()
-        with self.ctx.session.begin():
+        with db_api.CONTEXT_WRITER.using(self.ctx):
             self.ctx.session.add(self.router)
 
     def _get_default_api_values(self):
@@ -626,7 +625,7 @@ class ExtraAttributesMixinTestCase(testlib_api.SqlTestCase):
 
     def test_set_extra_attr_key_bad(self):
         with testtools.ExpectedException(RuntimeError):
-            with self.ctx.session.begin():
+            with db_api.CONTEXT_WRITER.using(self.ctx):
                 self.mixin.set_extra_attr_value(self.ctx, self.router,
                                                 'bad', 'value')
 
@@ -641,25 +640,25 @@ class ExtraAttributesMixinTestCase(testlib_api.SqlTestCase):
         self.assertEqual(self._get_default_api_values(), rdict)
 
     def test_set_attrs_and_extend(self):
-        with self.ctx.session.begin():
+        with db_api.CONTEXT_WRITER.using(self.ctx):
             self.mixin.set_extra_attr_value(self.ctx, self.router,
                                             'ha_vr_id', 99)
             self.mixin.set_extra_attr_value(self.ctx, self.router,
                                             'availability_zone_hints',
                                             ['x', 'y', 'z'])
-        expected = self._get_default_api_values()
-        expected.update({'ha_vr_id': 99,
-                         'availability_zone_hints': ['x', 'y', 'z']})
-        rdict = {}
-        self.mixin._extend_extra_router_dict(rdict, self.router)
-        self.assertEqual(expected, rdict)
-        with self.ctx.session.begin():
+            expected = self._get_default_api_values()
+            expected.update({'ha_vr_id': 99,
+                             'availability_zone_hints': ['x', 'y', 'z']})
+            rdict = {}
+            self.mixin._extend_extra_router_dict(rdict, self.router)
+            self.assertEqual(expected, rdict)
+
             self.mixin.set_extra_attr_value(self.ctx, self.router,
                                             'availability_zone_hints',
                                             ['z', 'y', 'z'])
-        expected['availability_zone_hints'] = ['z', 'y', 'z']
-        self.mixin._extend_extra_router_dict(rdict, self.router)
-        self.assertEqual(expected, rdict)
+            expected['availability_zone_hints'] = ['z', 'y', 'z']
+            self.mixin._extend_extra_router_dict(rdict, self.router)
+            self.assertEqual(expected, rdict)
 
 
 class L3NatTestCaseBase(L3NatTestCaseMixin):
@@ -1335,12 +1334,12 @@ class L3NatTestCaseBase(L3NatTestCaseMixin):
         with self.router(tenant_id=router_tenant_id, set_context=True) as r:
             with self.network(shared=True) as n:
                 with self.subnet(network=n) as s1, (
-                     self.subnet(network=n, cidr='fd00::/64',
-                                 ip_version=lib_constants.IP_VERSION_6)
-                                 ) as s2, (
-                     self.subnet(network=n, cidr='fd01::/64',
-                                 ip_version=lib_constants.IP_VERSION_6)
-                                 ) as s3:
+                        self.subnet(network=n, cidr='fd00::/64',
+                                    ip_version=lib_constants.IP_VERSION_6)
+                                    ) as s2, (
+                        self.subnet(network=n, cidr='fd01::/64',
+                                    ip_version=lib_constants.IP_VERSION_6)
+                                    ) as s3:
                     fixed_ips = [{'subnet_id': s1['subnet']['id']},
                                  {'subnet_id': s2['subnet']['id']},
                                  {'subnet_id': s3['subnet']['id']}]
@@ -1457,38 +1456,6 @@ class L3NatTestCaseBase(L3NatTestCaseMixin):
                                               None,
                                               exc.HTTPBadRequest.code)
                 self.assertFalse(plugin.get_ports(context.get_admin_context()))
-
-    def test_router_add_interface_dup_port(self):
-        '''This tests that if multiple routers add one port as their
-        interfaces. Only the first router's interface would be added
-        to this port. All the later requests would return exceptions.
-        '''
-        with self.router() as r1, self.router() as r2, self.network() as n:
-            with self.subnet(network=n) as s:
-                with self.port(subnet=s) as p:
-                    self._router_interface_action('add',
-                                                  r1['router']['id'],
-                                                  None,
-                                                  p['port']['id'])
-                    # mock out the sequential check
-                    plugin = 'neutron.db.l3_db.L3_NAT_dbonly_mixin'
-                    check_p = mock.patch(plugin + '._check_router_port',
-                                         port_id=p['port']['id'],
-                                         device_id=r2['router']['id'],
-                                         return_value=p['port'])
-                    checkport = check_p.start()
-                    # do regular checkport after first skip
-                    checkport.side_effect = check_p.stop()
-                    self._router_interface_action('add',
-                                                  r2['router']['id'],
-                                                  None,
-                                                  p['port']['id'],
-                                                  exc.HTTPConflict.code)
-                    # clean-up
-                    self._router_interface_action('remove',
-                                                  r1['router']['id'],
-                                                  None,
-                                                  p['port']['id'])
 
     def _assert_body_port_id_and_update_port(self, body, mock_update_port,
                                              port_id, device_id):
@@ -3407,7 +3374,7 @@ class L3NatTestCaseBase(L3NatTestCaseMixin):
         def mock_fail__update_router_gw_info(ctx, router_id, info,
                                              router=None):
             # Fail with breaking transaction
-            with ctx.session.begin(subtransactions=True):
+            with db_api.CONTEXT_WRITER.using(self.ctx):
                 raise n_exc.NeutronException
 
         mock.patch.object(plugin, '_update_router_gw_info',
@@ -3415,7 +3382,7 @@ class L3NatTestCaseBase(L3NatTestCaseMixin):
 
         def create_router_with_transaction(ctx, data):
             # Emulates what many plugins do
-            with ctx.session.begin(subtransactions=True):
+            with db_api.CONTEXT_WRITER.using(ctx):
                 plugin.create_router(ctx, data)
 
         # Verify router doesn't persist on failure
@@ -3438,11 +3405,11 @@ class L3NatTestCaseBase(L3NatTestCaseMixin):
         def mock_fail__update_router_gw_info(ctx, router_id, info,
                                              router=None):
             # Fail with breaking transaction
-            with ctx.session.begin(subtransactions=True):
+            with db_api.CONTEXT_WRITER.using(ctx):
                 raise n_exc.NeutronException
 
         def mock_fail_delete_router(ctx, router_id):
-            with ctx.session.begin(subtransactions=True):
+            with db_api.CONTEXT_WRITER.using(ctx):
                 raise Exception()
 
         mock.patch.object(plugin, '_update_router_gw_info',
@@ -3452,7 +3419,7 @@ class L3NatTestCaseBase(L3NatTestCaseMixin):
 
         def create_router_with_transaction(ctx, data):
             # Emulates what many plugins do
-            with ctx.session.begin(subtransactions=True):
+            with db_api.CONTEXT_WRITER.using(ctx):
                 plugin.create_router(ctx, data)
 
         # Verify router doesn't persist on failure
@@ -3475,13 +3442,13 @@ class L3NatTestCaseBase(L3NatTestCaseMixin):
 
         def mock_update_port_with_transaction(ctx, id, port):
             # Update port within a sub-transaction
-            with ctx.session.begin(subtransactions=True):
+            with db_api.CONTEXT_WRITER.using(ctx):
                 orig_update_port(ctx, id, port)
 
         def add_router_interface_with_transaction(ctx, router_id,
                                                   interface_info):
             # Call add_router_interface() within a sub-transaction
-            with ctx.session.begin():
+            with db_api.CONTEXT_WRITER.using(ctx):
                 plugin.add_router_interface(ctx, router_id, interface_info)
 
         tenant_id = _uuid()

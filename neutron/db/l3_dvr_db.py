@@ -13,9 +13,9 @@
 #    under the License.
 import collections
 
-import netaddr
 from neutron_lib.api.definitions import l3 as l3_apidef
 from neutron_lib.api.definitions import portbindings
+from neutron_lib.api.definitions import portbindings_extended
 from neutron_lib.api import validators
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import exceptions
@@ -27,10 +27,10 @@ from neutron_lib.db import api as db_api
 from neutron_lib import exceptions as n_exc
 from neutron_lib.exceptions import agent as agent_exc
 from neutron_lib.exceptions import l3 as l3_exc
+from neutron_lib.objects import exceptions as o_exc
 from neutron_lib.plugins import constants as plugin_constants
 from neutron_lib.plugins import directory
 from neutron_lib.plugins import utils as plugin_utils
-from oslo_concurrency import lockutils
 from oslo_config import cfg
 from oslo_log import helpers as log_helper
 from oslo_log import log as logging
@@ -49,7 +49,6 @@ from neutron.db import models_v2
 from neutron.extensions import _admin_state_down_before_update_lib
 from neutron.ipam import utils as ipam_utils
 from neutron.objects import agent as ag_obj
-from neutron.objects import base as base_obj
 from neutron.objects import l3agent as rb_obj
 from neutron.objects import router as l3_obj
 
@@ -66,6 +65,18 @@ def is_admin_state_down_necessary():
             _admin_state_down_before_update_lib.ALIAS in (extensions.
                     PluginAwareExtensionManager.get_instance().extensions)
     return _IS_ADMIN_STATE_DOWN_NECESSARY
+
+
+# TODO(slaweq): this should be moved to neutron_lib.plugins.utils module
+def is_port_bound(port):
+    active_binding = plugin_utils.get_port_binding_by_status_and_host(
+        port.get("port_bindings", []), const.ACTIVE)
+    if not active_binding:
+        LOG.warning("Binding for port %s was not found.", port)
+        return False
+    return active_binding[portbindings_extended.VIF_TYPE] not in [
+        portbindings.VIF_TYPE_UNBOUND,
+        portbindings.VIF_TYPE_BINDING_FAILED]
 
 
 @registry.has_registry_receivers
@@ -362,6 +373,22 @@ class DVRResourceOperationHandler(object):
             self.l3plugin.l3_rpc_notifier.delete_fipnamespace_for_ext_net(
                 payload.context, network_id)
 
+    def _delete_fip_agent_port(self, context, network_id, host_id):
+        try:
+            l3_agent_db = self._get_agent_by_type_and_host(
+                context, const.AGENT_TYPE_L3, host_id)
+        except agent_exc.AgentNotFoundByTypeHost:
+            LOG.warning("%(ag)s agent not found for the given host: %(host)s",
+                        {'ag': const.AGENT_TYPE_L3,
+                         'host': host_id})
+            return
+        try:
+            l3_obj.DvrFipGatewayPortAgentBinding(
+                context, network_id=network_id,
+                agent_id=l3_agent_db['id']).delete()
+        except n_exc.ObjectNotFound:
+            pass
+
     def delete_floatingip_agent_gateway_port(self, context, host_id,
                                              ext_net_id):
         """Function to delete FIP gateway port with given ext_net_id."""
@@ -373,6 +400,8 @@ class DVRResourceOperationHandler(object):
         for p in ports:
             if not host_id or p[portbindings.HOST_ID] == host_id:
                 self._core_plugin.ipam.delete_port(context, p['id'])
+                self._delete_fip_agent_port(
+                    context, ext_net_id, p[portbindings.HOST_ID])
                 if host_id:
                     return
 
@@ -436,17 +465,6 @@ class DVRResourceOperationHandler(object):
                                 fixed_ip_address))
                         if not addr_pair_active_service_port_list:
                             return
-                        self._inherit_service_port_and_arp_update(
-                            context, addr_pair_active_service_port_list[0])
-
-    def _inherit_service_port_and_arp_update(self, context, service_port):
-        """Function inherits port host bindings for allowed_address_pair."""
-        service_port_dict = self.l3plugin._core_plugin._make_port_dict(
-            service_port)
-        address_pair_list = service_port_dict.get('allowed_address_pairs')
-        for address_pair in address_pair_list:
-            self.update_arp_entry_for_dvr_service_port(context,
-                                                       service_port_dict)
 
     @registry.receives(resources.ROUTER_INTERFACE, [events.BEFORE_CREATE])
     @db_api.retry_if_session_inactive()
@@ -1012,9 +1030,13 @@ class _DVRAgentInterfaceMixin(object):
 
     def create_fip_agent_gw_port_if_not_exists(self, context, network_id,
                                                host):
-        # TODO(slaweq): add proper constraint on database level to avoid
-        # creation of duplicated Floating IP gateway ports for same network and
-        # same L3 agent. When this will be done, we can get rid of this lock.
+        """Function to return the FIP Agent GW port.
+
+        This function will create a FIP Agent GW port
+        if required. If the port already exists, it
+        will return the existing port and will not
+        create a new one.
+        """
         try:
             l3_agent_db = self._get_agent_by_type_and_host(
                 context, const.AGENT_TYPE_L3, host)
@@ -1023,66 +1045,61 @@ class _DVRAgentInterfaceMixin(object):
                         {'ag': const.AGENT_TYPE_L3,
                          'host': host})
             return
+        if not l3_agent_db:
+            return
+
         l3_agent_mode = self._get_agent_mode(l3_agent_db)
         if l3_agent_mode == const.L3_AGENT_MODE_DVR_NO_EXTERNAL:
             return
-        if not l3_agent_db:
-            return
-        lock_name = 'fip-gw-lock-' + network_id + '-' + host
-        with lockutils.lock(lock_name, external=True):
-            return self._create_fip_agent_gw_port_if_not_exists(
-                context, network_id, host, l3_agent_db)
 
-    def _create_fip_agent_gw_port_if_not_exists(self, context, network_id,
-                                                host, l3_agent_db):
-        """Function to return the FIP Agent GW port.
-
-        This function will create a FIP Agent GW port
-        if required. If the port already exists, it
-        will return the existing port and will not
-        create a new one.
-        """
         LOG.debug("Agent ID exists: %s", l3_agent_db['id'])
         agent_port = self._get_agent_gw_ports_exist_for_network(
             context, network_id, host, l3_agent_db['id'])
         if not agent_port:
-            LOG.info("Floating IP Agent Gateway port for network %s "
-                     "does not exist on host %s. Creating one.",
-                     network_id, host)
-            port_data = {'tenant_id': '',
-                         'network_id': network_id,
-                         'device_id': l3_agent_db['id'],
-                         'device_owner': const.DEVICE_OWNER_AGENT_GW,
-                         portbindings.HOST_ID: host,
-                         'admin_state_up': True,
-                         'name': ''}
-            agent_port = plugin_utils.create_port(
-                self._core_plugin, context, {'port': port_data})
-            if not agent_port:
-                msg = _("Unable to create Floating IP Agent Gateway port")
-                raise n_exc.BadRequest(resource='router', msg=msg)
-            LOG.debug("Floating IP Agent Gateway port %(gw)s created "
-                      "for the destination host: %(dest_host)s",
-                      {'gw': agent_port,
-                       'dest_host': host})
+            LOG.info("Floating IP Agent Gateway port for network %(network)s "
+                     "does not exist on host %(host)s. Creating one.",
+                     {'network': network_id,
+                      'host': host})
+            fip_agent_port_obj = l3_obj.DvrFipGatewayPortAgentBinding(
+                context,
+                network_id=network_id,
+                agent_id=l3_agent_db['id']
+            )
+            try:
+                fip_agent_port_obj.create()
+            except o_exc.NeutronDbObjectDuplicateEntry:
+                LOG.debug("Floating IP Agent Gateway port for network "
+                          "%(network)s already exists on host %(host)s. "
+                          "Probably it was just created by other worker.",
+                          {'network': network_id,
+                           'host': host})
+                agent_port = self._get_agent_gw_ports_exist_for_network(
+                    context, network_id, host, l3_agent_db['id'])
+                LOG.debug("Floating IP Agent Gateway port %(gw)s found "
+                          "for the destination host: %(dest_host)s",
+                          {'gw': agent_port,
+                           'dest_host': host})
+            else:
+                port_data = {'tenant_id': '',
+                             'network_id': network_id,
+                             'device_id': l3_agent_db['id'],
+                             'device_owner': const.DEVICE_OWNER_AGENT_GW,
+                             portbindings.HOST_ID: host,
+                             'admin_state_up': True,
+                             'name': ''}
+                agent_port = plugin_utils.create_port(
+                    self._core_plugin, context, {'port': port_data})
+                if not agent_port:
+                    fip_agent_port_obj.delete()
+                    msg = _("Unable to create Floating IP Agent Gateway port")
+                    raise n_exc.BadRequest(resource='router', msg=msg)
+                LOG.debug("Floating IP Agent Gateway port %(gw)s created "
+                          "for the destination host: %(dest_host)s",
+                          {'gw': agent_port,
+                           'dest_host': host})
 
         self._populate_mtu_and_subnets_for_ports(context, [agent_port])
         return agent_port
-
-    def _generate_arp_table_and_notify_agent(self, context, fixed_ip,
-                                             mac_address, notifier):
-        """Generates the arp table entry and notifies the l3 agent."""
-        ip_address = fixed_ip['ip_address']
-        subnet = fixed_ip['subnet_id']
-        arp_table = {'ip_address': ip_address,
-                     'mac_address': mac_address,
-                     'subnet_id': subnet}
-        filters = {'fixed_ips': {'subnet_id': [subnet]},
-                   'device_owner': [const.DEVICE_OWNER_DVR_INTERFACE]}
-        ports = self._core_plugin.get_ports(context, filters=filters)
-        routers = [port['device_id'] for port in ports]
-        for router_id in routers:
-            notifier(context, router_id, arp_table)
 
     def _get_subnet_id_for_given_fixed_ip(self, context, fixed_ip, port_dict):
         """Returns the subnet_id that matches the fixedip on a network."""
@@ -1091,78 +1108,6 @@ class _DVRAgentInterfaceMixin(object):
         for subnet in subnets:
             if ipam_utils.check_subnet_ip(subnet['cidr'], fixed_ip):
                 return subnet['id']
-
-    def _get_allowed_address_pair_fixed_ips(self, context, port_dict):
-        """Returns all fixed_ips associated with the allowed_address_pair."""
-        aa_pair_fixed_ips = []
-        if port_dict.get('allowed_address_pairs'):
-            for address_pair in port_dict['allowed_address_pairs']:
-                aap_ip_cidr = address_pair['ip_address'].split("/")
-                if len(aap_ip_cidr) == 1 or int(aap_ip_cidr[1]) == 32:
-                    subnet_id = self._get_subnet_id_for_given_fixed_ip(
-                        context, aap_ip_cidr[0], port_dict)
-                    if subnet_id is not None:
-                        fixed_ip = {'subnet_id': subnet_id,
-                                    'ip_address': aap_ip_cidr[0]}
-                        aa_pair_fixed_ips.append(fixed_ip)
-                    else:
-                        LOG.debug("Subnet does not match for the given "
-                                  "fixed_ip %s for arp update", aap_ip_cidr[0])
-        return aa_pair_fixed_ips
-
-    def update_arp_entry_for_dvr_service_port(self, context, port_dict):
-        """Notify L3 agents of ARP table entry for dvr service port.
-
-        When a dvr service port goes up, look for the DVR router on
-        the port's subnet, and send the ARP details to all
-        L3 agents hosting the router to add it.
-        If there are any allowed_address_pairs associated with the port
-        those fixed_ips should also be updated in the ARP table.
-        """
-        fixed_ips = port_dict['fixed_ips']
-        if not fixed_ips:
-            return
-        allowed_address_pair_fixed_ips = (
-            self._get_allowed_address_pair_fixed_ips(context, port_dict))
-        changed_fixed_ips = fixed_ips + allowed_address_pair_fixed_ips
-        for fixed_ip in changed_fixed_ips:
-            self._generate_arp_table_and_notify_agent(
-                context, fixed_ip, port_dict['mac_address'],
-                self.l3_rpc_notifier.add_arp_entry)
-
-    def delete_arp_entry_for_dvr_service_port(self, context, port_dict,
-                                              fixed_ips_to_delete=None):
-        """Notify L3 agents of ARP table entry for dvr service port.
-
-        When a dvr service port goes down, look for the DVR
-        router on the port's subnet, and send the ARP details to all
-        L3 agents hosting the router to delete it.
-        If there are any allowed_address_pairs associated with the
-        port, those fixed_ips should be removed from the ARP table.
-        """
-        fixed_ips = port_dict['fixed_ips']
-        if not fixed_ips:
-            return
-        if not fixed_ips_to_delete:
-            allowed_address_pair_fixed_ips = (
-                self._get_allowed_address_pair_fixed_ips(context, port_dict))
-            fixed_ips_to_delete = fixed_ips + allowed_address_pair_fixed_ips
-        for fixed_ip in fixed_ips_to_delete:
-            self._generate_arp_table_and_notify_agent(
-                context, fixed_ip, port_dict['mac_address'],
-                self.l3_rpc_notifier.del_arp_entry)
-
-    def _get_address_pair_active_port_with_fip(
-            self, context, port_dict, port_addr_pair_ip):
-        port_valid_state = (port_dict['admin_state_up'] or
-                            port_dict['status'] == const.PORT_STATUS_ACTIVE)
-        if not port_valid_state:
-            return
-        fips = l3_obj.FloatingIP.get_objects(
-            context, _pager=base_obj.Pager(limit=1),
-            fixed_ip_address=netaddr.IPAddress(port_addr_pair_ip))
-        return self._core_plugin.get_port(
-            context, fips[0].fixed_port_id) if fips else None
 
 
 class L3_NAT_with_dvr_db_mixin(_DVRAgentInterfaceMixin,
@@ -1272,10 +1217,11 @@ class L3_NAT_with_dvr_db_mixin(_DVRAgentInterfaceMixin,
 
     def get_ports_under_dvr_connected_subnet(self, context, subnet_id):
         query = dvr_mac_db.get_ports_query_by_subnet_and_ip(context, subnet_id)
+        ports = [p for p in query.all() if is_port_bound(p)]
         return [
             self.l3plugin._core_plugin._make_port_dict(
                 port, process_extensions=False)
-            for port in query.all()
+            for port in ports
         ]
 
 

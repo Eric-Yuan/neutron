@@ -14,8 +14,10 @@
 #    under the License.
 
 import os
+import sys
+from unittest import mock
 
-import mock
+import eventlet
 from neutron_lib import constants as n_const
 
 from neutron.agent.l3 import namespaces
@@ -71,10 +73,19 @@ class NetnsCleanupTest(base.BaseSudoTestCase):
         # killed during cleanup
         procs_launched = self._launch_processes([l3_namespace, dhcp_namespace])
         self.assertIsNot(procs_launched, 0)
-        common_utils.wait_until_true(
-            lambda: self._get_num_spawned_procs() == procs_launched,
-            timeout=15,
-            exception=Exception("Didn't spawn expected number of processes"))
+        try:
+            common_utils.wait_until_true(
+                lambda: self._get_num_spawned_procs() == procs_launched,
+                timeout=15)
+        except eventlet.Timeout:
+            num_spawned_procs = self._get_num_spawned_procs()
+            err_str = ("Expected number/spawned number: {0}/{1}\nProcess "
+                       "information:\n".format(num_spawned_procs,
+                                               procs_launched))
+            cmd = ['ps', '-f', '-u', 'root']
+            err_str += utils.execute(cmd, run_as_root=True)
+
+            raise Exception(err_str)
 
         netns_cleanup.cleanup_network_namespaces(self.conf)
 
@@ -100,19 +111,20 @@ class NetnsCleanupTest(base.BaseSudoTestCase):
         to test the cleanup functionality which will issue a SIGKILL
         to all remaining processes after the SIGTERM attempt
         """
-        commands = [['python', process_spawn.__file__,
+        python_exec = os.path.basename(sys.executable)
+        commands = [[python_exec, process_spawn.__file__,
                      '-n', NUM_SUBPROCESSES,
                      '-f', n_const.IPv4,
                      '-p', n_const.PROTO_NAME_TCP,
                      '--noignore_sigterm',
                      '--parent_listen'],
-                    ['python', process_spawn.__file__,
+                    [python_exec, process_spawn.__file__,
                      '-n', NUM_SUBPROCESSES,
                      '-f', process_spawn.UNIX_FAMILY,
                      '-p', n_const.PROTO_NAME_TCP,
                      '--noignore_sigterm',
                      '--noparent_listen'],
-                    ['python', process_spawn.__file__,
+                    [python_exec, process_spawn.__file__,
                      '-n', NUM_SUBPROCESSES,
                      '-f', n_const.IPv4,
                      '-p', n_const.PROTO_NAME_UDP,

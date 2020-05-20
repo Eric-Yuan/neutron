@@ -1,3 +1,5 @@
+.. _neutron_teams:
+
 ======================
 Neutron Team Structure
 ======================
@@ -105,6 +107,8 @@ Some notes on the above:
   new feature areas, and libification of certain pieces of code.
 * Infra means interactions with infra from a neutron perspective
 
+.. _subproject_lieutenants:
+
 Sub-project Lieutenants
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -126,6 +130,8 @@ updating the core review team for the sub-project's repositories.
 | neutron-fwaas           | Nate Johnston               | njohnston         |
 +-------------------------+-----------------------------+-------------------+
 | neutron-vpnaas          | YAMAMOTO Takashi            | yamamoto          |
+|                         +-----------------------------+-------------------+
+|                         | Dongcan Ye                  | yedongcan         |
 +-------------------------+-----------------------------+-------------------+
 | networking-midonet      | Ryu Ishimoto                | ryu25             |
 |                         +-----------------------------+-------------------+
@@ -217,6 +223,8 @@ code reviewers:
 
 Specs core reviewers may match core members of the above mentioned groups, but
 the group can be extended to other individuals, if required.
+
+.. _drivers_team:
 
 Drivers Team
 ------------

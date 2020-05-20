@@ -14,8 +14,8 @@
 #    under the License.
 
 import copy
+from unittest import mock
 
-import mock
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
@@ -280,7 +280,7 @@ class L3AgentTestCase(framework.L3AgentTestFramework):
         router_ip = router_ip_cidr.partition('/')[0]
 
         br_int = framework.get_ovs_bridge(
-            self.agent.conf.ovs_integration_bridge)
+            self.agent.conf.OVS.integration_bridge)
 
         src_machine, dst_machine = self.useFixture(
             machine_fixtures.PeerMachines(
@@ -320,7 +320,7 @@ class L3AgentTestCase(framework.L3AgentTestFramework):
         # Verify that the ping replys with fip
         ns_ip_wrapper = ip_lib.IPWrapper(src_machine.namespace)
         result = ns_ip_wrapper.netns.execute(
-            ['ping', '-c', 1, '-W', 5, dst_fip])
+            ['ping', '-W', 5, '-c', 1, dst_fip])
         self._assert_ping_reply_from_expected_address(result, dst_fip)
 
     def _setup_address_scope(self, internal_address_scope1,
@@ -346,7 +346,7 @@ class L3AgentTestCase(framework.L3AgentTestFramework):
         router_ip2 = router_ip_cidr2.partition('/')[0]
 
         br_int = framework.get_ovs_bridge(
-            self.agent.conf.ovs_integration_bridge)
+            self.agent.conf.OVS.integration_bridge)
         test_machine1 = self.useFixture(
             machine_fixtures.FakeMachine(
                 br_int,
@@ -392,7 +392,7 @@ class L3AgentTestCase(framework.L3AgentTestFramework):
         router.process()
 
         br_int = framework.get_ovs_bridge(
-            self.agent.conf.ovs_integration_bridge)
+            self.agent.conf.OVS.integration_bridge)
         src_machine = self.useFixture(
             machine_fixtures.FakeMachine(br_int, '19.4.4.12/24'))
         # Floating ip should work no matter of address scope
@@ -406,7 +406,7 @@ class L3AgentTestCase(framework.L3AgentTestFramework):
         gw_port = router.get_ex_gw_port()
         gw_ip = self._port_first_ip_cidr(gw_port).partition('/')[0]
         br_int = framework.get_ovs_bridge(
-            self.agent.conf.ovs_integration_bridge)
+            self.agent.conf.OVS.integration_bridge)
 
         src_machine = self.useFixture(
             machine_fixtures.FakeMachine(br_int, '19.4.4.12/24', gw_ip))

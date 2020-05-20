@@ -14,8 +14,8 @@
 #    under the License.
 
 import os
+from unittest import mock
 
-import mock
 from neutron_lib import constants
 from neutron_lib import fixture as lib_fixtures
 from oslo_config import cfg
@@ -157,6 +157,7 @@ class TestMetadataDriverProcess(base.BaseTestCase):
                 'unix_socket_path': self.METADATA_SOCKET,
                 'res_type': 'Router',
                 'res_id': router_id,
+                'res_type_del': 'Network',
                 'pidfile': self.PIDFILE,
                 'log_level': 'debug',
                 'log_tag': log_tag}

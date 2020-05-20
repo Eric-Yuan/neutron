@@ -10,7 +10,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import random
+import collections
+import itertools
+
+from oslo_utils import uuidutils
 
 from neutron.objects import securitygroup
 from neutron.tests.unit.objects import test_base
@@ -18,18 +21,7 @@ from neutron.tests.unit.objects import test_rbac
 from neutron.tests.unit import testlib_api
 
 
-class _SecurityGroupRBACBase(object):
-
-    def get_random_object_fields(self, obj_cls=None):
-        fields = (super(_SecurityGroupRBACBase, self).
-                  get_random_object_fields(obj_cls))
-        rnd_actions = self._test_class.db_model.get_valid_actions()
-        idx = random.randint(0, len(rnd_actions) - 1)
-        fields['action'] = rnd_actions[idx]
-        return fields
-
-
-class SecurityGroupRBACDbObjectTestCase(_SecurityGroupRBACBase,
+class SecurityGroupRBACDbObjectTestCase(test_rbac.TestRBACObjectMixin,
                                         test_base.BaseDbObjectTestCase,
                                         testlib_api.SqlTestCase):
 
@@ -55,7 +47,7 @@ class SecurityGroupRBACDbObjectTestCase(_SecurityGroupRBACBase,
                          security_group_rbac_dict['versioned_object.data'])
 
 
-class SecurityGroupRBACIfaceObjectTestCase(_SecurityGroupRBACBase,
+class SecurityGroupRBACIfaceObjectTestCase(test_rbac.TestRBACObjectMixin,
                                            test_base.BaseObjectIfaceTestCase):
     _test_class = securitygroup.SecurityGroupRBAC
 
@@ -79,6 +71,16 @@ class SecurityGroupDbObjTestCase(test_base.BaseDbObjectTestCase,
                 # we either make it null, or create remote groups for each rule
                 # generated; we picked the former here
                 rule['remote_group_id'] = None
+
+    def _create_test_security_group(self):
+        self.objs[0].create()
+        return self.objs[0]
+
+    def test_object_version_degradation_1_2_to_1_1_no_stateful(self):
+        sg_stateful_obj = self._create_test_security_group()
+        sg_no_stateful_obj = sg_stateful_obj.obj_to_primitive('1.1')
+        self.assertNotIn('stateful',
+                         sg_no_stateful_obj['versioned_object.data'])
 
     def test_is_default_True(self):
         fields = self.obj_fields[0].copy()
@@ -213,3 +215,38 @@ class SecurityGroupRuleDbObjTestCase(test_base.BaseDbObjectTestCase,
                 'remote_group_id':
                     lambda: self._create_test_security_group_id()
             })
+
+    def test_get_security_group_rule_ids(self):
+        """Retrieve the SG rules associated to a project (see method desc.)
+
+        SG1 (PROJECT1)            SG2 (PROJECT2)
+          rule1a (PROJECT1)         rule2a (PROJECT1)
+          rule1b (PROJECT2)         rule2b (PROJECT2)
+
+        query PROJECT1: rule1a, rule1b, rule2a
+        query PROJECT2: rule1b, rule2a, rule2b
+        """
+        projects = [uuidutils.generate_uuid(), uuidutils.generate_uuid()]
+        sgs = [
+            self._create_test_security_group_id({'project_id': projects[0]}),
+            self._create_test_security_group_id({'project_id': projects[1]})]
+
+        rules_per_project = collections.defaultdict(list)
+        rules_per_sg = collections.defaultdict(list)
+        for project, sg in itertools.product(projects, sgs):
+            sgrule_fields = self.get_random_object_fields(
+                securitygroup.SecurityGroupRule)
+            sgrule_fields['project_id'] = project
+            sgrule_fields['security_group_id'] = sg
+            rule = securitygroup.SecurityGroupRule(self.context,
+                                                   **sgrule_fields)
+            rule.create()
+            rules_per_project[project].append(rule.id)
+            rules_per_sg[sg].append(rule.id)
+
+        for idx in range(2):
+            rule_ids = securitygroup.SecurityGroupRule.\
+                get_security_group_rule_ids(projects[idx])
+            rule_ids_ref = set(rules_per_project[projects[idx]])
+            rule_ids_ref.update(set(rules_per_sg[sgs[idx]]))
+            self.assertEqual(rule_ids_ref, set(rule_ids))

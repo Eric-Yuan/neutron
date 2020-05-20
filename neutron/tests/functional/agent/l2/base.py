@@ -15,10 +15,10 @@
 #    under the License.
 
 import random
+from unittest import mock
 
 import eventlet
 import fixtures
-import mock
 from neutron_lib import constants as n_const
 from neutron_lib.utils import net
 from oslo_config import cfg
@@ -148,7 +148,6 @@ class OVSAgentTestFramework(base.BaseOVSLinuxTestCase, OVSOFControllerHelper):
             'interface_driver',
             'neutron.agent.linux.interface.OVSInterfaceDriver')
         config.set_override('integration_bridge', self.br_int, "OVS")
-        config.set_override('ovs_integration_bridge', self.br_int)
         config.set_override('tunnel_bridge', self.br_tun, "OVS")
         config.set_override('int_peer_patch_port', self.patch_tun, "OVS")
         config.set_override('tun_peer_patch_port', self.patch_int, "OVS")
@@ -336,7 +335,7 @@ class OVSAgentTestFramework(base.BaseOVSLinuxTestCase, OVSOFControllerHelper):
         return ports
 
     def _mock_update_device(self, context, devices_up, devices_down, agent_id,
-                            host=None, agent_restarted=False):
+                            host=None, refresh_tunnels=False):
         dev_up = []
         dev_down = []
         for port in self.ports:
@@ -382,7 +381,7 @@ class OVSAgentTestFramework(base.BaseOVSLinuxTestCase, OVSOFControllerHelper):
 
         def mock_failed_devices_up(context, devices_up, devices_down,
                                    agent_id, host=None,
-                                   agent_restarted=False):
+                                   refresh_tunnels=False):
             failed_devices = []
             devices = list(devices_up)
             # first port fails
@@ -404,7 +403,7 @@ class OVSAgentTestFramework(base.BaseOVSLinuxTestCase, OVSOFControllerHelper):
 
         def mock_failed_devices_down(context, devices_up, devices_down,
                                      agent_id, host=None,
-                                     agent_restarted=False):
+                                     refresh_tunnels=False):
             # first port fails
             failed_port_id = self.ports[0]['id']
             failed_devices_down = []

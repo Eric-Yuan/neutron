@@ -1,3 +1,5 @@
+.. _neutron_bugs:
+
 Neutron Bugs
 ============
 
@@ -31,6 +33,7 @@ management. Permissions will have to be granted assuming that people sign up
 on the deputy role. The permission won't be given freely, a person must show
 some degree of prior involvement.
 
+.. _neutron_bug_deputy:
 
 Neutron Bug Deputy
 ------------------
@@ -435,6 +438,12 @@ more will be added over time if needed.
 | oslo_                         | An interop/cross-project issue          | Bernard Cafarelli/       |
 |                               |                                         | Rodolfo Alonso Hernandez |
 +-------------------------------+-----------------------------------------+--------------------------+
+| ovn_                          | A bug affecting ML2/OVN                 | Jakub Libosvar/          |
+|                               |                                         | Lucas Alvares Gomes      |
++-------------------------------+-----------------------------------------+--------------------------+
+| ovn-octavia-provider_         | A bug affecting OVN Octavia provider    | Maciej Jozefczyk/        |
+|                               | driver                                  | Brian Haley              |
++-------------------------------+-----------------------------------------+--------------------------+
 | ovs_                          | A bug affecting ML2/OVS                 | Miguel Lavalle           |
 +-------------------------------+-----------------------------------------+--------------------------+
 | ovs-fw_                       | A bug affecting OVS firewall            | Miguel Lavalle           |
@@ -464,6 +473,8 @@ more will be added over time if needed.
 | unittest_                     | A bug affecting the unit test subtree   | Rodolfo Alonso Hernandez |
 +-------------------------------+-----------------------------------------+--------------------------+
 | usability_                    | UX, interoperability, feature parity    | PTL/Drivers Team         |
++-------------------------------+-----------------------------------------+--------------------------+
+| vpnaas_                       | A bug affecting neutron-vpnaas          | Dongcan Ye               |
 +-------------------------------+-----------------------------------------+--------------------------+
 | xxx-backport-potential_       | Cherry-pick request for stable team     | Bernard Cafarelli/       |
 |                               |                                         | Brian Haley              |
@@ -697,6 +708,22 @@ OSLO
 
 * `Oslo - All bugs <https://bugs.launchpad.net/neutron/+bugs?field.tag=oslo>`_
 * `Oslo - In progress <https://bugs.launchpad.net/neutron/+bugs?field.status%3Alist=INPROGRESS&field.tag=oslo>`_
+
+.. _ovn:
+
+OVN
++++
+
+* `OVN - All bugs <https://bugs.launchpad.net/neutron/+bugs?field.tag=ovn>`_
+* `OVN - In progress <https://bugs.launchpad.net/neutron/+bugs?field.status%3Alist=INPROGRESS&field.tag=ovn>`_
+
+.. _ovn-octavia-provider:
+
+OVN Octavia Provider driver
++++++++++++++++++++++++++++
+
+* `OVN Octavia Provider driver - All bugs <https://bugs.launchpad.net/neutron/+bugs?field.tag=ovn-octavia-provider>`_
+* `OVN Octavia Provider driver - In progress <https://bugs.launchpad.net/neutron/+bugs?field.status%3Alist=INPROGRESS&field.tag=ovn-octavia-provider>`_
 
 .. _ovs:
 

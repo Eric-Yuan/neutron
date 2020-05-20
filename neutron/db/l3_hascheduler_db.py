@@ -17,6 +17,7 @@ from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
 from neutron_lib import constants
+from neutron_lib.db import api as db_api
 from neutron_lib.plugins import constants as plugin_constants
 from neutron_lib.plugins import directory
 
@@ -41,7 +42,7 @@ class L3_HA_scheduler_db_mixin(l3_sch_db.AZL3AgentSchedulerDbMixin):
         return {'agents': agents}
 
     def list_l3_agents_hosting_router(self, context, router_id):
-        with context.session.begin(subtransactions=True):
+        with db_api.CONTEXT_WRITER.using(context):
             router_db = self._get_router(context, router_id)
             if router_db.extra_attributes.ha:
                 agents = self.get_l3_bindings_hosting_router_with_ha_states(
@@ -58,7 +59,7 @@ def _notify_l3_agent_ha_port_update(resource, event, trigger, **kwargs):
     new_port = kwargs.get('port')
     original_port = kwargs.get('original_port')
     context = kwargs.get('context')
-    host = new_port[portbindings.HOST_ID]
+    host = new_port.get(portbindings.HOST_ID)
 
     if new_port and original_port and host:
         new_device_owner = new_port.get('device_owner', '')

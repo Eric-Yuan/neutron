@@ -17,11 +17,13 @@ import sys
 
 import netaddr
 from neutron_lib import constants as n_const
+from oslo_config import cfg
 from oslo_log import log as logging
 import oslo_messaging
 from oslo_utils import excutils
 from osprofiler import profiler
 
+from neutron.agent.linux.openvswitch_firewall import firewall as ovs_firewall
 from neutron.common import utils as n_utils
 from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants
 
@@ -119,8 +121,7 @@ class OVSDVRNeutronAgent(object):
                  patch_int_ofport=constants.OFPORT_INVALID,
                  patch_tun_ofport=constants.OFPORT_INVALID,
                  host=None, enable_tunneling=False,
-                 enable_distributed_routing=False,
-                 arp_responder_enabled=False):
+                 enable_distributed_routing=False):
         self.context = context
         self.plugin_rpc = plugin_rpc
         self.host = host
@@ -134,9 +135,13 @@ class OVSDVRNeutronAgent(object):
                                   patch_int_ofport, patch_tun_ofport)
         self.reset_dvr_parameters()
         self.dvr_mac_address = None
-        self.arp_responder_enabled = arp_responder_enabled
         if self.enable_distributed_routing:
             self.get_dvr_mac_address()
+        self.conf = cfg.CONF
+        self.firewall = None
+
+    def set_firewall(self, firewall=None):
+        self.firewall = firewall
 
     def setup_dvr_flows(self):
         self.setup_dvr_flows_on_integ_br()
@@ -392,6 +397,15 @@ class OVSDVRNeutronAgent(object):
 
         subnet_info = ldm.get_subnet_info()
         ip_version = subnet_info['ip_version']
+
+        if self.firewall and isinstance(self.firewall,
+                                        ovs_firewall.OVSFirewallDriver):
+            tunnel_direct_info = {"network_type": lvm.network_type,
+                                  "physical_network": lvm.physical_network}
+            self.firewall.install_accepted_egress_direct_flow(
+                subnet_info['gateway_mac'], lvm.vlan, port.ofport,
+                tunnel_direct_info=tunnel_direct_info)
+
         local_compute_ports = (
             self.plugin_rpc.get_ports_on_host_by_subnet(
                 self.context, self.host, subnet_uuid))
@@ -425,15 +439,12 @@ class OVSDVRNeutronAgent(object):
                 gateway_mac=subnet_info['gateway_mac'],
                 dst_mac=comp_ovsport.get_mac(),
                 dst_port=comp_ovsport.get_ofport())
-        # Add the following flow rule only when ARP RESPONDER is
-        # enabled
-        if self.arp_responder_enabled:
-            self.int_br.install_dvr_dst_mac_for_arp(
-                lvm.network_type,
-                vlan_tag=lvm.vlan,
-                gateway_mac=port.vif_mac,
-                dvr_mac=self.dvr_mac_address,
-                rtr_port=port.ofport)
+        self.int_br.install_dvr_dst_mac_for_arp(
+            lvm.network_type,
+            vlan_tag=lvm.vlan,
+            gateway_mac=port.vif_mac,
+            dvr_mac=self.dvr_mac_address,
+            rtr_port=port.ofport)
 
         if lvm.network_type == n_const.TYPE_VLAN:
             # TODO(vivek) remove the IPv6 related flows once SNAT is not
@@ -628,16 +639,12 @@ class OVSDVRNeutronAgent(object):
                     network_type=network_type,
                     vlan_tag=vlan_to_use, dst_mac=comp_port.get_mac())
             ldm.remove_all_compute_ofports()
-            # If ARP Responder enabled, remove the rule that redirects
-            # the dvr_mac_address destination to the router port, since
-            # the router port is removed or unbound.
-            if self.arp_responder_enabled:
-                self.int_br.delete_dvr_dst_mac_for_arp(
-                    network_type=network_type,
-                    vlan_tag=vlan_to_use,
-                    gateway_mac=port.vif_mac,
-                    dvr_mac=self.dvr_mac_address,
-                    rtr_port=port.ofport)
+            self.int_br.delete_dvr_dst_mac_for_arp(
+                network_type=network_type,
+                vlan_tag=vlan_to_use,
+                gateway_mac=port.vif_mac,
+                dvr_mac=self.dvr_mac_address,
+                rtr_port=port.ofport)
             if ldm.get_csnat_ofport() == constants.OFPORT_INVALID:
                 # if there is no csnat port for this subnet, remove
                 # this subnet from local_dvr_map, as no dvr (or) csnat
@@ -656,6 +663,11 @@ class OVSDVRNeutronAgent(object):
                 br.delete_dvr_process_ipv6(
                     vlan_tag=lvm.vlan, gateway_mac=subnet_info['gateway_mac'])
             ovsport.remove_subnet(sub_uuid)
+
+            if self.firewall and isinstance(self.firewall,
+                                            ovs_firewall.OVSFirewallDriver):
+                self.firewall.delete_accepted_egress_direct_flow(
+                    subnet_info['gateway_mac'], lvm.vlan)
 
         if lvm.network_type == n_const.TYPE_VLAN:
             br = self.phys_brs[physical_network]

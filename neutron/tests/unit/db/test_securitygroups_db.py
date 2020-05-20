@@ -12,8 +12,8 @@
 # limitations under the License.
 
 import copy
+from unittest import mock
 
-import mock
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import exceptions
 from neutron_lib.callbacks import registry
@@ -25,6 +25,7 @@ import testtools
 
 from neutron.db import securitygroups_db
 from neutron.extensions import securitygroup
+from neutron import quota
 from neutron.services.revisions import revision_plugin
 from neutron.tests.unit import testlib_api
 
@@ -71,6 +72,10 @@ class SecurityGroupDbMixinTestCase(testlib_api.SqlTestCase):
         self.setup_coreplugin(core_plugin=DB_PLUGIN_KLASS)
         self.ctx = context.get_admin_context()
         self.mixin = SecurityGroupDbMixinImpl()
+        make_res = mock.patch.object(quota.QuotaEngine, 'make_reservation')
+        self.mock_quota_make_res = make_res.start()
+        commit_res = mock.patch.object(quota.QuotaEngine, 'commit_reservation')
+        self.mock_quota_commit_res = commit_res.start()
 
     def test_create_security_group_conflict(self):
         with mock.patch.object(registry, "publish") as mock_publish:
@@ -89,10 +94,22 @@ class SecurityGroupDbMixinTestCase(testlib_api.SqlTestCase):
             with testtools.ExpectedException(securitygroup.SecurityGroupInUse):
                 self.mixin.delete_security_group(self.ctx, mock.ANY)
 
+    def test_update_security_group_statefulness_binded_conflict(self):
+        FAKE_SECGROUP['security_group']['stateful'] = mock.ANY
+        sg_dict = self.mixin.create_security_group(self.ctx, FAKE_SECGROUP)
+        FAKE_SECGROUP['security_group']['stateful'] = not sg_dict['stateful']
+        with mock.patch.object(self.mixin,
+                               '_get_port_security_group_bindings'), \
+                mock.patch.object(registry, "notify") as mock_notify:
+            mock_notify.side_effect = exceptions.CallbackFailure(Exception())
+            with testtools.ExpectedException(securitygroup.SecurityGroupInUse):
+                self.mixin.update_security_group(self.ctx, sg_dict['id'],
+                                                 FAKE_SECGROUP)
+
     def test_update_security_group_conflict(self):
         with mock.patch.object(registry, "notify") as mock_notify:
             mock_notify.side_effect = exceptions.CallbackFailure(Exception())
-            secgroup = {'security_group': mock.ANY}
+            secgroup = {'security_group': FAKE_SECGROUP}
             with testtools.ExpectedException(
                     securitygroup.SecurityGroupConflict):
                 self.mixin.update_security_group(self.ctx, 'foo_id', secgroup)
@@ -267,6 +284,7 @@ class SecurityGroupDbMixinTestCase(testlib_api.SqlTestCase):
             'project_id': FAKE_SECGROUP['security_group']['tenant_id'],
             'name': 'default',
             'description': 'Default security group',
+            'stateful': mock.ANY,
             'security_group_rules': [
                 # Four rules for egress/ingress and ipv4/ipv6
                 mock.ANY, mock.ANY, mock.ANY, mock.ANY,
@@ -319,12 +337,16 @@ class SecurityGroupDbMixinTestCase(testlib_api.SqlTestCase):
         self._test_security_group_precommit_create_event()
 
     def test_security_group_precommit_update_event(self):
+        FAKE_SECGROUP['security_group']['stateful'] = mock.ANY
         original_sg_dict = self.mixin.create_security_group(self.ctx,
                                                             FAKE_SECGROUP)
         sg_id = original_sg_dict['id']
-        with mock.patch.object(registry, "publish") as mock_notify:
+        with mock.patch.object(self.mixin,
+                               '_get_port_security_group_bindings'), \
+                mock.patch.object(registry, "publish") as mock_notify:
             fake_secgroup = copy.deepcopy(FAKE_SECGROUP)
             fake_secgroup['security_group']['name'] = 'updated_fake'
+            fake_secgroup['security_group']['stateful'] = mock.ANY
             sg_dict = self.mixin.update_security_group(
                     self.ctx, sg_id, fake_secgroup)
 
@@ -349,7 +371,8 @@ class SecurityGroupDbMixinTestCase(testlib_api.SqlTestCase):
                  mock.call('security_group', 'after_delete',
                            mock.ANY, context=mock.ANY,
                            security_group_id=sg_dict['id'],
-                           security_group_rule_ids=[mock.ANY, mock.ANY])])
+                           security_group_rule_ids=[mock.ANY, mock.ANY],
+                           name=sg_dict['name'])])
 
     def test_security_group_rule_precommit_create_event_fail(self):
         registry.subscribe(fake_callback, resources.SECURITY_GROUP_RULE,
@@ -474,3 +497,60 @@ class SecurityGroupDbMixinTestCase(testlib_api.SqlTestCase):
             {'port_range_min': None,
              'port_range_max': 200,
              'protocol': constants.PROTO_NAME_VRRP})
+
+    def _create_environment(self):
+        self.sg = copy.deepcopy(FAKE_SECGROUP)
+        self.user_ctx = context.Context(user_id='user1', tenant_id='tenant_1',
+                                        is_admin=False, overwrite=False)
+        self.admin_ctx = context.Context(user_id='user2', tenant_id='tenant_2',
+                                         is_admin=True, overwrite=False)
+        self.sg_user = self.mixin.create_security_group(
+            self.user_ctx, {'security_group': {'name': 'name',
+                                               'tenant_id': 'tenant_1',
+                                               'description': 'fake'}})
+
+    def test_get_security_group_rules(self):
+        self._create_environment()
+        rules_before = self.mixin.get_security_group_rules(self.user_ctx)
+
+        rule = copy.deepcopy(FAKE_SECGROUP_RULE)
+        rule['security_group_rule']['security_group_id'] = self.sg_user['id']
+        rule['security_group_rule']['tenant_id'] = 'tenant_2'
+        self.mixin.create_security_group_rule(self.admin_ctx, rule)
+
+        rules_after = self.mixin.get_security_group_rules(self.user_ctx)
+        self.assertEqual(len(rules_before) + 1, len(rules_after))
+        for rule in (rule for rule in rules_after if rule not in rules_before):
+            self.assertEqual('tenant_2', rule['tenant_id'])
+
+    def test_get_security_group_rules_filters_passed(self):
+        self._create_environment()
+        filters = {'security_group_id': self.sg_user['id']}
+        rules_before = self.mixin.get_security_group_rules(self.user_ctx,
+                                                           filters=filters)
+
+        default_sg = self.mixin.get_security_groups(
+            self.user_ctx, filters={'name': 'default'})[0]
+        rule = copy.deepcopy(FAKE_SECGROUP_RULE)
+        rule['security_group_rule']['security_group_id'] = default_sg['id']
+        rule['security_group_rule']['tenant_id'] = 'tenant_1'
+        self.mixin.create_security_group_rule(self.user_ctx, rule)
+
+        rules_after = self.mixin.get_security_group_rules(self.user_ctx,
+                                                          filters=filters)
+        self.assertEqual(rules_before, rules_after)
+
+    def test_get_security_group_rules_admin_context(self):
+        self._create_environment()
+        rules_before = self.mixin.get_security_group_rules(self.ctx)
+
+        rule = copy.deepcopy(FAKE_SECGROUP_RULE)
+        rule['security_group_rule']['security_group_id'] = self.sg_user['id']
+        rule['security_group_rule']['tenant_id'] = 'tenant_1'
+        self.mixin.create_security_group_rule(self.user_ctx, rule)
+
+        rules_after = self.mixin.get_security_group_rules(self.ctx)
+        self.assertEqual(len(rules_before) + 1, len(rules_after))
+        for rule in (rule for rule in rules_after if rule not in rules_before):
+            self.assertEqual('tenant_1', rule['tenant_id'])
+            self.assertEqual(self.sg_user['id'], rule['security_group_id'])

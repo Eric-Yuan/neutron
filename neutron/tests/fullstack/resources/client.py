@@ -107,20 +107,25 @@ class ClientFixture(fixtures.Fixture):
 
     def create_subnet(self, tenant_id, network_id,
                       cidr, gateway_ip=None, name=None, enable_dhcp=True,
-                      ipv6_address_mode='slaac', ipv6_ra_mode='slaac'):
+                      ipv6_address_mode='slaac', ipv6_ra_mode='slaac',
+                      subnetpool_id=None, ip_version=None):
         resource_type = 'subnet'
 
         name = name or utils.get_rand_name(prefix=resource_type)
-        ip_version = netaddr.IPNetwork(cidr).version
+        if cidr and not ip_version:
+            ip_version = netaddr.IPNetwork(cidr).version
         spec = {'tenant_id': tenant_id, 'network_id': network_id, 'name': name,
-                'cidr': cidr, 'enable_dhcp': enable_dhcp,
-                'ip_version': ip_version}
+                'enable_dhcp': enable_dhcp, 'ip_version': ip_version}
         if ip_version == constants.IP_VERSION_6:
             spec['ipv6_address_mode'] = ipv6_address_mode
             spec['ipv6_ra_mode'] = ipv6_ra_mode
 
         if gateway_ip:
             spec['gateway_ip'] = gateway_ip
+        if subnetpool_id:
+            spec['subnetpool_id'] = subnetpool_id
+        if cidr:
+            spec['cidr'] = cidr
 
         return self._create_resource(resource_type, spec)
 
@@ -312,13 +317,17 @@ class ClientFixture(fixtures.Fixture):
         }
         return self.client.trunk_remove_subports(trunk_id, spec)
 
-    def create_security_group(self, tenant_id, name=None):
+    def create_security_group(self, tenant_id, name=None, stateful=True):
         resource_type = 'security_group'
 
         name = name or utils.get_rand_name(prefix=resource_type)
-        spec = {'tenant_id': tenant_id, 'name': name}
+        spec = {'tenant_id': tenant_id, 'name': name, 'stateful': stateful}
 
         return self._create_resource(resource_type, spec)
+
+    def update_security_group(self, security_group_id, **kwargs):
+        return self._update_resource('security_group', security_group_id,
+                                     kwargs)
 
     def create_security_group_rule(self, tenant_id, security_group_id,
                                    **kwargs):
@@ -342,3 +351,6 @@ class ClientFixture(fixtures.Fixture):
         self.addCleanup(
             _safe_method(self.client.delete_network_log), net_log['log']['id'])
         return net_log
+
+    def update_quota(self, project_id, tracked_resource, quota):
+        self._update_resource('quota', project_id, {tracked_resource: quota})

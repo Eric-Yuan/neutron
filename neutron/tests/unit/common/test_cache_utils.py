@@ -10,7 +10,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from oslo_config import cfg
 from oslo_config import fixture as config_fixture
 
@@ -117,3 +118,10 @@ class TestCachingDecorator(base.BaseTestCase):
         self.decor._cache = False
         retval = self.decor.func((1, 2))
         self.assertEqual(self.decor.func_retval, retval)
+
+    def test_skip_cache(self):
+        self.decor.func(1, 2, skip_cache=True)
+        expected_key = (self.func_name, 1, 2)
+        self.decor._cache.get.assert_not_called()
+        self.decor._cache.set.assert_called_once_with(str(expected_key),
+                                                      self.decor.func_retval)

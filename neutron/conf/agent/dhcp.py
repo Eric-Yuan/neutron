@@ -68,7 +68,13 @@ DHCP_AGENT_OPTS = [
     cfg.IntOpt('num_sync_threads', default=4,
                help=_('Number of threads to use during sync process. '
                       'Should not exceed connection pool size configured on '
-                      'server.'))
+                      'server.')),
+    cfg.IntOpt('bulk_reload_interval', default=0, min=0,
+               help=_('Time to sleep between reloading the DHCP allocations. '
+                      'This will only be invoked if the value is not 0. '
+                      'If a network has N updates in X seconds then '
+                      'we will reload once with the port changes in the X '
+                      'seconds and not N times.')),
 ]
 
 DHCP_OPTS = [
@@ -110,6 +116,9 @@ DNSMASQ_OPTS = [
     cfg.IntOpt('dhcp_rebinding_time', default=0,
                help=_("DHCP rebinding time T2 (in seconds). If set to 0, it "
                       "will default to 7/8 of the lease time.")),
+    cfg.BoolOpt('dnsmasq_enable_addr6_list', default=False,
+                help=_("Enable dhcp-host entry with list of addresses when "
+                       "port has multiple IPv6 addresses in the same subnet."))
 ]
 
 

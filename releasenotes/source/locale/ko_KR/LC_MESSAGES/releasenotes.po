@@ -2,9 +2,9 @@
 # jtjang <jang.jitae@gmail.com>, 2016. #zanata
 msgid ""
 msgstr ""
-"Project-Id-Version: Neutron Release Notes\n"
+"Project-Id-Version: neutron\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2018-03-02 16:31+0000\n"
+"POT-Creation-Date: 2020-04-24 10:44+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"

@@ -397,11 +397,12 @@ class LinuxBridgeManager(amb.CommonAgentManagerBase):
         if gateway:
             # Ensure that the gateway can be updated by changing the metric
             metric = 100
-            if 'metric' in gateway:
+            ip_version = utils.get_ip_version(gateway['cidr'])
+            if gateway['metric'] != ip_lib.IP_ROUTE_METRIC_DEFAULT[ip_version]:
                 metric = gateway['metric'] - 1
-            dst_device.route.add_gateway(gateway=gateway['gateway'],
+            dst_device.route.add_gateway(gateway=gateway['via'],
                                          metric=metric)
-            src_device.route.delete_gateway(gateway=gateway['gateway'])
+            src_device.route.delete_gateway(gateway=gateway['via'])
 
         # Remove IP's from interface
         if ips:

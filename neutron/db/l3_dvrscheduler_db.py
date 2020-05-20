@@ -174,12 +174,18 @@ class L3_DVRsch_db_mixin(l3agent_sch_db.L3AgentSchedulerDbMixin):
             router_ids.add(subnet_port['device_id'])
         return router_ids
 
-    def get_subnet_ids_on_router(self, context, router_id):
+    def get_subnet_ids_on_router(self, context, router_id,
+                                 keep_gateway_port=True):
         """Return subnet IDs for interfaces attached to the given router."""
         subnet_ids = set()
         filter_rtr = {'device_id': [router_id]}
         int_ports = self._core_plugin.get_ports(context, filters=filter_rtr)
+
         for int_port in int_ports:
+            if (not keep_gateway_port and
+                    int_port['device_owner'] ==
+                    n_const.DEVICE_OWNER_ROUTER_GW):
+                continue
             int_ips = int_port['fixed_ips']
             if int_ips:
                 int_subnet = int_ips[0]['subnet_id']
@@ -433,7 +439,7 @@ class L3_DVRsch_db_mixin(l3agent_sch_db.L3AgentSchedulerDbMixin):
             else:
                 for router_id in (router_ids - result_set):
                     subnet_ids = self.get_subnet_ids_on_router(
-                        context, router_id)
+                        context, router_id, keep_gateway_port=False)
                     if (subnet_ids and
                             self._check_dvr_serviceable_ports_on_host(
                                     context, agent_db['host'],
@@ -501,19 +507,6 @@ class L3_DVRsch_db_mixin(l3agent_sch_db.L3AgentSchedulerDbMixin):
         return query.first() is not None
 
 
-def _dvr_handle_unbound_allowed_addr_pair_add(
-        plugin, context, port, allowed_address_pair):
-    plugin.update_arp_entry_for_dvr_service_port(context, port)
-
-
-def _dvr_handle_unbound_allowed_addr_pair_del(
-        plugin, context, port, allowed_address_pair):
-    aa_fixed_ips = plugin._get_allowed_address_pair_fixed_ips(context, port)
-    if aa_fixed_ips:
-        plugin.delete_arp_entry_for_dvr_service_port(
-            context, port, fixed_ips_to_delete=aa_fixed_ips)
-
-
 def _notify_l3_agent_new_port(resource, event, trigger, **kwargs):
     LOG.debug('Received %(resource)s %(event)s', {
         'resource': resource,
@@ -526,7 +519,6 @@ def _notify_l3_agent_new_port(resource, event, trigger, **kwargs):
         l3plugin = directory.get_plugin(plugin_constants.L3)
         context = kwargs['context']
         l3plugin.dvr_handle_new_service_port(context, port)
-        l3plugin.update_arp_entry_for_dvr_service_port(context, port)
 
 
 def _notify_port_delete(event, resource, trigger, **kwargs):
@@ -534,14 +526,6 @@ def _notify_port_delete(event, resource, trigger, **kwargs):
     port = kwargs['port']
     get_related_hosts_info = kwargs.get("get_related_hosts_info", True)
     l3plugin = directory.get_plugin(plugin_constants.L3)
-    if port:
-        port_host = port.get(portbindings.HOST_ID)
-        allowed_address_pairs_list = port.get('allowed_address_pairs')
-        if allowed_address_pairs_list and port_host:
-            for address_pair in allowed_address_pairs_list:
-                _dvr_handle_unbound_allowed_addr_pair_del(
-                    l3plugin, context, port, address_pair)
-    l3plugin.delete_arp_entry_for_dvr_service_port(context, port)
     removed_routers = l3plugin.get_dvr_routers_to_remove(
         context, port, get_related_hosts_info)
     for info in removed_routers:
@@ -565,14 +549,14 @@ def _notify_l3_agent_port_update(resource, event, trigger, **kwargs):
     if new_port and original_port:
         l3plugin = directory.get_plugin(plugin_constants.L3)
         context = kwargs['context']
+        new_port_host = new_port.get(portbindings.HOST_ID)
+        original_port_host = original_port.get(portbindings.HOST_ID)
         is_new_port_binding_changed = (
-            new_port[portbindings.HOST_ID] and
-            new_port[portbindings.HOST_ID] !=
-            original_port[portbindings.HOST_ID])
+            new_port_host and
+            new_port_host != original_port_host)
         is_bound_port_moved = (
-            original_port[portbindings.HOST_ID] and
-            original_port[portbindings.HOST_ID] !=
-            new_port[portbindings.HOST_ID])
+            original_port_host and
+            original_port_host != new_port_host)
         fip_router_id = None
         dest_host = None
         new_port_profile = new_port.get(portbindings.PROFILE)
@@ -630,32 +614,7 @@ def _notify_l3_agent_port_update(resource, event, trigger, **kwargs):
                     context, new_port,
                     dest_host=dest_host,
                     router_id=fip_router_id)
-            l3plugin.update_arp_entry_for_dvr_service_port(
-                context, new_port)
             return
-        # Check for allowed_address_pairs and port state
-        new_port_host = new_port.get(portbindings.HOST_ID)
-        allowed_address_pairs_list = new_port.get('allowed_address_pairs')
-        if allowed_address_pairs_list and new_port_host:
-            new_port_state = new_port.get('admin_state_up')
-            original_port_state = original_port.get('admin_state_up')
-            if new_port_state:
-                # Case were we activate the port from inactive state,
-                # or the same port has additional address_pairs added.
-                for address_pair in allowed_address_pairs_list:
-                    _dvr_handle_unbound_allowed_addr_pair_add(
-                        l3plugin, context, new_port, address_pair)
-                return
-            elif original_port_state:
-                # Case were we deactivate the port from active state.
-                for address_pair in allowed_address_pairs_list:
-                    _dvr_handle_unbound_allowed_addr_pair_del(
-                        l3plugin, context, original_port, address_pair)
-                return
-
-        if kwargs.get('mac_address_updated') or is_fixed_ips_changed:
-            l3plugin.update_arp_entry_for_dvr_service_port(
-                context, new_port)
 
 
 def subscribe():

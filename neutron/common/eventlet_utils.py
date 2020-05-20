@@ -25,7 +25,8 @@ def monkey_patch():
     # This issue is fixed in eventlet with patch
     # https://github.com/eventlet/eventlet/commit/b756447bab51046dfc6f1e0e299cc997ab343701
     # For details please check https://bugs.launchpad.net/neutron/+bug/1745013
-    eventlet.hubs.get_hub()
+    hub = eventlet.hubs.get_hub()
+    hub.is_available = lambda: True
     if os.name != 'nt':
         eventlet.monkey_patch()
 
@@ -36,3 +37,9 @@ def monkey_patch():
         # fail on Windows when using pipes due to missing non-blocking IO
         # support.
         eventlet.monkey_patch(os=False)
+    # Monkey patch the original current_thread to use the up-to-date _active
+    # global variable. See https://bugs.launchpad.net/bugs/1863021 and
+    # https://github.com/eventlet/eventlet/issues/592
+    import __original_module_threading as orig_threading
+    import threading  # noqa
+    orig_threading.current_thread.__globals__['_active'] = threading._active

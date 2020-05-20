@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
+from unittest import mock
+
 from neutron_lib.api.definitions import portbindings
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
@@ -22,6 +23,7 @@ from neutron_lib import constants as const
 from neutron_lib import context
 from neutron_lib import exceptions
 from neutron_lib.exceptions import l3 as l3_exc
+from neutron_lib.objects import exceptions as o_exc
 from neutron_lib.plugins import constants as plugin_constants
 from neutron_lib.plugins import directory
 from neutron_lib.plugins import utils as plugin_utils
@@ -394,7 +396,8 @@ class L3DvrTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
         routers = self.mixin._build_routers_list(self.ctx, routers, gw_ports)
         self.assertIsNone(routers[0].get('gw_port'))
 
-    def _helper_delete_floatingip_agent_gateway_port(self, port_host):
+    def _helper_delete_floatingip_agent_gateway_port(
+            self, port_host, delete_dvr_fip_agent_port_side_effect=None):
         ports = [{
             'id': 'my_port_id',
             portbindings.HOST_ID: 'foo_host',
@@ -410,17 +413,31 @@ class L3DvrTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
         plugin = mock.Mock()
         directory.add_plugin(plugin_constants.CORE, plugin)
         plugin.get_ports.return_value = ports
-        self.mixin.delete_floatingip_agent_gateway_port(
-            self.ctx, port_host, 'ext_network_id')
+        self.mixin._get_agent_by_type_and_host = mock.Mock(
+            return_value={'id': uuidutils.generate_uuid()})
+
+        with mock.patch.object(
+            router_obj, "DvrFipGatewayPortAgentBinding"
+        ) as dvr_fip_agent_port_obj:
+            dvr_fip_agent_port_obj_instance = (
+                dvr_fip_agent_port_obj.return_value)
+            dvr_fip_agent_port_obj_instance.delete.side_effect = (
+                delete_dvr_fip_agent_port_side_effect)
+
+            self.mixin.delete_floatingip_agent_gateway_port(
+                self.ctx, port_host, 'ext_network_id')
+
         plugin.get_ports.assert_called_with(self.ctx, filters={
             'network_id': ['ext_network_id'],
             'device_owner': [const.DEVICE_OWNER_AGENT_GW]})
         if port_host:
             plugin.ipam.delete_port.assert_called_once_with(
                 self.ctx, 'my_port_id')
+            dvr_fip_agent_port_obj_instance.delete.assert_called_once()
         else:
             plugin.ipam.delete_port.assert_called_with(
                 self.ctx, 'my_new_port_id')
+            dvr_fip_agent_port_obj_instance.delete.assert_called()
 
     def test_delete_floatingip_agent_gateway_port_without_host_id(self):
         self._helper_delete_floatingip_agent_gateway_port(None)
@@ -428,6 +445,16 @@ class L3DvrTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
     def test_delete_floatingip_agent_gateway_port_with_host_id(self):
         self._helper_delete_floatingip_agent_gateway_port(
             'foo_host')
+
+    def test_delete_floatingip_agent_gateway_port_no_host_id_fip_gw_not_found(
+            self):
+        self._helper_delete_floatingip_agent_gateway_port(
+                None, exceptions.ObjectNotFound(id='my_port_id'))
+
+    def test_delete_floatingip_agent_gateway_port_host_id_fip_gw_not_found(
+            self):
+        self._helper_delete_floatingip_agent_gateway_port(
+            'foo_host', exceptions.ObjectNotFound(id='my_port_id'))
 
     def _setup_delete_current_gw_port_deletes_dvr_internal_ports(
             self, port=None, gw_port=True, new_network_id='ext_net_id_2'):
@@ -625,6 +652,7 @@ class L3DvrTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
         self.assertTrue(create_fip.called)
 
     def test_create_fip_agent_gw_port_if_not_exists_with_l3_agent(self):
+        network_id = _uuid()
         fport_db = {'id': _uuid()}
         self.mixin._get_agent_gw_ports_exist_for_network = mock.Mock(
             return_value=fport_db)
@@ -641,7 +669,7 @@ class L3DvrTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
             return_value=fipagent)
         fport = self.mixin.create_fip_agent_gw_port_if_not_exists(
                                                 self.ctx,
-                                                'network_id',
+                                                network_id,
                                                 'host')
         self.assertIsNone(fport)
 
@@ -655,10 +683,84 @@ class L3DvrTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
                 configurations={"agent_mode": "dvr"})
         self.mixin._get_agent_by_type_and_host = mock.Mock(
             return_value=fipagent)
-        fport = self.mixin.create_fip_agent_gw_port_if_not_exists(
-                                                self.ctx,
-                                                'network_id',
-                                                'host')
+        with mock.patch.object(
+            router_obj, "DvrFipGatewayPortAgentBinding",
+        ) as dvr_fip_agent_port_obj:
+            dvr_fip_agent_port_obj_instance = (
+                dvr_fip_agent_port_obj.return_value)
+            fport = self.mixin.create_fip_agent_gw_port_if_not_exists(
+                                                    self.ctx,
+                                                    network_id,
+                                                    'host')
+
+        dvr_fip_agent_port_obj_instance.create.assert_not_called()
+        self.assertIsNotNone(fport)
+        dvr_fip_agent_port_obj_instance.delete.assert_not_called()
+
+    def test_create_fip_agent_gw_port_agent_port_not_created(self):
+        network_id = _uuid()
+        self.mixin._get_agent_gw_ports_exist_for_network = mock.Mock(
+            return_value=None)
+        fipagent = agent_obj.Agent(
+                self.ctx,
+                id=_uuid(),
+                binary='foo-agent',
+                host='host',
+                agent_type='L3 agent',
+                topic='foo_topic',
+                configurations={"agent_mode": "dvr"})
+        self.mixin._get_agent_by_type_and_host = mock.Mock(
+            return_value=fipagent)
+
+        with mock.patch.object(
+            router_obj, "DvrFipGatewayPortAgentBinding",
+        ) as dvr_fip_agent_port_obj,\
+            mock.patch.object(
+                plugin_utils, "create_port", return_value=None):
+
+            dvr_fip_agent_port_obj_instance = (
+                dvr_fip_agent_port_obj.return_value)
+
+            self.assertRaises(
+                exceptions.BadRequest,
+                self.mixin.create_fip_agent_gw_port_if_not_exists,
+                self.ctx, network_id, 'host')
+
+        dvr_fip_agent_port_obj_instance.create.assert_called_once_with()
+        self.mixin._get_agent_gw_ports_exist_for_network.\
+            assert_called_once_with(
+                self.ctx, network_id, 'host', fipagent['id'])
+        dvr_fip_agent_port_obj_instance.delete.assert_called_once_with()
+
+    def test_create_fip_agent_gw_port_if_not_exists_duplicate_port(self):
+        network_id = _uuid()
+        fport_db = {'id': _uuid()}
+        self.mixin._get_agent_gw_ports_exist_for_network = mock.Mock(
+            side_effect=[None, fport_db])
+        fipagent = agent_obj.Agent(
+                self.ctx,
+                id=_uuid(),
+                binary='foo-agent',
+                host='host',
+                agent_type='L3 agent',
+                topic='foo_topic',
+                configurations={"agent_mode": "dvr"})
+        self.mixin._get_agent_by_type_and_host = mock.Mock(
+            return_value=fipagent)
+
+        with mock.patch.object(
+            router_obj.DvrFipGatewayPortAgentBinding, 'create',
+            side_effect=o_exc.NeutronDbObjectDuplicateEntry(
+                mock.Mock(), mock.Mock())
+        ) as dvr_fip_gateway_port_agent_binding_create:
+            fport = self.mixin.create_fip_agent_gw_port_if_not_exists(
+                                                    self.ctx,
+                                                    network_id,
+                                                    'host')
+        dvr_fip_gateway_port_agent_binding_create.assert_called_once_with()
+        self.mixin._get_agent_gw_ports_exist_for_network.assert_has_calls([
+            mock.call(self.ctx, network_id, 'host', fipagent['id']),
+            mock.call(self.ctx, network_id, 'host', fipagent['id'])])
         self.assertIsNotNone(fport)
 
     def test_create_floatingip_agent_gw_port_with_non_dvr_router(self):
@@ -1035,72 +1137,6 @@ class L3DvrTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
                                                 port=mock.ANY,
                                                 interface_info=interface_info)
 
-    def test__generate_arp_table_and_notify_agent(self):
-        fixed_ip = {
-            'ip_address': '1.2.3.4',
-            'subnet_id': _uuid()}
-        mac_address = "00:11:22:33:44:55"
-        expected_arp_table = {
-            'ip_address': fixed_ip['ip_address'],
-            'subnet_id': fixed_ip['subnet_id'],
-            'mac_address': mac_address}
-        notifier = mock.Mock()
-        ports = [{'id': _uuid(), 'device_id': 'router_1'},
-                 {'id': _uuid(), 'device_id': 'router_2'}]
-        with mock.patch.object(self.core_plugin, "get_ports",
-                               return_value=ports):
-            self.mixin._generate_arp_table_and_notify_agent(
-                self.ctx, fixed_ip, mac_address, notifier)
-        notifier.assert_has_calls([
-            mock.call(self.ctx, "router_1", expected_arp_table),
-            mock.call(self.ctx, "router_2", expected_arp_table)])
-
-    def _test_update_arp_entry_for_dvr_service_port(
-            self, device_owner, action):
-        router_dict = {'name': 'test_router', 'admin_state_up': True,
-                       'distributed': True}
-        router = self._create_router(router_dict)
-        plugin = mock.Mock()
-        directory.add_plugin(plugin_constants.CORE, plugin)
-        l3_notify = self.mixin.l3_rpc_notifier = mock.Mock()
-        port = {
-            'id': 'my_port_id',
-            'fixed_ips': [
-                {'subnet_id': '51edc9e0-24f9-47f2-8e1e-2a41cb691323',
-                 'ip_address': '10.0.0.11'},
-                {'subnet_id': '2b7c8a07-6f8e-4937-8701-f1d5da1a807c',
-                 'ip_address': '10.0.0.21'},
-                {'subnet_id': '48534187-f077-4e81-93ff-81ec4cc0ad3b',
-                 'ip_address': 'fd45:1515:7e0:0:f816:3eff:fe1a:1111'}],
-            'mac_address': 'my_mac',
-            'device_owner': device_owner
-        }
-        dvr_port = {
-            'id': 'dvr_port_id',
-            'fixed_ips': mock.ANY,
-            'device_owner': const.DEVICE_OWNER_DVR_INTERFACE,
-            'device_id': router['id']
-        }
-        plugin.get_ports.return_value = [dvr_port]
-        if action == 'add':
-            self.mixin.update_arp_entry_for_dvr_service_port(
-                self.ctx, port)
-            self.assertEqual(3, l3_notify.add_arp_entry.call_count)
-        elif action == 'del':
-            self.mixin.delete_arp_entry_for_dvr_service_port(
-                self.ctx, port)
-            self.assertEqual(3, l3_notify.del_arp_entry.call_count)
-
-    def test_update_arp_entry_for_dvr_service_port_added(self):
-        action = 'add'
-        device_owner = const.DEVICE_OWNER_LOADBALANCER
-        self._test_update_arp_entry_for_dvr_service_port(device_owner, action)
-
-    def test_update_arp_entry_for_dvr_service_port_deleted(self):
-        action = 'del'
-        device_owner = const.DEVICE_OWNER_LOADBALANCER
-        self._test_update_arp_entry_for_dvr_service_port(device_owner, action)
-
     def test_add_router_interface_csnat_ports_failure(self):
         router_dict = {'name': 'test_router', 'admin_state_up': True,
                        'distributed': True}
@@ -1246,6 +1282,35 @@ class L3DvrTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
             mock_get_router.return_value = {'distributed': True}
             self.assertTrue(
                 self.mixin.is_router_distributed(self.ctx, router_id))
+
+    @mock.patch.object(l3_dvr_db, "is_port_bound")
+    def test_get_ports_under_dvr_connected_subnet(self, is_port_bound_mock):
+        router_dict = {'name': 'test_router', 'admin_state_up': True,
+                       'distributed': True}
+        router = self._create_router(router_dict)
+        with self.network() as network,\
+                self.subnet(network=network) as subnet:
+            fake_bound_ports_ids = []
+
+            def fake_is_port_bound(port):
+                return port['id'] in fake_bound_ports_ids
+
+            is_port_bound_mock.side_effect = fake_is_port_bound
+
+            for _ in range(4):
+                port_res = self.create_port(
+                    network['network']['id'],
+                    {'fixed_ips': [{'subnet_id': subnet['subnet']['id']}]})
+                port_id = self.deserialize(self.fmt, port_res)['port']['id']
+                if len(fake_bound_ports_ids) < 2:
+                    fake_bound_ports_ids.append(port_id)
+
+            self.mixin.add_router_interface(self.ctx, router['id'],
+                {'subnet_id': subnet['subnet']['id']})
+            dvr_subnet_ports = self.mixin.get_ports_under_dvr_connected_subnet(
+                self.ctx, subnet['subnet']['id'])
+            dvr_subnet_ports_ids = [p['id'] for p in dvr_subnet_ports]
+            self.assertItemsEqual(fake_bound_ports_ids, dvr_subnet_ports_ids)
 
     @mock.patch.object(plugin_utils, 'can_port_be_bound_to_virtual_bridge',
                        return_value=True)

@@ -214,6 +214,14 @@ class IPAllocation(base.NeutronDbObject):
         if alloc_db:
             return True
 
+    @classmethod
+    def delete_alloc_by_subnet_id(cls, context, subnet_id):
+        allocs = context.session.query(models_v2.IPAllocation).filter_by(
+            subnet_id=subnet_id).all()
+        for alloc in allocs:
+            alloc_obj = super(IPAllocation, cls)._load_object(context, alloc)
+            alloc_obj.delete()
+
 
 @base.NeutronObjectRegistry.register
 class PortDNS(base.NeutronDbObject):
@@ -627,3 +635,10 @@ class Port(base.NeutronDbObject):
             query = query.filter(
                 ml2_models.PortBinding.vif_type.in_(binding_types))
         return bool(query.count())
+
+    @classmethod
+    def get_ports_allocated_by_subnet_id(cls, context, subnet_id):
+        """Return ports with fixed IPs in a subnet"""
+        return context.session.query(models_v2.Port).filter(
+            models_v2.IPAllocation.port_id == models_v2.Port.id).filter(
+            models_v2.IPAllocation.subnet_id == subnet_id).all()

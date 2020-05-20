@@ -1,0 +1,115 @@
+- job:
+    name: neutron-grenade-multinode
+    parent: grenade-multinode
+    required-projects:
+      - openstack/grenade
+      - openstack/neutron
+    irrelevant-files: &irrelevant-files
+      - ^(test-|)requirements.txt$
+      - ^.*\.rst$
+      - ^doc/.*$
+      - ^neutron/locale/.*$
+      - ^neutron/tests/unit/.*$
+      - ^releasenotes/.*$
+      - ^setup.cfg$
+      - ^tools/.*$
+      - ^tox.ini$
+      - ^vagrant/.*$
+      - ^migration/.*$
+    vars:
+      devstack_services:
+        c-bak: false
+        etcd: false
+        s-account: false
+        s-container: false
+        s-object: false
+        s-proxy: false
+
+- job:
+    name: neutron-grenade-dvr-multinode
+    parent: grenade-multinode
+    pre-run: playbooks/dvr-multinode-scenario-pre-run.yaml
+    roles:
+      - zuul: openstack/neutron-tempest-plugin
+    required-projects:
+      - openstack/grenade
+      - openstack/neutron
+    irrelevant-files: *irrelevant-files
+    vars:
+      devstack_services:
+        c-bak: false
+        etcd: false
+        s-account: false
+        s-container: false
+        s-object: false
+        s-proxy: false
+      devstack_local_conf:
+        post-config:
+          $NEUTRON_CONF:
+            DEFAULT:
+              router_distributed: True
+          # NOTE(slaweq): We can get rid of this hardcoded absolute path when
+          # devstack-tempest job will be switched to use lib/neutron instead of
+          # lib/neutron-legacy
+          "/$NEUTRON_CORE_PLUGIN_CONF":
+            ml2:
+              mechanism_drivers: openvswitch,l2population
+            agent:
+              enable_distributed_routing: True
+              l2_population: True
+              tunnel_types: vxlan
+              arp_responder: True
+            ovs:
+              tunnel_bridge: br-tun
+              bridge_mappings: public:br-ex
+          $NEUTRON_L3_CONF:
+            DEFAULT:
+              agent_mode: dvr
+            agent:
+              availability_zone: nova
+          $NEUTRON_DHCP_CONF:
+            agent:
+              availability_zone: nova
+    group-vars:
+      subnode:
+        devstack_services:
+          q-agt: true
+          q-l3: true
+          q-meta: true
+        devstack_local_conf:
+          post-config:
+            $NEUTRON_CONF:
+              DEFAULT:
+                router_distributed: True
+            # NOTE(slaweq): We can get rid of this hardcoded absolute path when
+            # devstack-tempest job will be switched to use lib/neutron instead of
+            # lib/neutron-legacy
+            "/$NEUTRON_CORE_PLUGIN_CONF":
+              agent:
+                enable_distributed_routing: True
+                l2_population: True
+                tunnel_types: vxlan
+                arp_responder: True
+              ovs:
+                tunnel_bridge: br-tun
+                bridge_mappings: public:br-ex
+            $NEUTRON_L3_CONF:
+              DEFAULT:
+                agent_mode: dvr_snat
+              agent:
+                availability_zone: nova
+
+- job:
+    name: neutron-ovn-grenade
+    parent: legacy-dsvm-base
+    run: playbooks/legacy/neutron-ovn-grenade/run.yaml
+    post-run: playbooks/legacy/neutron-ovn-grenade/post.yaml
+    timeout: 9000
+    irrelevant-files: *irrelevant-files
+    required-projects:
+      - openstack/grenade
+      - openstack/devstack-gate
+      - openstack/neutron-tempest-plugin
+      - openstack/tempest
+      - openstack/networking-ovn
+

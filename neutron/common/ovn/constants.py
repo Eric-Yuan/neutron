@@ -10,6 +10,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import re
+
 from neutron_lib.api.definitions import portbindings
 from neutron_lib import constants as const
 import six
@@ -157,9 +159,22 @@ MAINTENANCE_DELETE_TYPE_ORDER = {
 # peer router port (connecting to the logical router).
 DEFAULT_ADDR_FOR_LSP_WITH_PEER = 'router'
 
+# FIP ACTIONS
+FIP_ACTION_ASSOCIATE = 'fip_associate'
+FIP_ACTION_DISASSOCIATE = 'fip_disassociate'
+
 # Loadbalancer constants
 LRP_PREFIX = "lrp-"
+RE_PORT_FROM_GWC = re.compile(r'(%s)([\w-]+)_([\w-]+)' % LRP_PREFIX)
 LB_VIP_PORT_PREFIX = "ovn-lb-vip-"
+LB_EXT_IDS_LS_REFS_KEY = 'ls_refs'
+LB_EXT_IDS_LR_REF_KEY = 'lr_ref'
+LB_EXT_IDS_POOL_PREFIX = 'pool_'
+LB_EXT_IDS_LISTENER_PREFIX = 'listener_'
+LB_EXT_IDS_MEMBER_PREFIX = 'member_'
+LB_EXT_IDS_VIP_KEY = 'neutron:vip'
+LB_EXT_IDS_VIP_FIP_KEY = 'neutron:vip_fip'
+LB_EXT_IDS_VIP_PORT_ID_KEY = 'neutron:vip_port_id'
 
 # Hash Ring constants
 HASH_RING_NODES_TIMEOUT = 60
@@ -183,3 +198,19 @@ LSP_OPTIONS_VIRTUAL_IP_KEY = 'virtual-ip'
 
 HA_CHASSIS_GROUP_DEFAULT_NAME = 'default_ha_chassis_group'
 HA_CHASSIS_GROUP_HIGHEST_PRIORITY = 32767
+
+# TODO(lucasagomes): Move this to neutron-lib later.
+# Metadata constants
+METADATA_DEFAULT_PREFIX = 16
+METADATA_DEFAULT_IP = '169.254.169.254'
+METADATA_DEFAULT_CIDR = '%s/%d' % (METADATA_DEFAULT_IP,
+                                   METADATA_DEFAULT_PREFIX)
+METADATA_PORT = 80
+
+# OVN igmp options
+MCAST_SNOOP = 'mcast_snoop'
+MCAST_FLOOD_UNREGISTERED = 'mcast_flood_unregistered'
+
+EXTERNAL_PORT_TYPES = (portbindings.VNIC_DIRECT,
+                       portbindings.VNIC_DIRECT_PHYSICAL,
+                       portbindings.VNIC_MACVTAP)

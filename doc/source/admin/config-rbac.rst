@@ -18,6 +18,8 @@ is supported by:
 * Binding QoS policies permissions to networks or ports (since Mitaka).
 * Attaching router gateways to networks (since Mitaka).
 * Binding security groups to ports (since Stein).
+* Assigning address scopes to subnet pools (since Ussuri).
+* Assigning subnet pools to subnets (since Ussuri).
 
 
 Sharing an object with specific projects
@@ -281,12 +283,173 @@ This process can be repeated any number of times to share a security-group
 with an arbitrary number of projects.
 
 
+Sharing an address scope with specific projects
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Create an address scope to share:
+
+.. code-block:: console
+
+   $ openstack address scope create my_address_scope
+   +-------------------+--------------------------------------+
+   | Field             | Value                                |
+   +-------------------+--------------------------------------+
+   | id                | c19cb654-3489-4160-9c82-8a3015483643 |
+   | ip_version        | 4                                    |
+   | location          | ...                                  |
+   | name              | my_address_scope                     |
+   | project_id        | 34304bc4f233470fa4a2448d153b6324     |
+   | shared            | False                                |
+   +-------------------+--------------------------------------+
+
+
+Create the RBAC policy entry using the :command:`openstack network rbac create`
+command (in this example, the ID of the project we want to share with is
+``32016615de5d43bb88de99e7f2e26a1e``):
+
+.. code-block:: console
+
+   $ openstack network rbac create --target-project \
+   32016615de5d43bb88de99e7f2e26a1e --action access_as_shared \
+   --type address_scope c19cb654-3489-4160-9c82-8a3015483643
+   +-------------------+--------------------------------------+
+   | Field             | Value                                |
+   +-------------------+--------------------------------------+
+   | action            | access_as_shared                     |
+   | id                | d54b1482-98c4-44aa-9115-ede80387ffe0 |
+   | location          | ...                                  |
+   | name              | None                                 |
+   | object_id         | c19cb654-3489-4160-9c82-8a3015483643 |
+   | object_type       | address_scope                        |
+   | project_id        | 34304bc4f233470fa4a2448d153b6324     |
+   | target_project_id | 32016615de5d43bb88de99e7f2e26a1e     |
+   +-------------------+--------------------------------------+
+
+
+The ``target-project`` parameter specifies the project that requires
+access to the address scope. The ``action`` parameter specifies what
+the project is allowed to do. The ``type`` parameter says
+that the target object is an address scope. The final parameter is the ID of
+the address scope we are granting access to.
+
+Project ``32016615de5d43bb88de99e7f2e26a1e`` will now be able to see
+the address scope when running :command:`openstack address scope list` and
+:command:`openstack address scope show` and will also be able to assign
+it to its subnet pools. No other users (other than admins and the owner)
+will be able to see the address scope.
+
+To remove access for that project, delete the RBAC policy that allows
+it using the :command:`openstack network rbac delete` command:
+
+.. code-block:: console
+
+   $ openstack network rbac delete d54b1482-98c4-44aa-9115-ede80387ffe0
+
+If that project has subnet pools with the address scope applied to them,
+the server will not delete the RBAC policy until
+the address scope is no longer in use:
+
+.. code-block:: console
+
+   $ openstack network rbac delete d54b1482-98c4-44aa-9115-ede80387ffe0
+   RBAC policy on object c19cb654-3489-4160-9c82-8a3015483643
+   cannot be removed because other objects depend on it.
+
+This process can be repeated any number of times to share an address scope
+with an arbitrary number of projects.
+
+Sharing a subnet pool with specific projects
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Create a subnet pool to share:
+
+.. code-block:: console
+
+   $ openstack subnet pool create my_subnetpool --pool-prefix 203.0.113.0/24
+   +-------------------+--------------------------------------+
+   | Field             | Value                                |
+   +-------------------+--------------------------------------+
+   | address_scope_id  | None                                 |
+   | created_at        | 2020-03-16T14:23:01Z                 |
+   | default_prefixlen | 8                                    |
+   | default_quota     | None                                 |
+   | description       |                                      |
+   | id                | 11f79287-bc17-46b2-bfd0-2562471eb631 |
+   | ip_version        | 4                                    |
+   | is_default        | False                                |
+   | location          | ...                                  |
+   | max_prefixlen     | 32                                   |
+   | min_prefixlen     | 8                                    |
+   | name              | my_subnetpool                        |
+   | project_id        | 290ccedbcf594ecc8e76eff06f964f7e     |
+   | revision_number   | 0                                    |
+   | shared            | False                                |
+   | tags              |                                      |
+   | updated_at        | 2020-03-16T14:23:01Z                 |
+   +-------------------+--------------------------------------+
+
+
+Create the RBAC policy entry using the :command:`openstack network rbac create`
+command (in this example, the ID of the project we want to share with is
+``32016615de5d43bb88de99e7f2e26a1e``):
+
+.. code-block:: console
+
+   $ openstack network rbac create --target-project \
+   32016615de5d43bb88de99e7f2e26a1e --action access_as_shared \
+   --type subnetpool 11f79287-bc17-46b2-bfd0-2562471eb631
+   +-------------------+--------------------------------------+
+   | Field             | Value                                |
+   +-------------------+--------------------------------------+
+   | action            | access_as_shared                     |
+   | id                | d54b1482-98c4-44aa-9115-ede80387ffe0 |
+   | location          | ...                                  |
+   | name              | None                                 |
+   | object_id         | 11f79287-bc17-46b2-bfd0-2562471eb631 |
+   | object_type       | subnetpool                           |
+   | project_id        | 290ccedbcf594ecc8e76eff06f964f7e     |
+   | target_project_id | 32016615de5d43bb88de99e7f2e26a1e     |
+   +-------------------+--------------------------------------+
+
+
+The ``target-project`` parameter specifies the project that requires
+access to the subnet pool. The ``action`` parameter specifies what
+the project is allowed to do. The ``type`` parameter says
+that the target object is a subnet pool. The final parameter is the ID of
+the subnet pool we are granting access to.
+
+Project ``32016615de5d43bb88de99e7f2e26a1e`` will now be able to see
+the subnet pool when running :command:`openstack subnet pool list` and
+:command:`openstack subnet pool show` and will also be able to assign
+it to its subnets. No other users (other than admins and the owner)
+will be able to see the subnet pool.
+
+To remove access for that project, delete the RBAC policy that allows
+it using the :command:`openstack network rbac delete` command:
+
+.. code-block:: console
+
+   $ openstack network rbac delete d54b1482-98c4-44aa-9115-ede80387ffe0
+
+If that project has subnets with the subnet pool applied to them,
+the server will not delete the RBAC policy until
+the subnet pool is no longer in use:
+
+.. code-block:: console
+
+   $ openstack network rbac delete d54b1482-98c4-44aa-9115-ede80387ffe0
+   RBAC policy on object 11f79287-bc17-46b2-bfd0-2562471eb631
+   cannot be removed because other objects depend on it.
+
+This process can be repeated any number of times to share a subnet pool
+with an arbitrary number of projects.
+
 How the 'shared' flag relates to these entries
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 As introduced in other guide entries, neutron provides a means of
-making an object (``network``, ``qos-policy``, ``security-group``) available
-to every project.
+making an object (``address-scope``, ``network``, ``qos-policy``,
+``security-group``, ``subnetpool``) available to every project.
 This is accomplished using the ``shared`` flag on the supported object:
 
 .. code-block:: console

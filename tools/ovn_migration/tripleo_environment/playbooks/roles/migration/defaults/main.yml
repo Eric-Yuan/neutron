@@ -1,0 +1,4 @@
+---
+
+tunnel_bridge: "br-tun"
+ovn_bridge: "br-int"

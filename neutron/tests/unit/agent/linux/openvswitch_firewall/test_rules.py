@@ -12,7 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from neutron_lib import constants
 
 from neutron.agent.linux.openvswitch_firewall import constants as ovsfw_consts
@@ -349,7 +350,8 @@ class TestCreateFlowsForIpAddress(base.BaseTestCase):
 
         conj_ids = [12, 20]
         flows = rules.create_flows_for_ip_address(
-            '192.168.0.1', constants.EGRESS_DIRECTION, constants.IPv4,
+            ('192.168.0.1', 'fa:16:3e:aa:bb:cc'),
+            constants.EGRESS_DIRECTION, constants.IPv4,
             0x123, conj_ids)
 
         self.assertEqual(2, len(flows))

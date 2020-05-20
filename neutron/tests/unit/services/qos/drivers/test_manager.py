@@ -10,7 +10,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from neutron_lib.api.definitions import portbindings
 from neutron_lib import constants as lib_consts
 from neutron_lib import context
@@ -111,7 +112,8 @@ class TestQoSDriversRulesValidations(TestQosDriversManagerBase):
         driver_manager._drivers[0].is_rule_supported = is_rule_supported_mock
 
         self.assertEqual(expected_result,
-                         driver_manager.validate_rule_for_port(rule, port))
+                         driver_manager.validate_rule_for_port(
+                             mock.Mock(), rule, port))
         if expected_result:
             is_rule_supported_mock.assert_called_once_with(rule)
         else:

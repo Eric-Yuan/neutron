@@ -18,9 +18,9 @@ import copy
 import functools
 import itertools
 import random
+from unittest import mock
 
 import eventlet
-import mock
 import netaddr
 from neutron_lib.callbacks import exceptions
 from neutron_lib.callbacks import registry
@@ -574,7 +574,8 @@ class NeutronDbPluginV2TestCase(testlib_api.WebTestCase):
         return self.deserialize(fmt, res)
 
     def _api_for_resource(self, resource):
-        if resource in ['networks', 'subnets', 'ports', 'subnetpools']:
+        if resource in ['networks', 'subnets', 'ports', 'subnetpools',
+                        'security-groups']:
             return self.api
         else:
             return self.ext_api
@@ -3934,7 +3935,7 @@ class TestSubnetsV2(NeutronDbPluginV2TestCase):
                                  ipv6_ra_mode=constants.DHCPV6_STATEFUL,
                                  ipv6_address_mode=constants.DHCPV6_STATEFUL)
         # If gateway_ip is not specified, allocate first IP from the subnet
-        expected = {'gateway_ip': gateway,
+        expected = {'gateway_ip': str(netaddr.IPNetwork(cidr).network),
                     'cidr': cidr}
         self._test_create_subnet(expected=expected,
                                  cidr=cidr, ip_version=constants.IP_VERSION_6,
@@ -3966,8 +3967,9 @@ class TestSubnetsV2(NeutronDbPluginV2TestCase):
                                  cidr=cidr, ip_version=constants.IP_VERSION_6,
                                  ipv6_ra_mode=constants.DHCPV6_STATELESS,
                                  ipv6_address_mode=constants.DHCPV6_STATELESS)
-        # If gateway_ip is not specified, allocate first IP from the subnet
-        expected = {'gateway_ip': gateway,
+        # If gateway_ip is not specified and the subnet is using prefix
+        # delegation, until the CIDR is assigned, this value should be "None"
+        expected = {'gateway_ip': None,
                     'cidr': cidr}
         self._test_create_subnet(expected=expected,
                                  cidr=cidr, ip_version=constants.IP_VERSION_6,
@@ -6506,11 +6508,10 @@ class DbModelMixin(object):
                                         project_id='fake_project',
                                         mtu=1500)
             ctx.session.add(network)
-            with db_api.autonested_transaction(ctx.session):
-                sg = sg_models.SecurityGroup(name='sg', description='sg')
-                ctx.session.add(sg)
             # ensure db rels aren't loaded until commit for network object
-            # by sharing after a nested transaction
+            # by sharing after flush
+            ctx.session.flush()
+
             network_obj.NetworkRBAC(
                 ctx, object_id=network.id,
                 action='access_as_shared',
@@ -6554,11 +6555,12 @@ class DbModelMixin(object):
         return sg, rule
 
     def _make_floating_ip(self, ctx, port_id):
-        flip = l3_obj.FloatingIP(
-            ctx, floating_ip_address=netaddr.IPAddress('1.2.3.4'),
-            floating_network_id=uuidutils.generate_uuid(),
-            floating_port_id=port_id)
-        flip.create()
+        with db_api.CONTEXT_WRITER.using(ctx):
+            flip = l3_obj.FloatingIP(
+                ctx, floating_ip_address=netaddr.IPAddress('1.2.3.4'),
+                floating_network_id=uuidutils.generate_uuid(),
+                floating_port_id=port_id)
+            flip.create()
         return flip
 
     def _make_router(self, ctx):
@@ -6577,7 +6579,7 @@ class DbModelMixin(object):
         self.assertEqual(
             obj.__table__.name,
             self._get_neutron_attr(ctx, attr_id).resource_type)
-        with ctx.session.begin():
+        with db_api.CONTEXT_WRITER.using(ctx):
             ctx.session.delete(obj)
         with testtools.ExpectedException(orm.exc.NoResultFound):
             # we want to make sure that the attr resource was removed
@@ -6753,7 +6755,7 @@ class DbModelTenantTestCase(DbModelMixin, testlib_api.SqlTestCase):
         return subnet
 
     def _make_port(self, ctx, network_id):
-        with ctx.session.begin():
+        with db_api.CONTEXT_WRITER.using(ctx):
             port = models_v2.Port(network_id=network_id, mac_address='1',
                                   tenant_id='dbcheck',
                                   admin_state_up=True, status="COOL",
@@ -6765,7 +6767,7 @@ class DbModelTenantTestCase(DbModelMixin, testlib_api.SqlTestCase):
         with db_api.CONTEXT_WRITER.using(ctx):
             subnetpool = models_v2.SubnetPool(
                 ip_version=constants.IP_VERSION_4, default_prefixlen=4,
-                min_prefixlen=4, max_prefixlen=4, shared=False,
+                min_prefixlen=4, max_prefixlen=4,
                 default_quota=4, address_scope_id='f', tenant_id='dbcheck',
                 is_default=False
             )
@@ -6793,7 +6795,7 @@ class DbModelProjectTestCase(DbModelMixin, testlib_api.SqlTestCase):
         return subnet
 
     def _make_port(self, ctx, network_id):
-        with ctx.session.begin():
+        with db_api.CONTEXT_WRITER.using(ctx):
             port = models_v2.Port(network_id=network_id, mac_address='1',
                                   project_id='dbcheck',
                                   admin_state_up=True, status="COOL",
@@ -6805,7 +6807,7 @@ class DbModelProjectTestCase(DbModelMixin, testlib_api.SqlTestCase):
         with db_api.CONTEXT_WRITER.using(ctx):
             subnetpool = models_v2.SubnetPool(
                 ip_version=constants.IP_VERSION_4, default_prefixlen=4,
-                min_prefixlen=4, max_prefixlen=4, shared=False,
+                min_prefixlen=4, max_prefixlen=4,
                 default_quota=4, address_scope_id='f', project_id='dbcheck',
                 is_default=False
             )

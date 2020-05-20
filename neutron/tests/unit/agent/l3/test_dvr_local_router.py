@@ -12,7 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from neutron_lib.api.definitions import portbindings
 from neutron_lib import constants as lib_constants
 from oslo_config import cfg
@@ -561,14 +562,14 @@ class TestDvrRouterOperations(base.BaseTestCase):
         payload = {'arp_table': arp_table, 'router_id': router['id']}
         agent.add_arp_entry(None, payload)
 
-    def test__update_arp_entry_with_no_subnet(self):
+    def test_get_arp_related_dev_no_subnet(self):
         self._set_ri_kwargs(mock.sentinel.agent,
                             'foo_router_id',
                             {'distributed': True, 'gw_port_host': HOSTNAME})
         ri = dvr_router.DvrLocalRouter(HOSTNAME, **self.ri_kwargs)
-        ri.get_internal_device_name = mock.Mock()
-        ri._update_arp_entry(mock.ANY, mock.ANY, 'foo_subnet_id', 'add')
-        self.assertFalse(ri.get_internal_device_name.call_count)
+        with mock.patch('neutron.agent.linux.ip_lib.IPDevice') as f:
+            ri.get_arp_related_dev('foo_subnet_id')
+        self.assertFalse(f.call_count)
 
     def _setup_test_for_arp_entry_cache(self):
         agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
@@ -585,9 +586,9 @@ class TestDvrRouterOperations(base.BaseTestCase):
         state = True
         with mock.patch('neutron.agent.linux.ip_lib.IPDevice') as rtrdev,\
                 mock.patch.object(ri, '_cache_arp_entry') as arp_cache:
-            rtrdev.return_value.exists.return_value = False
             state = ri._update_arp_entry(
-                mock.ANY, mock.ANY, subnet_id, 'add')
+                mock.ANY, mock.ANY, subnet_id, 'add',
+                mock.ANY, device_exists=False)
         self.assertFalse(state)
         self.assertTrue(arp_cache.called)
         arp_cache.assert_called_once_with(mock.ANY, mock.ANY,
@@ -899,9 +900,37 @@ class TestDvrRouterOperations(base.BaseTestCase):
         self.mock_driver.unplug.reset_mock()
         self._set_ri_kwargs(agent, router['id'], router)
         ri = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, [], **self.ri_kwargs)
+        ri._ha_state_path = self.get_temp_file_path('router_ha_state')
         ri._create_snat_namespace = mock.Mock()
         ri.update_initial_state = mock.Mock()
         ri._plug_external_gateway = mock.Mock()
         ri.initialize(mock.Mock())
         ri._create_dvr_gateway(mock.Mock(), mock.Mock())
         ri._create_snat_namespace.assert_called_once_with()
+
+    def test_initialize_dvr_ha_router_reset_state(self):
+        agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
+        agent.conf.agent_mode = lib_constants.L3_AGENT_MODE_DVR_SNAT
+        router = l3_test_common.prepare_router_data(
+            num_internal_ports=2, enable_ha=True)
+        router['gw_port_host'] = HOSTNAME
+        router[lib_constants.HA_INTERFACE_KEY]['status'] = 'ACTIVE'
+        self.mock_driver.unplug.reset_mock()
+        self._set_ri_kwargs(agent, router['id'], router)
+
+        ri = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, [], **self.ri_kwargs)
+        ri._ha_state_path = self.get_temp_file_path('router_ha_state')
+
+        with open(ri._ha_state_path, "w") as f:
+            f.write("master")
+
+        ri._create_snat_namespace = mock.Mock()
+        ri.update_initial_state = mock.Mock()
+        ri._plug_external_gateway = mock.Mock()
+        with mock.patch("neutron.agent.linux.keepalived."
+                        "KeepalivedManager.check_processes",
+                        return_value=False):
+            ri.initialize(mock.Mock())
+            with open(ri._ha_state_path, "r") as f:
+                state = f.readline()
+                self.assertEqual("backup", state)

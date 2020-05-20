@@ -13,7 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
 from neutron_lib.agent import topics
 from neutron_lib.api.definitions import port as port_def
@@ -373,7 +373,7 @@ class TestL2PopulationRpcTestCase(test_plugin.Ml2PluginV2TestCase):
                                                 agent_id=HOST_4,
                                                 device=port_id,
                                                 host=HOST_4,
-                                                agent_restarted=True)
+                                                refresh_tunnels=True)
                 fanout_expected = {port['port']['network_id']: {
                     'network_type': u'vxlan',
                     'ports': {u'20.0.0.4': [('00:00:00:00:00:00', '0.0.0.0')]},

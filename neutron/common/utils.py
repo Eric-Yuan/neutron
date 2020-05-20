@@ -38,6 +38,7 @@ import netaddr
 from neutron_lib import constants as n_const
 from neutron_lib.db import api as db_api
 from neutron_lib import exceptions as n_exc
+from neutron_lib.services.trunk import constants as trunk_constants
 from neutron_lib.utils import helpers
 from oslo_config import cfg
 from oslo_db import exception as db_exc
@@ -178,7 +179,8 @@ def get_other_dvr_serviced_device_owners(host_dvr_for_dhcp=True):
     separately (see is_dvr_serviced() below)
     """
     device_owners = [n_const.DEVICE_OWNER_LOADBALANCER,
-                     n_const.DEVICE_OWNER_LOADBALANCERV2]
+                     n_const.DEVICE_OWNER_LOADBALANCERV2,
+                     trunk_constants.TRUNK_SUBPORT_OWNER]
     if host_dvr_for_dhcp:
         device_owners.append(n_const.DEVICE_OWNER_DHCP)
     return device_owners
@@ -873,6 +875,12 @@ class Timer(object):
 
     The timeout exception can be suppressed; when the time expires, the context
     finishes without rising TimerTimeout.
+
+    NOTE(ralonsoh): this class, when a timeout is defined, cannot be used in
+    other than the main thread. When a timeout is defined, an alarm signal is
+    set. Only the main thread is allowed to set a signal handler and the signal
+    handlers are always executed in this main thread [1].
+    [1] https://docs.python.org/3/library/signal.html#signals-and-threads
     """
     def __init__(self, timeout=None, raise_exception=True):
         self.start = self.delta = None

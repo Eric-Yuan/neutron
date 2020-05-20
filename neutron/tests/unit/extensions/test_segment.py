@@ -13,8 +13,8 @@
 #    under the License.
 
 import copy
+from unittest import mock
 
-import mock
 import netaddr
 from neutron_lib.api.definitions import ip_allocation as ipalloc_apidef
 from neutron_lib.api.definitions import l2_adjacency as l2adj_apidef
@@ -1007,6 +1007,19 @@ class SegmentAwareIpamTestCase(SegmentTestCase):
                                         is_adjacent=False)
             return subnet
 
+    def _create_test_slaac_subnet_with_segment(
+            self, network, segment, cidr='2001:db8:0:0::/64'):
+        with self.subnet(network=network,
+                         segment_id=segment['segment']['id'],
+                         ip_version=constants.IP_VERSION_6,
+                         ipv6_ra_mode=constants.IPV6_SLAAC,
+                         ipv6_address_mode=constants.IPV6_SLAAC,
+                         cidr=cidr,
+                         allocation_pools=None) as subnet:
+            self._validate_l2_adjacency(network['network']['id'],
+                                        is_adjacent=False)
+            return subnet
+
     def _validate_l2_adjacency(self, network_id, is_adjacent):
         request = self.new_show_request('networks', network_id)
         response = self.deserialize(self.fmt, request.get_response(self.api))
@@ -1028,6 +1041,27 @@ class TestSegmentAwareIpam(SegmentAwareIpamTestCase):
                 segments.append(segment)
                 subnets.append(subnet)
             return network, segments, subnets
+
+    def _create_net_two_segments_four_slaac_subnets(self):
+        with self.network() as network:
+            segment_a = self._test_create_segment(
+                network_id=network['network']['id'],
+                physical_network='physnet_a',
+                network_type=constants.TYPE_FLAT)
+            segment_b = self._test_create_segment(
+                network_id=network['network']['id'],
+                physical_network='physnet_b',
+                network_type=constants.TYPE_FLAT)
+            subnet_a0 = self._create_test_slaac_subnet_with_segment(
+                network, segment_a, '2001:db8:a:0::/64')
+            subnet_a1 = self._create_test_slaac_subnet_with_segment(
+                network, segment_a, '2001:db8:a:1::/64')
+            subnet_b0 = self._create_test_slaac_subnet_with_segment(
+                network, segment_b, '2001:db8:b:0::/64')
+            subnet_b1 = self._create_test_slaac_subnet_with_segment(
+                network, segment_b, '2001:db8:b:1::/64')
+            return (network, segment_a, segment_b, subnet_a0, subnet_a1,
+                    subnet_b0, subnet_b1)
 
     def test_port_create_with_segment_subnets(self):
         """No binding information is provided, defer IP allocation"""
@@ -1628,6 +1662,167 @@ class TestSegmentAwareIpam(SegmentAwareIpamTestCase):
         self.assertEqual(webob.exc.HTTPOk.code, response.status_int)
         self._assert_one_ip_in_subnet(response, subnet['subnet']['cidr'])
 
+    def test_slaac_segment_aware_no_binding_info(self):
+        (network, segment_a, segment_b, subnet_a0, subnet_a1, subnet_b0,
+         subnet_b1) = self._create_net_two_segments_four_slaac_subnets()
+
+        # Create a port with no IP address (since there is no subnet)
+        port_deferred = self._create_deferred_ip_port(network)
+        self._validate_deferred_ip_allocation(port_deferred['port']['id'])
+
+    def test_slaac_segment_aware_immediate_fixed_ips_no_binding_info_(self):
+        (network, segment_a, segment_b, subnet_a0, subnet_a1, subnet_b0,
+         subnet_b1) = self._create_net_two_segments_four_slaac_subnets()
+
+        # Create two ports, port_a with subnet_a0 in fixed_ips and port_b
+        # with subnet_b0 in fixed_ips
+        port_a = self._create_port_and_show(
+            network, fixed_ips=[{'subnet_id': subnet_a0['subnet']['id']}])
+        port_b = self._create_port_and_show(
+            network, fixed_ips=[{'subnet_id': subnet_b0['subnet']['id']}])
+        self._validate_immediate_ip_allocation(port_a['port']['id'])
+        self._validate_immediate_ip_allocation(port_b['port']['id'])
+        self.assertEqual(2, len(port_a['port']['fixed_ips']))
+        self.assertEqual(2, len(port_b['port']['fixed_ips']))
+        port_a_snet_ids = [f['subnet_id'] for f in port_a['port']['fixed_ips']]
+        port_b_snet_ids = [f['subnet_id'] for f in port_b['port']['fixed_ips']]
+        self.assertIn(subnet_a0['subnet']['id'], port_a_snet_ids)
+        self.assertIn(subnet_a1['subnet']['id'], port_a_snet_ids)
+        self.assertIn(subnet_b0['subnet']['id'], port_b_snet_ids)
+        self.assertIn(subnet_b1['subnet']['id'], port_b_snet_ids)
+        self.assertNotIn(subnet_a0['subnet']['id'], port_b_snet_ids)
+        self.assertNotIn(subnet_a1['subnet']['id'], port_b_snet_ids)
+        self.assertNotIn(subnet_b0['subnet']['id'], port_a_snet_ids)
+        self.assertNotIn(subnet_b1['subnet']['id'], port_a_snet_ids)
+
+    def test_slaac_segment_aware_immediate_with_binding_info(self):
+        (network, segment_a, segment_b, subnet_a0, subnet_a1, subnet_b0,
+         subnet_b1) = self._create_net_two_segments_four_slaac_subnets()
+
+        self._setup_host_mappings([(segment_a['segment']['id'], 'fakehost_a')])
+
+        # Create a port with host ID, validate immediate allocation on subnets
+        # with correct segment_id.
+        response = self._create_port(self.fmt,
+                                     net_id=network['network']['id'],
+                                     tenant_id=network['network']['tenant_id'],
+                                     arg_list=(portbindings.HOST_ID,),
+                                     **{portbindings.HOST_ID: 'fakehost_a'})
+        res = self.deserialize(self.fmt, response)
+        self._validate_immediate_ip_allocation(res['port']['id'])
+        # Since host mapped to segment_a, IP's must come from subnets:
+        #   subnet_a0 and subnet_a1
+        self.assertEqual(2, len(res['port']['fixed_ips']))
+        res_subnet_ids = [f['subnet_id'] for f in res['port']['fixed_ips']]
+        self.assertIn(subnet_a0['subnet']['id'], res_subnet_ids)
+        self.assertIn(subnet_a1['subnet']['id'], res_subnet_ids)
+        self.assertNotIn(subnet_b0['subnet']['id'], res_subnet_ids)
+        self.assertNotIn(subnet_b1['subnet']['id'], res_subnet_ids)
+
+    def test_slaac_segment_aware_add_subnet(self):
+        (network, segment_a, segment_b, subnet_a0, subnet_a1, subnet_b0,
+         subnet_b1) = self._create_net_two_segments_four_slaac_subnets()
+
+        # Create a port with no IP address (since there is no subnet)
+        port_deferred = self._create_deferred_ip_port(network)
+        self._validate_deferred_ip_allocation(port_deferred['port']['id'])
+
+        # Create two ports, port_a with subnet_a0 in fixed_ips and port_b
+        # with subnet_b0 in fixed_ips
+        port_a = self._create_port_and_show(
+            network, fixed_ips=[{'subnet_id': subnet_a0['subnet']['id']}])
+        port_b = self._create_port_and_show(
+            network, fixed_ips=[{'subnet_id': subnet_b0['subnet']['id']}])
+        self._validate_immediate_ip_allocation(port_a['port']['id'])
+        self._validate_immediate_ip_allocation(port_b['port']['id'])
+        self.assertEqual(2, len(port_a['port']['fixed_ips']))
+        self.assertEqual(2, len(port_b['port']['fixed_ips']))
+
+        # Add another subnet on segment_a
+        subnet_a2 = self._create_test_slaac_subnet_with_segment(
+            network, segment_a, '2001:db8:a:2::/64')
+        # The port with deferred allocation should not have an allocation
+        req = self.new_show_request('ports', port_deferred['port']['id'])
+        res = req.get_response(self.api)
+        port_deferred = self.deserialize(self.fmt, res)
+        self._validate_deferred_ip_allocation(port_deferred['port']['id'])
+        self.assertEqual(0, len(port_deferred['port']['fixed_ips']))
+        # port_a should get an allocation on the new subnet.
+        # port_b does not get an allocation.
+        req = self.new_show_request('ports', port_a['port']['id'])
+        res = req.get_response(self.api)
+        port_a = self.deserialize(self.fmt, res)
+        req = self.new_show_request('ports', port_b['port']['id'])
+        res = req.get_response(self.api)
+        port_b = self.deserialize(self.fmt, res)
+        self.assertEqual(3, len(port_a['port']['fixed_ips']))
+        self.assertEqual(2, len(port_b['port']['fixed_ips']))
+        port_a_snet_ids = [f['subnet_id'] for f in port_a['port']['fixed_ips']]
+        self.assertIn(subnet_a2['subnet']['id'], port_a_snet_ids)
+
+    def test_slaac_segment_aware_delete_subnet(self):
+        (network, segment_a, segment_b, subnet_a0, subnet_a1, subnet_b0,
+         subnet_b1) = self._create_net_two_segments_four_slaac_subnets()
+
+        # Create two ports, port_a with subnet_a0 in fixed_ips and port_b
+        # with subnet_b0 in fixed_ips
+        port_a = self._create_port_and_show(
+            network, fixed_ips=[{'subnet_id': subnet_a0['subnet']['id']}])
+        port_b = self._create_port_and_show(
+            network, fixed_ips=[{'subnet_id': subnet_b0['subnet']['id']}])
+        self._validate_immediate_ip_allocation(port_a['port']['id'])
+        self._validate_immediate_ip_allocation(port_b['port']['id'])
+        self.assertEqual(2, len(port_a['port']['fixed_ips']))
+        self.assertEqual(2, len(port_b['port']['fixed_ips']))
+
+        # Delete subnet_b1 on segment_b, port_a should keep it's allocations
+        # on the new subnet. Allocation for deleted subnet removed on port_b.
+        req = self.new_delete_request('subnets', subnet_b1['subnet']['id'])
+        res = req.get_response(self.api)
+        self.assertEqual(webob.exc.HTTPNoContent.code, res.status_int)
+        req = self.new_show_request('ports', port_a['port']['id'])
+        res = req.get_response(self.api)
+        port_a = self.deserialize(self.fmt, res)
+        req = self.new_show_request('ports', port_b['port']['id'])
+        res = req.get_response(self.api)
+        port_b = self.deserialize(self.fmt, res)
+        self.assertEqual(2, len(port_a['port']['fixed_ips']))
+        self.assertEqual(1, len(port_b['port']['fixed_ips']))
+        port_b_snet_ids = [f['subnet_id'] for f in port_b['port']['fixed_ips']]
+        self.assertNotIn(subnet_b1['subnet']['id'], port_b_snet_ids)
+
+    def test_slaac_segment_aware_delete_last_subnet_on_segment_fails(self):
+        (network, segment_a, segment_b, subnet_a0, subnet_a1, subnet_b0,
+         subnet_b1) = self._create_net_two_segments_four_slaac_subnets()
+
+        # Create two ports, port_a with subnet_a0 in fixed_ips and port_b
+        # with subnet_b0 in fixed_ips
+        port_a = self._create_port_and_show(
+            network, fixed_ips=[{'subnet_id': subnet_a0['subnet']['id']}])
+        port_b = self._create_port_and_show(
+            network, fixed_ips=[{'subnet_id': subnet_b0['subnet']['id']}])
+        self._validate_immediate_ip_allocation(port_a['port']['id'])
+        self._validate_immediate_ip_allocation(port_b['port']['id'])
+        self.assertEqual(2, len(port_a['port']['fixed_ips']))
+        self.assertEqual(2, len(port_b['port']['fixed_ips']))
+        # Delete subnet_b1 on segment_b
+        req = self.new_delete_request('subnets', subnet_b1['subnet']['id'])
+        res = req.get_response(self.api)
+        self.assertEqual(webob.exc.HTTPNoContent.code, res.status_int)
+        # Delete subnet_b0 on segment_b fails because port_b has no other
+        # allocation, SubnetInUse
+        req = self.new_delete_request('subnets', subnet_b0['subnet']['id'])
+        res = req.get_response(self.api)
+        self.assertEqual(webob.exc.HTTPConflict.code, res.status_int)
+        # Delete port_b
+        req = self.new_delete_request('ports', port_b['port']['id'])
+        res = req.get_response(self.api)
+        self.assertEqual(webob.exc.HTTPNoContent.code, res.status_int)
+        # Try to delete subnet_b0 again, should not fail with no ports
+        req = self.new_delete_request('subnets', subnet_b0['subnet']['id'])
+        res = req.get_response(self.api)
+        self.assertEqual(webob.exc.HTTPNoContent.code, res.status_int)
+
 
 class TestSegmentAwareIpamML2(TestSegmentAwareIpam):
 
@@ -1702,10 +1897,10 @@ class TestNovaSegmentNotifier(SegmentAwareIpamTestCase):
             total += int(netaddr.IPAddress(pool['end']) -
                          netaddr.IPAddress(pool['start'])) + 1
         if total:
-            if subnet['gateway_ip']:
+            if subnet.get('gateway_ip'):
                 total += 1
                 reserved += 1
-            if subnet['enable_dhcp']:
+            if subnet.get('enable_dhcp'):
                 reserved += 1
         return total, reserved
 
@@ -2258,9 +2453,9 @@ class TestNovaSegmentNotifier(SegmentAwareIpamTestCase):
                 self.mock_p_client.get_inventory.return_value = inventory
                 self.mock_p_client.update_resource_provider_inventory.\
                     side_effect = (
-                        placement_exc.PlacementInventoryUpdateConflict(
-                            resource_provider=mock.ANY,
-                            resource_class=seg_plugin.IPV4_RESOURCE_CLASS))
+                        placement_exc.
+                        PlacementResourceProviderGenerationConflict(
+                            resource_provider=mock.ANY, generation=1))
                 self.segments_plugin.nova_updater._update_nova_inventory(event)
                 self.assertEqual(seg_plugin.MAX_INVENTORY_UPDATE_RETRIES,
                                  self.mock_p_client.get_inventory.call_count)

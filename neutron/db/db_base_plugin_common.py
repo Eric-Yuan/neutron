@@ -207,12 +207,13 @@ class DbBasePluginCommon(object):
                'max_prefixlen': max_prefixlen,
                'is_default': subnetpool['is_default'],
                'shared': subnetpool['shared'],
-               'prefixes': [prefix.cidr for prefix in subnetpool['prefixes']],
+               'prefixes': [str(prefix.cidr)
+                            for prefix in subnetpool['prefixes']],
                'ip_version': subnetpool['ip_version'],
                'default_quota': subnetpool['default_quota'],
                'address_scope_id': subnetpool['address_scope_id']}
         resource_extend.apply_funcs(
-            subnetpool_def.COLLECTION_NAME, res, subnetpool)
+            subnetpool_def.COLLECTION_NAME, res, subnetpool.db_obj)
         return db_utils.resource_fields(res, fields)
 
     def _make_port_dict(self, port, fields=None,
@@ -306,12 +307,9 @@ class DbBasePluginCommon(object):
         if filters.get('cidr'):
             filters.update(
                 {'cidr': [netaddr.IPNetwork(x).cidr for x in filters['cidr']]})
-        # TODO(ihrachys) remove explicit reader usage when subnet OVO switches
-        # to engine facade by default
-        with db_api.CONTEXT_READER.using(context):
-            return subnet_obj.Subnet.get_objects(context, _pager=pager,
-                                                 validate_filters=False,
-                                                 **filters)
+        return subnet_obj.Subnet.get_objects(context, _pager=pager,
+                                             validate_filters=False,
+                                             **filters)
 
     def _make_network_dict(self, network, fields=None,
                            process_extensions=True, context=None):
@@ -356,9 +354,3 @@ class DbBasePluginCommon(object):
             if validators.is_attr_set(subnet['ipv6_address_mode']):
                 args['ipv6_address_mode'] = subnet['ipv6_address_mode']
         return args
-
-    def _make_fixed_ip_dict(self, ips):
-        # Excludes from dict all keys except subnet_id and ip_address
-        return [{'subnet_id': ip["subnet_id"],
-                 'ip_address': ip["ip_address"]}
-                for ip in ips]
