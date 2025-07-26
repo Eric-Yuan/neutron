@@ -15,13 +15,15 @@
 
 import copy
 import os.path
+import time
 from unittest import mock
 
-import eventlet
 import fixtures
 import netaddr
+from neutron_lib.api import converters
 from neutron_lib import constants as lib_const
 from oslo_config import fixture as fixture_config
+from oslo_log import log as logging
 from oslo_utils import uuidutils
 
 from neutron.agent.common import ovs_lib
@@ -32,20 +34,22 @@ from neutron.agent.linux import external_process
 from neutron.agent.linux import interface
 from neutron.agent.linux import ip_lib
 from neutron.agent.linux import utils
-from neutron.agent.metadata import driver as metadata_driver
+from neutron.agent.metadata import driver_base
 from neutron.common import utils as common_utils
 from neutron.conf.agent import common as config
 from neutron.tests.common import net_helpers
 from neutron.tests.functional.agent.linux import helpers
 from neutron.tests.functional import base
 
+LOG = logging.getLogger(__name__)
+
 
 class DHCPAgentOVSTestFramework(base.BaseSudoTestCase):
 
-    _DHCP_PORT_MAC_ADDRESS = netaddr.EUI("24:77:03:7d:00:4c")
-    _DHCP_PORT_MAC_ADDRESS.dialect = netaddr.mac_unix
-    _TENANT_PORT_MAC_ADDRESS = netaddr.EUI("24:77:03:7d:00:3a")
-    _TENANT_PORT_MAC_ADDRESS.dialect = netaddr.mac_unix
+    _DHCP_PORT_MAC_ADDRESS = converters.convert_to_sanitized_mac_address(
+        '24:77:03:7d:00:4c')
+    _TENANT_PORT_MAC_ADDRESS = converters.convert_to_sanitized_mac_address(
+        '24:77:03:7d:00:3a')
 
     _IP_ADDRS = {
         4: {'addr': '192.168.10.11',
@@ -56,7 +60,7 @@ class DHCPAgentOVSTestFramework(base.BaseSudoTestCase):
             'gateway': '2001:db8:0:1::c0a8:a01'}, }
 
     def setUp(self):
-        super(DHCPAgentOVSTestFramework, self).setUp()
+        super().setUp()
         config.setup_logging()
         self.conf_fixture = self.useFixture(fixture_config.Config())
         self.conf = self.conf_fixture.conf
@@ -73,17 +77,20 @@ class DHCPAgentOVSTestFramework(base.BaseSudoTestCase):
             'interface_driver',
             'neutron.agent.linux.interface.OVSInterfaceDriver')
         self.conf.set_override('report_interval', 0, 'AGENT')
-        br_int = self.useFixture(net_helpers.OVSBridgeFixture()).bridge
-        self.conf.set_override('integration_bridge', br_int.br_name, 'OVS')
+        self.br_int = self.useFixture(net_helpers.OVSBridgeFixture()).bridge
+        self.conf.set_override('integration_bridge', self.br_int.br_name,
+                               'OVS')
 
         self.mock_plugin_api = mock.patch(
             'neutron.agent.dhcp.agent.DhcpPluginApi').start().return_value
         mock.patch('neutron.agent.rpc.PluginReportStateAPI').start()
+        self.conf.set_override('check_child_processes_interval', 1, 'AGENT')
         self.agent = agent.DhcpAgentWithStateReport('localhost')
+        self.agent.init_host()
 
         self.ovs_driver = interface.OVSInterfaceDriver(self.conf)
-
-        self.conf.set_override('check_child_processes_interval', 1, 'AGENT')
+        mock.patch('neutron.agent.common.ovs_lib.'
+                   'OVSBridge._set_port_dead').start()
 
     def network_dict_for_dhcp(self, dhcp_enabled=True,
                               ip_version=lib_const.IP_VERSION_4,
@@ -105,6 +112,7 @@ class DHCPAgentOVSTestFramework(base.BaseSudoTestCase):
                            ip_version=lib_const.IP_VERSION_4,
                            prefix_override=None):
         cidr = self._IP_ADDRS[ip_version]['cidr']
+        spool_id = uuidutils.generate_uuid()
         if prefix_override is not None:
             cidr = '/'.join((cidr.split('/')[0], str(prefix_override)))
         sn_dict = dhcp.DictModel(
@@ -112,6 +120,7 @@ class DHCPAgentOVSTestFramework(base.BaseSudoTestCase):
             network_id=net_id,
             ip_version=ip_version,
             cidr=cidr,
+            subnetpool_id=spool_id,
             gateway_ip=self._IP_ADDRS[ip_version]['gateway'],
             enable_dhcp=dhcp_enabled,
             dns_nameservers=[],
@@ -125,7 +134,7 @@ class DHCPAgentOVSTestFramework(base.BaseSudoTestCase):
     def create_port_dict(self, network_id, subnet_id, mac_address,
                          ip_version=lib_const.IP_VERSION_4, ip_address=None):
         ip_address = (self._IP_ADDRS[ip_version]['addr']
-            if not ip_address else ip_address)
+                      if not ip_address else ip_address)
         port_dict = dhcp.DictModel(id=uuidutils.generate_uuid(),
                                    name="foo",
                                    mac_address=mac_address,
@@ -147,7 +156,7 @@ class DHCPAgentOVSTestFramework(base.BaseSudoTestCase):
                                  non_local_subnets=non_local_subnets,
                                  ports=ports,
                                  admin_state_up=True,
-                                 tenant_id=uuidutils.generate_uuid())
+                                 project_id=uuidutils.generate_uuid())
         return net_dict
 
     def get_interface_name(self, network, port):
@@ -178,7 +187,8 @@ class DHCPAgentOVSTestFramework(base.BaseSudoTestCase):
 
     def assert_accept_ra_disabled(self, namespace):
         actual = ip_lib.IPWrapper(namespace=namespace).netns.execute(
-            ['sysctl', '-b', 'net.ipv6.conf.default.accept_ra'])
+            ['sysctl', '-b', 'net.ipv6.conf.default.accept_ra'],
+            privsep_exec=True)
         self.assertEqual('0', actual)
 
     def assert_dhcp_device(self, namespace, dhcp_iface_name, dhcp_enabled):
@@ -198,7 +208,9 @@ class DHCPAgentOVSTestFramework(base.BaseSudoTestCase):
 
     def _ip_list_for_vif(self, vif_name, namespace):
         ip_device = ip_lib.IPDevice(vif_name, namespace)
-        return ip_device.addr.list(ip_version=lib_const.IP_VERSION_4)
+        res = ip_device.addr.list(ip_version=lib_const.IP_VERSION_4)
+        LOG.debug("IP addr list of %s: %s", vif_name, res)
+        return res
 
     def _get_network_port_for_allocation_test(self):
         network = self.network_dict_for_dhcp()
@@ -211,10 +223,15 @@ class DHCPAgentOVSTestFramework(base.BaseSudoTestCase):
 
     def assert_good_allocation_for_port(self, network, port):
         vif_name = self.get_interface_name(network.id, port)
+        tag = self.br_int.ovsdb.db_get('Port', vif_name, 'tag').execute(
+            check_error=True)
+        self.assertEqual([], tag)
+
         self._run_dhclient(vif_name, network)
 
-        predicate = lambda: len(
-            self._ip_list_for_vif(vif_name, network.namespace))
+        def predicate():
+            return len(self._ip_list_for_vif(vif_name, network.namespace))
+
         common_utils.wait_until_true(predicate, 10)
 
         ip_list = self._ip_list_for_vif(vif_name, network.namespace)
@@ -227,7 +244,7 @@ class DHCPAgentOVSTestFramework(base.BaseSudoTestCase):
         self._run_dhclient(vif_name, network)
         # we need wait some time (10 seconds is enough) and check
         # that dhclient not configured ip-address for interface
-        eventlet.sleep(10)
+        time.sleep(10)
 
         ip_list = self._ip_list_for_vif(vif_name, network.namespace)
         self.assertEqual([], ip_list)
@@ -255,7 +272,7 @@ class DHCPAgentOVSTestFramework(base.BaseSudoTestCase):
             self.conf,
             network.id,
             network.namespace,
-            service=metadata_driver.HAPROXY_SERVICE)
+            service=driver_base.HAPROXY_SERVICE)
 
 
 class DHCPAgentOVSTestCase(DHCPAgentOVSTestFramework):
@@ -301,9 +318,8 @@ class DHCPAgentOVSTestCase(DHCPAgentOVSTestFramework):
         network, port = self._get_network_port_for_allocation_test()
         network.ports.append(port)
         self.configure_dhcp_for_network(network=network)
-        bad_mac_address = netaddr.EUI(self._TENANT_PORT_MAC_ADDRESS.value + 1)
-        bad_mac_address.dialect = netaddr.mac_unix
-        port.mac_address = str(bad_mac_address)
+        port.mac_address = converters.convert_to_sanitized_mac_address(
+            '24:77:03:7d:00:4d')
         self._plug_port_for_dhcp_request(network, port)
         self.assert_bad_allocation_for_port(network, port)
 
@@ -343,17 +359,26 @@ class DHCPAgentOVSTestCase(DHCPAgentOVSTestFramework):
             exception=RuntimeError("Stale metadata proxy didn't get killed"))
 
     def _test_metadata_proxy_spawn_kill_with_subnet_create_delete(self):
-        network = self.network_dict_for_dhcp(ip_version=lib_const.IP_VERSION_6)
+        network = self.network_dict_for_dhcp(
+            ip_version=lib_const.IP_VERSION_6,
+            dhcp_enabled=False)
         self.configure_dhcp_for_network(network=network)
         pm = self._get_metadata_proxy_process(network)
 
-        # A newly created network with ipv6 subnet will not have metadata proxy
         self.assertFalse(pm.active)
 
         new_network = copy.deepcopy(network)
         dhcp_enabled_ipv4_subnet = self.create_subnet_dict(network.id)
         new_network.subnets.append(dhcp_enabled_ipv4_subnet)
+
         self.mock_plugin_api.get_network_info.return_value = new_network
+        dhcp_port_mock = self.create_port_dict(
+            network.id, dhcp_enabled_ipv4_subnet.id,
+            mac_address=str(self._DHCP_PORT_MAC_ADDRESS))
+        self.mock_plugin_api.create_dhcp_port.return_value = dhcp_port_mock
+        network.ports = []
+        new_network.ports = []
+
         self.agent.refresh_dhcp_helper(network.id)
         # Metadata proxy should be spawned for the newly added subnet
         common_utils.wait_until_true(
@@ -398,43 +423,3 @@ class DHCPAgentOVSTestCase(DHCPAgentOVSTestFramework):
             exception=RuntimeError("'dhcp_ready_on_ports' not be called"))
         self.mock_plugin_api.dhcp_ready_on_ports.assert_called_with(
             ports_to_send)
-
-    def test_dhcp_processing_pool_size(self):
-        mock.patch.object(self.agent, 'call_driver').start().return_value = (
-            True)
-        self.agent.update_isolated_metadata_proxy = mock.Mock()
-        self.agent.disable_isolated_metadata_proxy = mock.Mock()
-
-        network_info_1 = self.network_dict_for_dhcp()
-        self.configure_dhcp_for_network(network=network_info_1)
-        self.assertEqual(agent.DHCP_PROCESS_GREENLET_MIN,
-                         self.agent._pool.size)
-
-        network_info_2 = self.network_dict_for_dhcp()
-        self.configure_dhcp_for_network(network=network_info_2)
-        self.assertEqual(agent.DHCP_PROCESS_GREENLET_MIN,
-                         self.agent._pool.size)
-
-        network_info_list = [network_info_1, network_info_2]
-        for _i in range(agent.DHCP_PROCESS_GREENLET_MAX + 1):
-            ni = self.network_dict_for_dhcp()
-            self.configure_dhcp_for_network(network=ni)
-            network_info_list.append(ni)
-
-        self.assertEqual(agent.DHCP_PROCESS_GREENLET_MAX,
-                         self.agent._pool.size)
-
-        for network in network_info_list:
-            self.agent.disable_dhcp_helper(network.id)
-
-        agent_network_info_len = len(self.agent.cache.get_network_ids())
-        if agent_network_info_len < agent.DHCP_PROCESS_GREENLET_MIN:
-            self.assertEqual(agent.DHCP_PROCESS_GREENLET_MIN,
-                             self.agent._pool.size)
-        elif (agent.DHCP_PROCESS_GREENLET_MIN <= agent_network_info_len <=
-              agent.DHCP_PROCESS_GREENLET_MAX):
-            self.assertEqual(agent_network_info_len,
-                             self.agent._pool.size)
-        else:
-            self.assertEqual(agent.DHCP_PROCESS_GREENLET_MAX,
-                             self.agent._pool.size)

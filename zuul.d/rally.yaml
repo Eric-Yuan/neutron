@@ -1,5 +1,5 @@
 - job:
-    name: neutron-rally-task
+    name: neutron-ovs-rally-task
     parent: rally-task-neutron
     timeout: 10800
     vars:
@@ -7,6 +7,11 @@
         USE_PYTHON3: true
         OSPROFILER_COLLECTOR: redis
         OSPROFILER_HMAC_KEYS: "neutron-hmac-key-used-in-zuul-ci"
+        Q_ML2_TENANT_NETWORK_TYPE: vxlan
+        Q_ML2_PLUGIN_MECHANISM_DRIVERS: openvswitch
+        Q_AGENT: openvswitch
+        KEYSTONE_ADMIN_ENDPOINT: true
+        NEUTRON_DEPLOY_MOD_WSGI: true
       rally_task: rally-jobs/task-neutron.yaml
       devstack_plugins:
         osprofiler: https://opendev.org/openstack/osprofiler
@@ -14,6 +19,30 @@
         neutron: https://opendev.org/openstack/neutron
       devstack_services:
         neutron-trunk: true
+        # Cinder services
+        c-api: false
+        c-bak: false
+        c-sch: false
+        c-vol: false
+        cinder: false
+        # Swift services
+        s-account: false
+        s-container: false
+        s-object: false
+        s-proxy: false
+        # OVN services
+        ovn-controller: false
+        ovn-northd: false
+        ovs-vswitchd: false
+        ovsdb-server: false
+        q-ovn-metadata-agent: false
+        # Neutron services
+        q-agt: true
+        q-dhcp: true
+        q-l3: true
+        q-meta: true
+        q-metering: true
+        q-svc: true
       devstack_local_conf:
         post-config:
           $NEUTRON_CONF:
@@ -23,28 +52,91 @@
       - openstack/rally
       - openstack/rally-openstack
       - openstack/osprofiler
-    irrelevant-files: &irrelevant-files
-      - ^(test-|)requirements.txt$
-      - ^.*\.rst$
-      - ^doc/.*$
-      - ^neutron/locale/.*$
-      - ^neutron/tests/unit/.*$
+    irrelevant-files:
+      - ^\.pre-commit-config\.yaml$
+      - ^\.pylintrc$
+      - ^test-requirements.txt$
       - ^releasenotes/.*$
+      - ^doc/.*$
       - ^setup.cfg$
+      - ^pyproject.toml$
+      - ^.*\.conf\.sample$
+      - ^.*\.rst$
+      - ^neutron/locale/.*$
+      - ^neutron/tests/.*$
       - ^tools/.*$
       - ^tox.ini$
-      - ^vagrant/.*$
-      - ^migration/.*$
+      - ^plugin.spec$
+      - ^tools/ovn_migration/.*$
+      - ^neutron/agent/ovn/.*$
+      - ^neutron/plugins/ml2/drivers/macvtap/.*$
+      - ^neutron/plugins/ml2/drivers/mech_sriov/.*$
+      - ^neutron/plugins/ml2/drivers/ovn/.*$
+      - ^neutron/services/ovn_l3/.*$
+      - ^neutron/services/logapi/drivers/ovn/.*$
+      - ^neutron/services/portforwarding/drivers/ovn/.*$
+      - ^neutron/services/qos/drivers/ovn/.*$
+      - ^neutron/services/trunk/drivers/ovn/.*$
+      - ^neutron/cmd/ovn/.*$
+      - ^neutron/common/ovn/.*$
+      - ^roles/.*functional.*$
+      - ^playbooks/.*functional.*$
+      # Ignore everything except for zuul.d/project.yaml
+      - ^zuul.d/base.yaml
+      - ^zuul.d/grenade.yaml
+      - ^zuul.d/job-templates.yaml
+      - ^zuul.d/rally.yaml
+      - ^zuul.d/tempest-multinode.yaml
+      - ^zuul.d/tempest-singlenode.yaml
 
 - job:
     name: neutron-ovn-rally-task
     parent: rally-task-at-devstack
     required-projects:
       - name: openstack/devstack
-      - name: openstack/devstack-gate
       - name: openstack/rally
       - name: openstack/rally-openstack
-    irrelevant-files: *irrelevant-files
+    irrelevant-files:
+      - ^\.pre-commit-config\.yaml$
+      - ^\.pylintrc$
+      - ^test-requirements.txt$
+      - ^releasenotes/.*$
+      - ^doc/.*$
+      - ^setup.cfg$
+      - ^pyproject.toml$
+      - ^.*\.conf\.sample$
+      - ^.*\.rst$
+      - ^neutron/locale/.*$
+      - ^neutron/tests/.*$
+      - ^tools/.*$
+      - ^tox.ini$
+      - ^plugin.spec$
+      - ^tools/ovn_migration/.*$
+      - ^neutron/agent/dhcp/.*$
+      - ^neutron/agent/l2/.*$
+      - ^neutron/agent/l3/.*$
+      - ^neutron/agent/metadata/.*$
+      - ^neutron/agent/dhcp_agent.py
+      - ^neutron/agent/l3_agent.py
+      - ^neutron/agent/metadata_agent.py
+      - ^neutron/agent/resource_cache.py
+      - ^neutron/agent/rpc.py
+      - ^neutron/agent/securitygroup_rpc.py
+      - ^neutron/plugins/ml2/drivers/openvswitch/.*$
+      - ^neutron/plugins/ml2/drivers/macvtap/.*$
+      - ^neutron/plugins/ml2/drivers/mech_sriov/.*$
+      - ^neutron/services/qos/drivers/openvswitch/.*$
+      - ^neutron/services/trunk/drivers/openvswitch/.*$
+      - ^neutron/scheduler/.*$
+      - ^roles/.*functional.*$
+      - ^playbooks/.*functional.*$
+      # Ignore everything except for zuul.d/project.yaml
+      - ^zuul.d/base.yaml
+      - ^zuul.d/grenade.yaml
+      - ^zuul.d/job-templates.yaml
+      - ^zuul.d/rally.yaml
+      - ^zuul.d/tempest-multinode.yaml
+      - ^zuul.d/tempest-singlenode.yaml
     vars:
       devstack_plugins:
         neutron: https://opendev.org/openstack/neutron
@@ -58,7 +150,8 @@
         ovn-controller: true
         ovs-vswitchd: true
         ovsdb-server: true
-        q-ovn-metadata-agent: true
+        q-ovn-metadata-agent: false
+        q-ovn-agent: true
         br-ex-tcpdump: true
         br-int-flows: true
         q-dhcp: false
@@ -67,21 +160,41 @@
         q-meta: false
         q-metering: false
         q-dns: true
+        # Cinder services
+        c-api: false
+        c-bak: false
+        c-sch: false
+        c-vol: false
+        cinder: false
+        # Swift services
+        s-account: false
+        s-container: false
+        s-object: false
+        s-proxy: false
       devstack_localrc:
         Q_AGENT: ovn
-        Q_ML2_PLUGIN_MECHANISM_DRIVERS: ovn,logger
+        OVN_AGENT_EXTENSIONS: 'metadata'
+        ML2_L3_PLUGIN: ovn-router,trunk
+        # NOTE(ralonsoh): during the eventlet removal, the "logger" mech
+        # driver has been removed from this list. Re-add it once the removal
+        # is finished or the mech driver does not call monkey_patch().
+        Q_ML2_PLUGIN_MECHANISM_DRIVERS: ovn
         Q_ML2_TENANT_NETWORK_TYPE: geneve
         USE_PYTHON3: true
         PHYSICAL_NETWORK: public
         Q_USE_PROVIDERNET_FOR_PUBLIC: true
         ENABLE_CHASSIS_AS_GW: true
         OVN_L3_CREATE_PUBLIC_NETWORK: true
-        OVN_BRANCH: master
+        KEYSTONE_ADMIN_ENDPOINT: true
+        OVN_BUILD_FROM_SOURCE: True
+        OVN_BRANCH: "branch-24.03"
+        OVS_BRANCH: "branch-3.3"
+        NEUTRON_DEPLOY_MOD_WSGI: true
       devstack_local_conf:
         post-config:
           "${RALLY_CONF_DIR}/${RALLY_CONF_FILE}":
             openstack:
               neutron_bind_l2_agent_types: "OVN Controller Gateway agent"
       rally_task: rally-jobs/task-neutron.yaml
-    timeout: 7800
+    timeout: 9000
 

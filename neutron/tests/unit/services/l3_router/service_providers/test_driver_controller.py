@@ -26,6 +26,7 @@ from oslo_utils import uuidutils
 import testtools
 
 from neutron.services.l3_router.service_providers import driver_controller
+from neutron.services.l3_router.service_providers import single_node
 from neutron.services import provider_configuration
 from neutron.tests import base
 from neutron.tests.unit import testlib_api
@@ -37,7 +38,7 @@ DB_PLUGIN_KLASS = 'neutron.db.db_base_plugin_v2.NeutronDbPluginV2'
 class TestDriverController(testlib_api.SqlTestCase):
 
     def setUp(self):
-        super(TestDriverController, self).setUp()
+        super().setUp()
         self.setup_coreplugin(DB_PLUGIN_KLASS)
         self.fake_l3 = mock.Mock()
         self.dc = driver_controller.DriverController(self.fake_l3)
@@ -58,7 +59,11 @@ class TestDriverController(testlib_api.SqlTestCase):
         router_id = uuidutils.generate_uuid()
         router = dict(id=router_id, flavor_id=flavor_id)
         self.dc._set_router_provider('router', 'PRECOMMIT_CREATE', self,
-                                     self.ctx, router, router_db)
+                                     payload=events.DBEventPayload(
+                                         self.ctx,
+                                         resource_id=router_id,
+                                         metadata={'router_db': router_db},
+                                         states=(router,)))
         self.assertTrue(self.dc.uses_scheduler(self.ctx, router_id))
         self.dc.drivers['dvrha'].use_integrated_agent_scheduler = False
         self.assertFalse(self.dc.uses_scheduler(self.ctx, router_id))
@@ -71,7 +76,11 @@ class TestDriverController(testlib_api.SqlTestCase):
         r2 = uuidutils.generate_uuid()
         router = dict(id=r1, flavor_id=flavor_id)
         self.dc._set_router_provider('router', 'PRECOMMIT_CREATE', self,
-                                     self.ctx, router, router_db)
+                                     payload=events.DBEventPayload(
+                                         self.ctx,
+                                         resource_id=r1,
+                                         metadata={'router_db': router_db},
+                                         states=(router,)))
         self.assertTrue(self.dc.drivers['dvrha'].owns_router(self.ctx, r1))
         self.assertFalse(self.dc.drivers['dvr'].owns_router(self.ctx, r1))
         self.assertFalse(self.dc.drivers['dvr'].owns_router(self.ctx, r2))
@@ -85,10 +94,14 @@ class TestDriverController(testlib_api.SqlTestCase):
         router_id = uuidutils.generate_uuid()
         router = dict(id=router_id, flavor_id=flavor_id)
         self.dc._set_router_provider('router', 'PRECOMMIT_CREATE', self,
-                                     self.ctx, router, router_db)
+                                     payload=events.DBEventPayload(
+                                         self.ctx,
+                                         resource_id=router_id,
+                                         metadata={'router_db': router_db},
+                                         states=(router,)))
         mock_cb.assert_called_with(resources.ROUTER_CONTROLLER,
-            events.PRECOMMIT_ADD_ASSOCIATION, mock.ANY,
-            payload=mock.ANY)
+                                   events.PRECOMMIT_ADD_ASSOCIATION, mock.ANY,
+                                   payload=mock.ANY)
         payload = mock_cb.mock_calls[0][2]['payload']
         self.assertEqual(router, payload.request_body)
         self.assertEqual(router_db, payload.latest_state)
@@ -114,6 +127,18 @@ class TestDriverController(testlib_api.SqlTestCase):
                             None, request_body={'name': 'testname'},
                             states=({'flavor_id': 'old_fid'},)))
                     mock_cb.assert_not_called()
+
+    def test___attrs_to_driver(self):
+        test_dc = driver_controller.DriverController(self.fake_l3)
+        test_dc.default_provider = 'single_node'
+        self.assertIsInstance(test_dc._attrs_to_driver({}),
+                              single_node.SingleNodeDriver)
+
+        test_dc.default_provider = 'ha'
+        with mock.patch.object(driver_controller,
+                               "_is_driver_compatible", return_value=False):
+            self.assertRaises(NotImplementedError, test_dc._attrs_to_driver,
+                              {})
 
     def test__update_router_provider_with_flags(self):
         test_dc = driver_controller.DriverController(self.fake_l3)
@@ -177,7 +202,12 @@ class TestDriverController(testlib_api.SqlTestCase):
         ]
         for driver, body in cases:
             self.dc._set_router_provider('router', 'PRECOMMIT_CREATE', self,
-                                         self.ctx, body, mock.Mock())
+                                         payload=events.DBEventPayload(
+                                             self.ctx,
+                                             resource_id=body['id'],
+                                             metadata={
+                                                 'router_db': mock.Mock()},
+                                             states=(body,)))
             mock_cb.assert_called_with(
                 resources.ROUTER_CONTROLLER,
                 events.PRECOMMIT_ADD_ASSOCIATION, mock.ANY,
@@ -185,7 +215,7 @@ class TestDriverController(testlib_api.SqlTestCase):
             self.assertEqual(self.dc.drivers[driver],
                              self.dc.get_provider_for_router(self.ctx,
                                                              body['id']),
-                             'Expecting %s for body %s' % (driver, body))
+                             f'Expecting {driver} for body {body}')
 
     @mock.patch('neutron_lib.callbacks.registry.publish')
     def test__clear_router_provider(self, mock_cb):
@@ -193,10 +223,14 @@ class TestDriverController(testlib_api.SqlTestCase):
         router_id1 = uuidutils.generate_uuid()
         body = dict(id=router_id1, distributed=True, ha=True)
         self.dc._set_router_provider('router', 'PRECOMMIT_CREATE', self,
-                                     self.ctx, body, mock.Mock())
+                                     payload=events.DBEventPayload(
+                                         self.ctx,
+                                         resource_id=router_id1,
+                                         metadata={'router_db': mock.Mock()},
+                                         states=(body,)))
         mock_cb.assert_called_with(resources.ROUTER_CONTROLLER,
-            events.PRECOMMIT_ADD_ASSOCIATION, mock.ANY,
-            payload=mock.ANY)
+                                   events.PRECOMMIT_ADD_ASSOCIATION, mock.ANY,
+                                   payload=mock.ANY)
         payload = mock_cb.mock_calls[0][2]['payload']
         self.assertEqual(self.ctx, payload.context)
         self.assertIn('old_driver', payload.metadata)
@@ -206,8 +240,11 @@ class TestDriverController(testlib_api.SqlTestCase):
                          self.dc.get_provider_for_router(self.ctx,
                                                          body['id']))
         self.dc._clear_router_provider('router', 'PRECOMMIT_DELETE', self,
-                                       self.ctx, body['id'])
-        mock_cb.assert_called_with(resources.ROUTER_CONTROLLER,
+                                       payload=events.DBEventPayload(
+                                           self.ctx,
+                                           resource_id=body['id']))
+        mock_cb.assert_called_with(
+            resources.ROUTER_CONTROLLER,
             events.PRECOMMIT_DELETE_ASSOCIATIONS, mock.ANY,
             payload=mock.ANY)
         with testtools.ExpectedException(ValueError):

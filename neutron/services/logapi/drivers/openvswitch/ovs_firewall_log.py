@@ -16,6 +16,7 @@
 import collections
 
 from neutron_lib import constants as lib_const
+from neutron_lib.plugins.ml2 import ovs_constants as ovs_consts
 from neutron_lib.services.logapi import constants as log_const
 from os_ken.base import app_manager
 from os_ken.lib.packet import packet
@@ -27,8 +28,6 @@ from oslo_log import log as logging
 from neutron.agent.linux.openvswitch_firewall import constants as ovsfw_consts
 from neutron.agent.linux.openvswitch_firewall import firewall as ovsfw
 from neutron.agent.linux.openvswitch_firewall import rules
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants \
-        as ovs_consts
 from neutron.services.logapi.agent import log_extension as log_ext
 from neutron.services.logapi.common import exceptions as log_exc
 from neutron.services.logapi.drivers.openvswitch import log_oskenapp
@@ -49,6 +48,7 @@ REMOTE_RULE_PRIORITY = 70
 def setup_logging():
     log_file = cfg.CONF.network_log.local_output_log_base
     if log_file:
+        # pylint: disable=import-outside-toplevel
         from logging import handlers as watch_handler
         log_file_handler = watch_handler.WatchedFileHandler(log_file)
         log_file_handler.setLevel(
@@ -67,7 +67,7 @@ def setup_logging():
 
 
 def find_deleted_sg_rules(old_port, new_ports):
-    del_rules = list()
+    del_rules = []
     for port in new_ports:
         if old_port.id == port.id:
             for rule in old_port.secgroup_rules:
@@ -77,7 +77,7 @@ def find_deleted_sg_rules(old_port, new_ports):
     return del_rules
 
 
-class Cookie(object):
+class Cookie:
 
     def __init__(self, cookie_id, port, action, project):
         self.id = cookie_id
@@ -105,7 +105,7 @@ class Cookie(object):
         return not self.log_object_refs
 
 
-class OFPortLog(object):
+class OFPortLog:
 
     def __init__(self, port, ovs_port, log_event):
         self.id = port['port_id']
@@ -131,7 +131,7 @@ class OFPortLog(object):
 
 class OVSFirewallLoggingDriver(log_ext.LoggingDriver):
 
-    SUPPORTED_LOGGING_TYPES = ['security_group']
+    SUPPORTED_LOGGING_TYPES = ('security_group',)
     REQUIRED_PROTOCOLS = [
         ovs_consts.OPENFLOW13,
         ovs_consts.OPENFLOW14,
@@ -144,7 +144,7 @@ class OVSFirewallLoggingDriver(log_ext.LoggingDriver):
         self.log_ports = collections.defaultdict(dict)
         self.cookies_table = set()
         self.cookie_ids_to_delete = set()
-        self.conj_id_map = ovsfw.ConjIdMap()
+        self.conj_id_map = ovsfw.ConjIdMap(self.int_br.br)
 
     def initialize(self, resource_rpc, **kwargs):
         self.resource_rpc = resource_rpc
@@ -261,7 +261,7 @@ class OVSFirewallLoggingDriver(log_ext.LoggingDriver):
                 action, context, resource_type, log_resources=log_resources)
 
     def _handle_logging(self, action, context, resource_type, **kwargs):
-        handler_name = "%s_%s_log" % (action, resource_type)
+        handler_name = "{}_{}_log".format(action, resource_type)
         handler = getattr(self, handler_name)
         handler(context, **kwargs)
 
@@ -352,7 +352,7 @@ class OVSFirewallLoggingDriver(log_ext.LoggingDriver):
         dl_type = kwargs.get('dl_type')
         ovsfw.create_reg_numbers(kwargs)
         if isinstance(dl_type, int):
-            kwargs['dl_type'] = "0x{:04x}".format(dl_type)
+            kwargs['dl_type'] = f"0x{dl_type:04x}"
         LOG.debug("Add flow firewall log %s", str(kwargs))
         if self._deferred:
             self.int_br.add_flow(**kwargs)
@@ -378,13 +378,13 @@ class OVSFirewallLoggingDriver(log_ext.LoggingDriver):
         )
 
     def create_rules_generator_for_port(self, port):
-        for rule in port.secgroup_rules:
-            yield rule
+        yield from port.secgroup_rules
 
     def _create_conj_flows_log(self, remote_rule, port):
         ethertype = remote_rule['ethertype']
         direction = remote_rule['direction']
-        remote_sg_id = remote_rule['remote_group_id']
+        remote_sg_id = remote_rule.get('remote_group_id')
+        remote_ag_id = remote_rule.get('remote_address_group_id')
         secgroup_id = remote_rule['security_group_id']
         # we only want to log first accept packet, that means a packet with
         # ct_state=+new-est, reg_remote_group=conj_id + 1 will be logged
@@ -393,7 +393,8 @@ class OVSFirewallLoggingDriver(log_ext.LoggingDriver):
             'dl_type': ovsfw_consts.ethertype_to_dl_type_map[ethertype],
             'reg_port': port.ofport,
             'reg_remote_group': self.conj_id_map.get_conj_id(
-                secgroup_id, remote_sg_id, direction, ethertype) + 1,
+                secgroup_id, remote_sg_id or remote_ag_id,
+                direction, ethertype) + 1,
         }
         if direction == lib_const.INGRESS_DIRECTION:
             flow_template['table'] = ovs_consts.RULES_INGRESS_TABLE
@@ -405,7 +406,7 @@ class OVSFirewallLoggingDriver(log_ext.LoggingDriver):
         cookie = self.generate_cookie(port.id, log_const.ACCEPT_EVENT,
                                       log_id, project_id)
         for rule in self.create_rules_generator_for_port(port):
-            if 'remote_group_id' in rule:
+            if 'remote_group_id' in rule or 'remote_address_group_id' in rule:
                 flows = self._create_conj_flows_log(rule, port)
             else:
                 flows = rules.create_flows_from_rule_and_port(rule, port)
@@ -464,7 +465,7 @@ class OVSFirewallLoggingDriver(log_ext.LoggingDriver):
         if not cookie:
             return
         for rule in del_rules:
-            if 'remote_group_id' in rule:
+            if 'remote_group_id' in rule or 'remote_address_group_id' in rule:
                 flows = self._create_conj_flows_log(rule, port)
             else:
                 flows = rules.create_flows_from_rule_and_port(rule, port)

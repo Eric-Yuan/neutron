@@ -20,6 +20,11 @@ set -e
 # directly or allow the gate_hook to import.
 IS_GATE=${IS_GATE:-False}
 USE_CONSTRAINT_ENV=${USE_CONSTRAINT_ENV:-True}
+MYSQL_USER=${MYSQL_USER:-root}
+DATABASE_USER=${DATABASE_USER:-openstack_citest}
+DATABASE_NAME=${DATABASE_NAME:-openstack_citest}
+MEMORY_TRACKER=${MEMORY_TRACKER:-False}
+MYSQL_REDUCE_MEMORY=${MYSQL_REDUCE_MEMORY:-True}
 
 
 if [[ "$IS_GATE" != "True" ]] && [[ "$#" -lt 1 ]]; then
@@ -58,11 +63,17 @@ VENV=${VENV:-dsvm-functional}
 DEVSTACK_PATH=${DEVSTACK_PATH:-$1}
 PROJECT_NAME=${PROJECT_NAME:-neutron}
 REPO_BASE=${GATE_DEST:-$(cd $(dirname "$0")/../.. && pwd)}
-NEUTRON_PATH=${NEUTRON_PATH:=$REPO_BASE/$PROJECT_NAME}
+NEUTRON_DIR=${NEUTRON_DIR:=$REPO_BASE/$PROJECT_NAME}
 INSTALL_MYSQL_ONLY=${INSTALL_MYSQL_ONLY:-False}
 # The gate should automatically install dependencies.
 INSTALL_BASE_DEPENDENCIES=${INSTALL_BASE_DEPENDENCIES:-$IS_GATE}
-BUILD_OVS_FROM_SOURCE=${BUILD_OVS_FROM_SOURCE:-True}
+INSTALL_OVN=${INSTALL_OVN:-True}
+Q_BUILD_OVS_FROM_GIT=${Q_BUILD_OVS_FROM_GIT:-True}
+OVN_BRANCH=${OVN_BRANCH:-branch-24.03}
+# OVS_BRANCH needs to be updated along with OVN_BRANCH, ovs is
+# being used as submodule in ovn repo, to get a working ovs
+# version can use git submodule status command on ovn repo
+OVS_BRANCH=${OVS_BRANCH:-branch-3.3}
 
 
 if [ ! -f "$DEVSTACK_PATH/stack.sh" ]; then
@@ -81,7 +92,7 @@ function _init {
     TOP_DIR=$DEVSTACK_PATH
 
     if [ -f $DEVSTACK_PATH/local.conf ]; then
-        source $DEVSTACK_PATH/local.conf 2> /dev/null
+        source $DEVSTACK_PATH/local.conf 2> /dev/null || true
     fi
 
     source $DEVSTACK_PATH/stackrc
@@ -89,17 +100,21 @@ function _init {
     # Allow the gate to override values set by stackrc.
     DEST=${GATE_DEST:-$DEST}
     STACK_USER=${GATE_STACK_USER:-$STACK_USER}
+    sudo mkdir -p /opt/stack/data
+    sudo chown -R $STACK_USER /opt/stack/data
+    source $DEVSTACK_PATH/inc/python
+    install_python
+    setup_devstack_virtualenv
 
     GetDistro
     source $DEVSTACK_PATH/tools/fixup_stuff.sh
-    fixup_ubuntu
 }
 
 function _install_base_deps {
     echo_summary "Installing base dependencies"
 
     INSTALL_TESTONLY_PACKAGES=True
-    if [[ "$BUILD_OVS_FROM_SOURCE" == "True" ]]; then
+    if [[ "$Q_BUILD_OVS_FROM_GIT" == "True" ]]; then
         PACKAGES=$(get_packages general,neutron,q-agt,q-l3)
         # Do not install 'python-' prefixed packages other than
         # python-dev*.  Neutron's functional testing relies on deployment
@@ -108,14 +123,21 @@ function _install_base_deps {
         PACKAGES=$(echo $PACKAGES | perl -pe 's|python-(?!dev)[^ ]*||g')
         install_package $PACKAGES
 
-        source $NEUTRON_PATH/devstack/lib/ovs
-        remove_ovs_packages
-        OVS_BRANCH="v2.12.0"
-        compile_ovs False /usr /var
+        source $DEVSTACK_PATH/lib/neutron_plugins/ovn_agent
+        echo_summary "OVS_BRANCH: ${OVS_BRANCH}"
+        compile_ovs False /usr/local /var
+        if [[ "$INSTALL_OVN" == "True" ]]; then
+            echo_summary "OVN_BRANCH: ${OVN_BRANCH}"
+            compile_ovn /usr/local /var
+        fi
     else
-        PACKAGES=$(get_packages general,neutron,q-agt,q-l3,openvswitch)
+        PACKAGES=$(get_packages general,neutron,q-agt,q-l3,openvswitch,ovn)
         PACKAGES=$(echo $PACKAGES | perl -pe 's|python-(?!dev)[^ ]*||g')
         install_package $PACKAGES
+    fi
+
+    if is_ubuntu && [[ "$DISTRO" != "bionic" ]]; then
+        install_package "ncat"
     fi
 }
 
@@ -135,21 +157,19 @@ function _install_rpc_backend {
 }
 
 
-# _install_databases [install_pg]
-function _install_databases {
-    local install_pg=${1:-True}
-
+# _install_database
+function _install_database {
     echo_summary "Installing databases"
 
     # Avoid attempting to configure the db if it appears to already
     # have run.  The setup as currently defined is not idempotent.
-    if mysql openstack_citest > /dev/null 2>&1 < /dev/null; then
+    if mysql ${DATABASE_NAME} > /dev/null 2>&1 < /dev/null; then
         echo_summary "DB config appears to be complete, skipping."
         return 0
     fi
 
-    MYSQL_PASSWORD=${MYSQL_PASSWORD:-stackdb}
-    DATABASE_PASSWORD=${DATABASE_PASSWORD:-stackdb}
+    MYSQL_PASSWORD=${MYSQL_PASSWORD:-openstack_citest}
+    DATABASE_PASSWORD=${DATABASE_PASSWORD:-openstack_citest}
 
     source $DEVSTACK_PATH/lib/database
 
@@ -158,37 +178,17 @@ function _install_databases {
     install_database
     configure_database_mysql
 
-    if [[ "$install_pg" == "True" ]]; then
-        enable_service postgresql
-        initialize_database_backends
-        install_database
-        configure_database_postgresql
-    fi
-
-    # Set up the 'openstack_citest' user and database in each backend
+    # Set up the '${DATABASE_USER}' user and '${DATABASE_NAME}' database in each backend
     tmp_dir=$(mktemp -d)
     trap "rm -rf $tmp_dir" EXIT
 
     cat << EOF > $tmp_dir/mysql.sql
-CREATE DATABASE openstack_citest;
-CREATE USER 'openstack_citest'@'localhost' IDENTIFIED BY 'openstack_citest';
-CREATE USER 'openstack_citest' IDENTIFIED BY 'openstack_citest';
-GRANT ALL PRIVILEGES ON *.* TO 'openstack_citest'@'localhost';
-GRANT ALL PRIVILEGES ON *.* TO 'openstack_citest';
+CREATE DATABASE ${DATABASE_NAME};
+CREATE USER '${DATABASE_USER}'@'localhost' IDENTIFIED BY '${MYSQL_PASSWORD}';
+GRANT ALL PRIVILEGES ON *.* TO '${DATABASE_USER}'@'localhost';
 FLUSH PRIVILEGES;
 EOF
-    /usr/bin/mysql -u root -p"$MYSQL_PASSWORD" < $tmp_dir/mysql.sql
-
-    if [[ "$install_pg" == "True" ]]; then
-        cat << EOF > $tmp_dir/postgresql.sql
-CREATE USER openstack_citest WITH CREATEDB LOGIN PASSWORD 'openstack_citest';
-CREATE DATABASE openstack_citest WITH OWNER openstack_citest;
-EOF
-
-        # User/group postgres needs to be given access to tmp_dir
-        setfacl -m g:postgres:rwx $tmp_dir
-        sudo -u postgres /usr/bin/psql --file=$tmp_dir/postgresql.sql
-    fi
+    /usr/bin/mysql -u $MYSQL_USER -p"$MYSQL_PASSWORD" < $tmp_dir/mysql.sql
 }
 
 
@@ -248,7 +248,7 @@ EOF
 function _install_post_devstack {
     echo_summary "Performing post-devstack installation"
 
-    _install_databases
+    _install_database
     _install_rootwrap_sudoers
 
     if is_ubuntu; then
@@ -257,37 +257,32 @@ function _install_post_devstack {
     elif is_fedora; then
         install_package dhclient
         install_package nmap-ncat
-    elif is_suse; then
-        install_package dhcp-client
-        # NOTE(armax): no harm in allowing 'other' to read and
-        # execute the script. This is required in fullstack
-        # testing and avoids quite a bit of rootwrap pain
-        sudo chmod o+rx /sbin/dhclient-script
-        install_package ncat
     else
         exit_distro_not_supported "installing dhclient and ncat packages"
     fi
 
-    # Installing python-openvswitch from packages is a stop-gap while
-    # python-openvswitch remains unavailable from pypi.  This also
-    # requires that sitepackages=True be set in tox.ini to allow the
-    # venv to use the installed package.  Once python-openvswitch
-    # becomes available on pypi, this will no longer be required.
-    #
-    # NOTE: the package name 'python-openvswitch' is common across
-    # supported distros.
-    install_package python-openvswitch
-
     enable_kernel_bridge_firewall
-}
 
+    # install/start memory tracker service if enabled
+    if [[ "$MEMORY_TRACKER" == "True" ]]; then
+        # is_service_enabled checks for service into ENABLED_SERVICES
+        ENABLED_SERVICES+=,dstat,memory_tracker
+        source $DEVSTACK_PATH/lib/dstat
+        if is_ubuntu; then
+            install_package pcp
+        else
+            install_package pcp-system-tools
+        fi
+        install_dstat
+        start_dstat
+    fi
 
-function _configure_iptables_rules {
-    # For linuxbridge agent fullstack tests we need to add special rules to
-    # iptables for connection of agents to rabbitmq:
-    CHAIN_NAME="openstack-INPUT"
-    sudo iptables -n --list $CHAIN_NAME 1> /dev/null 2>&1 || CHAIN_NAME="INPUT"
-    sudo iptables -I $CHAIN_NAME -s 240.0.0.0/8 -p tcp -m tcp -d 240.0.0.0/8 --dport 5672 -j ACCEPT
+    if [[ "$IS_GATE" != "True" ]]; then
+        # Ensure home directory for the ``stack`` user has executable
+        # permissions for all. Only for local (non-gate) installations.
+        # Check https://review.opendev.org/c/openstack/devstack/+/838645
+        chmod +x $HOME
+    fi
 }
 
 
@@ -316,7 +311,7 @@ _init
 
 if [[ "$IS_GATE" != "True" ]]; then
     if [[ "$INSTALL_MYSQL_ONLY" == "True" ]]; then
-        _install_databases nopg
+        _install_database
     else
         configure_host_for_func_testing
     fi
@@ -324,9 +319,12 @@ fi
 
 if [[ "$VENV" =~ "dsvm-fullstack" ]]; then
     _enable_ipv6
-    _configure_iptables_rules
     # This module only exists on older kernels, built-in otherwise
     modinfo ip_conntrack_proto_sctp 1> /dev/null 2>&1 && sudo modprobe ip_conntrack_proto_sctp
+    if is_fedora; then
+        install_package kernel-modules-extra-`uname -r`
+        sudo modprobe sctp
+    fi
 fi
 
 echo "Phew, we're done!"

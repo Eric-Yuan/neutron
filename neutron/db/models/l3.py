@@ -13,12 +13,12 @@
 from neutron_lib.api.definitions import l3 as l3_apidef
 from neutron_lib.db import constants as db_const
 from neutron_lib.db import model_base
+from neutron_lib.db import standard_attr
 import sqlalchemy as sa
 from sqlalchemy import orm
 
 from neutron.db.models import l3agent as rb_model
 from neutron.db import models_v2
-from neutron.db import standard_attr
 
 
 class RouterPort(model_base.BASEV2):
@@ -58,9 +58,9 @@ class Router(standard_attr.HasStandardAttributes, model_base.BASEV2,
     attached_ports = orm.relationship(
         RouterPort,
         backref=orm.backref('router', load_on_pending=True),
-        lazy='subquery')
+        lazy='selectin')
     l3_agents = orm.relationship(
-        'Agent', lazy='subquery', viewonly=True,
+        'Agent', lazy='selectin', viewonly=True,
         secondary=rb_model.RouterL3AgentBinding.__table__)
     api_collections = [l3_apidef.ROUTERS]
     collection_resource_map = {l3_apidef.ROUTERS: l3_apidef.ROUTER}
@@ -88,11 +88,11 @@ class FloatingIP(standard_attr.HasStandardAttributes, model_base.BASEV2,
     port = orm.relationship(models_v2.Port,
                             backref=orm.backref('floating_ips',
                                                 cascade='all,delete-orphan'),
-                            foreign_keys='FloatingIP.floating_port_id')
+                            foreign_keys=floating_port_id)
     fixed_port_id = sa.Column(sa.String(36), sa.ForeignKey('ports.id'))
     fixed_port = orm.relationship(models_v2.Port,
-                                  foreign_keys='FloatingIP.fixed_port_id',
-                                  lazy='joined')
+                                  foreign_keys=fixed_port_id,
+                                  lazy='joined', viewonly=True)
     fixed_ip_address = sa.Column(sa.String(64))
     router_id = sa.Column(sa.String(36), sa.ForeignKey('routers.id'))
     # Additional attribute for keeping track of the router where the floating
@@ -120,6 +120,6 @@ class RouterRoute(model_base.BASEV2, models_v2.Route):
 
     router = orm.relationship(Router, load_on_pending=True,
                               backref=orm.backref("route_list",
-                                                  lazy='subquery',
+                                                  lazy='selectin',
                                                   cascade='delete'))
     revises_on_change = ('router', )

@@ -39,7 +39,7 @@ class FakeAgentMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
 
     NOTE(yamamoto): This is a modified copy of ofagent mechanism driver as
     of writing this.  There's no need to keep this synced with the "real"
-    ofagent mechansim driver or its agent.
+    ofagent mechanism driver or its agent.
     """
 
     def __init__(self):
@@ -49,7 +49,7 @@ class FakeAgentMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
                        portbindings.VIF_DETAILS_CONNECTIVITY:
                            portbindings.CONNECTIVITY_L2,
                        }
-        super(FakeAgentMechanismDriver, self).__init__(
+        super().__init__(
             # NOTE(yamamoto): l2pop driver has a hardcoded list of
             # supported agent types.
             constants.AGENT_TYPE_OFA,
@@ -64,6 +64,10 @@ class FakeAgentMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
     def get_mappings(self, agent):
         return dict(agent['configurations'].get('interface_mappings', {}))
 
+    @property
+    def connectivity(self):
+        return portbindings.CONNECTIVITY_L2
+
 
 class AnotherFakeAgentMechanismDriver(FakeAgentMechanismDriver):
     pass
@@ -73,6 +77,10 @@ class FakeAgentMechanismDriverL3(FakeAgentMechanismDriver):
     """ML2 mechanism driver for testing, with L3 connectivity only"""
 
     def __init__(self):
-        super(FakeAgentMechanismDriverL3, self).__init__()
+        super().__init__()
         self.vif_details[portbindings.VIF_DETAILS_CONNECTIVITY] = (
             portbindings.CONNECTIVITY_L3)
+
+    @property
+    def connectivity(self):
+        return portbindings.CONNECTIVITY_L3

@@ -13,8 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import copy
-
 from neutron_lib import constants as const
 from oslo_log import log as logging
 from oslo_policy import policy as oslo_policy
@@ -64,11 +62,9 @@ def fetch_resource(method, neutron_context, controller,
         if parent_id:
             getter_args.append(parent_id)
         return getter(*getter_args, fields=field_list)
-    else:
-        # Some legit resources, like quota, do not have a plugin yet.
-        # Retrieving the original object is nevertheless important
-        # for policy checks.
-        return _custom_getter(resource, resource_id)
+    # Some legit resources, like quota, do not have a plugin yet. Retrieving
+    # the original object is nevertheless important for policy checks.
+    return _custom_getter(resource, resource_id)
 
 
 class PolicyHook(hooks.PecanHook):
@@ -92,9 +88,7 @@ class PolicyHook(hooks.PecanHook):
         if not controller or utils.is_member_action(controller):
             return
         collection = state.request.context.get('collection')
-        needs_prefetch = (state.request.method == 'PUT' or
-                          state.request.method == 'DELETE')
-        policy.init()
+        needs_prefetch = state.request.method in ('PUT', 'DELETE')
 
         action = controller.plugin_handlers[
             pecan_constants.ACTION_MAP[state.request.method]]
@@ -119,8 +113,7 @@ class PolicyHook(hooks.PecanHook):
                                           parent_id=parent_id)
             if resource_obj:
                 original_resources.append(resource_obj)
-                obj = copy.copy(resource_obj)
-                obj.update(item)
+                obj = resource_obj | item
                 obj[const.ATTRIBUTES_TO_UPDATE] = list(item)
                 # Put back the item in the list so that policies could be
                 # enforced
@@ -134,15 +127,19 @@ class PolicyHook(hooks.PecanHook):
                 policy.enforce(
                     neutron_context, action, item,
                     pluralized=collection)
-            except oslo_policy.PolicyNotAuthorized:
+            except (oslo_policy.PolicyNotAuthorized, oslo_policy.InvalidScope):
                 with excutils.save_and_reraise_exception() as ctxt:
+                    controller = utils.get_controller(state)
                     # If a tenant is modifying it's own object, it's safe to
                     # return a 403. Otherwise, pretend that it doesn't exist
                     # to avoid giving away information.
-                    controller = utils.get_controller(state)
+                    # It is also safe to return 403 if it's POST (CREATE)
+                    # request.
                     s_action = controller.plugin_handlers[controller.SHOW]
-                    if not policy.check(neutron_context, s_action, item,
-                                        pluralized=collection):
+                    c_action = controller.plugin_handlers[controller.CREATE]
+                    if (action != c_action and
+                            not policy.check(neutron_context, s_action, item,
+                                             pluralized=collection)):
                         ctxt.reraise = False
                 msg = _('The resource could not be found.')
                 raise webob.exc.HTTPNotFound(msg)
@@ -166,7 +163,6 @@ class PolicyHook(hooks.PecanHook):
             return
         if not data or (resource not in data and collection not in data):
             return
-        policy.init()
         is_single = resource in data
         action_type = pecan_constants.ACTION_MAP[state.request.method]
         if action_type == 'get':
@@ -178,16 +174,14 @@ class PolicyHook(hooks.PecanHook):
         # in the single case, we enforce which raises on violation
         # in the plural case, we just check so violating items are hidden
         policy_method = policy.enforce if is_single else policy.check
-        plugin = manager.NeutronManager.get_plugin_for_resource(collection)
         try:
             resp = [self._get_filtered_item(state.request, controller,
                                             resource, collection, item)
                     for item in to_process
                     if (state.request.method != 'GET' or
                         policy_method(neutron_context, action, item,
-                                      plugin=plugin,
                                       pluralized=collection))]
-        except oslo_policy.PolicyNotAuthorized:
+        except (oslo_policy.PolicyNotAuthorized, oslo_policy.InvalidScope):
             # This exception must be explicitly caught as the exception
             # translation hook won't be called if an error occurs in the
             # 'after' handler.  Instead of raising an HTTPNotFound exception,
@@ -237,7 +231,7 @@ class PolicyHook(hooks.PecanHook):
                         context,
                         # NOTE(kevinbenton): this used to reference a
                         # _plugin_handlers dict, why?
-                        'get_%s:%s' % (resource, attr_name),
+                        f'get_{resource}:{attr_name}',
                         data,
                         might_not_exist=True,
                         pluralized=collection):

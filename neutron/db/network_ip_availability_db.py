@@ -15,7 +15,6 @@
 
 import netaddr
 from neutron_lib.db import api as db_api
-import six
 from sqlalchemy import func
 
 import neutron.db.models_v2 as mod
@@ -32,10 +31,10 @@ SUPPORTED_FILTERS = {
     'project_id': mod.Network.project_id,
     'ip_version': mod.Subnet.ip_version,
 }
-SUPPORTED_FILTER_KEYS = six.viewkeys(SUPPORTED_FILTERS)
+SUPPORTED_FILTER_KEYS = set(SUPPORTED_FILTERS.keys())
 
 
-class IpAvailabilityMixin(object):
+class IpAvailabilityMixin:
     """Mixin class to query for IP availability."""
 
     # Columns common to all queries
@@ -61,6 +60,7 @@ class IpAvailabilityMixin(object):
     total_ips_columns.append(mod.IPAllocationPool.last_ip)
 
     @classmethod
+    @db_api.CONTEXT_READER
     def get_network_ip_availabilities(cls, context, filters=None):
         """Get IP availability stats on a per subnet basis.
 
@@ -82,7 +82,7 @@ class IpAvailabilityMixin(object):
                             subnet_total_ips_dict.get(row.subnet_id, 0))
 
         # Convert result back into the list it expects
-        net_ip_availabilities = list(six.viewvalues(result_dict))
+        net_ip_availabilities = list(result_dict.values())
         return net_ip_availabilities
 
     @classmethod
@@ -110,8 +110,8 @@ class IpAvailabilityMixin(object):
         query = query.outerjoin(mod.Subnet,
                                 mod.Network.id == mod.Subnet.network_id)
         query = query.outerjoin(
-                mod.IPAllocationPool,
-                mod.Subnet.id == mod.IPAllocationPool.subnet_id)
+            mod.IPAllocationPool,
+            mod.Subnet.id == mod.IPAllocationPool.subnet_id)
         return cls._adjust_query_for_filters(query, filters)
 
     @classmethod
@@ -130,20 +130,20 @@ class IpAvailabilityMixin(object):
             # Add IPAllocationPool data
             if row.last_ip:
                 pool_total = netaddr.IPRange(
-                        netaddr.IPAddress(row.first_ip),
-                        netaddr.IPAddress(row.last_ip)).size
+                    netaddr.IPAddress(row.first_ip),
+                    netaddr.IPAddress(row.last_ip)).size
                 cur_total = subnet_totals_dict.get(row.subnet_id, 0)
                 subnet_totals_dict[row.subnet_id] = cur_total + pool_total
             else:
                 subnet_totals_dict[row.subnet_id] = netaddr.IPNetwork(
-                        row.cidr, version=row.ip_version).size
+                    row.cidr, version=row.ip_version).size
 
         return subnet_totals_dict
 
     @classmethod
     def _adjust_query_for_filters(cls, query, filters):
         # The intersect of sets gets us applicable filter keys (others ignored)
-        common_keys = six.viewkeys(filters) & SUPPORTED_FILTER_KEYS
+        common_keys = filters.keys() & SUPPORTED_FILTER_KEYS
         for key in common_keys:
             filter_vals = filters[key]
             if filter_vals:

@@ -27,11 +27,12 @@ from oslo_utils import uuidutils
 from neutron.conf.db import extraroute_db
 from neutron.db import l3_gateway_ip_qos
 from neutron.extensions import l3
+from neutron.objects.qos import binding
 from neutron.objects.qos import policy
 from neutron.tests.unit.extensions import test_l3
 
 
-class GatewayIPQoSTestExtensionManager(object):
+class GatewayIPQoSTestExtensionManager:
 
     def get_resources(self):
         l3_apidef.RESOURCE_ATTRIBUTE_MAP['routers'].update(
@@ -62,13 +63,13 @@ class TestGatewayIPQoSL3NatServicePlugin(
                                    qos_gateway_ip.ALIAS]
 
 
-class GatewayIPQoSDBTestCaseBase(object):
+class GatewayIPQoSDBTestCaseBase:
 
     def test_create_router_gateway_with_qos_policy(self):
         ctx = context.get_admin_context()
         policy_obj = policy.QosPolicy(ctx,
                                       id=uuidutils.generate_uuid(),
-                                      project_id='tenant', name='pol1',
+                                      project_id=self._tenant_id, name='pol1',
                                       rules=[])
         policy_obj.create()
         with self.subnet(cidr='11.0.0.0/24') as public_sub,\
@@ -87,7 +88,7 @@ class GatewayIPQoSDBTestCaseBase(object):
         ctx = context.get_admin_context()
         policy_obj = policy.QosPolicy(ctx,
                                       id=uuidutils.generate_uuid(),
-                                      project_id='tenant', name='pol1',
+                                      project_id=self._tenant_id, name='pol1',
                                       rules=[])
         policy_obj.create()
         with self.subnet(cidr='11.0.0.0/24') as public_sub,\
@@ -110,12 +111,11 @@ class GatewayIPQoSDBTestCaseBase(object):
                 res['router']['external_gateway_info'].get(
                     qos_consts.QOS_POLICY_ID))
 
-    def test_clear_router_gateway_and_create_with_old_qos_policy_implicitly(
-            self):
+    def test_clear_router_gateway_and_create_again(self):
         ctx = context.get_admin_context()
         policy_obj = policy.QosPolicy(ctx,
                                       id=uuidutils.generate_uuid(),
-                                      project_id='tenant', name='pol1',
+                                      project_id=self._tenant_id, name='pol1',
                                       rules=[])
         policy_obj.create()
         with self.subnet(cidr='11.0.0.0/24') as public_sub,\
@@ -129,28 +129,31 @@ class GatewayIPQoSDBTestCaseBase(object):
                 policy_obj.id,
                 res['router']['external_gateway_info'].get(
                     qos_consts.QOS_POLICY_ID))
+            gw_binding = binding.QosPolicyRouterGatewayIPBinding.get_object(
+                ctx, router_id=r['router']['id'])
+            self.assertEqual(r['router']['id'], gw_binding.router_id)
 
-            # Clear router gateway
+            # Clear router gateway, the QoS policy must be removed.
             self._remove_external_gateway_from_router(
                 r['router']['id'],
                 public_sub['subnet']['network_id'],
                 external_gw_info={})
+            gw_binding = binding.QosPolicyRouterGatewayIPBinding.get_object(
+                ctx, router_id=r['router']['id'])
+            self.assertIsNone(gw_binding)
 
-            # Create router gateway again, then the qos policy binding will be
-            # reused here.
+            # Create router gateway again.
             res = self._add_external_gateway_to_router(
                 r['router']['id'],
                 public_sub['subnet']['network_id'])
-            self.assertEqual(
-                policy_obj.id,
-                res['router']['external_gateway_info'].get(
-                    qos_consts.QOS_POLICY_ID))
+            self.assertIsNone(res['router']['external_gateway_info'].get(
+                qos_consts.QOS_POLICY_ID))
 
     def test_clear_router_gateway_qos_policy(self):
         ctx = context.get_admin_context()
         policy_obj = policy.QosPolicy(ctx,
                                       id=uuidutils.generate_uuid(),
-                                      project_id='tenant', name='pol1',
+                                      project_id=self._tenant_id, name='pol1',
                                       rules=[])
         policy_obj.create()
         with self.subnet(cidr='11.0.0.0/24') as public_sub,\
@@ -195,8 +198,6 @@ class GatewayIPQoSDBIntTestCase(test_l3.L3BaseForIntTests,
         service_plugins = {'qos': 'neutron.services.qos.qos_plugin.QoSPlugin'}
 
         extraroute_db.register_db_extraroute_opts()
-        # for these tests we need to enable overlapping ips
-        cfg.CONF.set_default('allow_overlapping_ips', True)
         cfg.CONF.set_default('max_routes', 3)
 
         ext_mgr = GatewayIPQoSTestExtensionManager()
@@ -222,8 +223,6 @@ class GatewayIPQoSDBSepTestCase(test_l3.L3BaseForSepTests,
                            'qos': 'neutron.services.qos.qos_plugin.QoSPlugin'}
 
         extraroute_db.register_db_extraroute_opts()
-        # for these tests we need to enable overlapping ips
-        cfg.CONF.set_default('allow_overlapping_ips', True)
         cfg.CONF.set_default('max_routes', 3)
 
         ext_mgr = GatewayIPQoSTestExtensionManager()

@@ -28,7 +28,7 @@ _uuid = uuidutils.generate_uuid
 
 class TestRouterInfo(base.BaseTestCase):
     def setUp(self):
-        super(TestRouterInfo, self).setUp()
+        super().setUp()
 
         conf = config.setup_conf()
         l3_config.register_l3_agent_config_opts(l3_config.OPTS, conf)
@@ -37,13 +37,88 @@ class TestRouterInfo(base.BaseTestCase):
         ip_cls = self.ip_cls_p.start()
         self.mock_ip = mock.MagicMock()
         ip_cls.return_value = self.mock_ip
+        self.mock_add_ip_route = mock.patch.object(
+            ip_lib, 'add_ip_route').start()
+        self.mock_delete_ip_route = mock.patch.object(
+            ip_lib, 'delete_ip_route').start()
         self.ri_kwargs = {'agent_conf': conf,
                           'interface_driver': mock.sentinel.interface_driver}
 
-    def _check_agent_method_called(self, calls):
+    def _check_agent_method_called(self, router, action_calls):
+        for action, calls in action_calls.items():
+            mock_calls = [mock.call(router.ns_name, c[0], via=c[1])
+                          for c in calls]
+            mock_method = (self.mock_add_ip_route if action == 'replace' else
+                           self.mock_delete_ip_route)
+            mock_method.assert_has_calls(mock_calls, any_order=True)
+
+    def _check_ip_wrapper_method_called(self, calls):
         self.mock_ip.netns.execute.assert_has_calls(
             [mock.call(call, check_exit_code=False) for call in calls],
             any_order=True)
+
+    def test_update_routing_table_ecmp(self):
+        ri = router_info.RouterInfo(mock.Mock(), _uuid(), {}, **self.ri_kwargs)
+        ri.router = {}
+        fake_route_list = [{'destination': '135.207.111.111/32',
+                            'nexthop': '135.207.111.112'},
+                           {'destination': '135.207.111.111/32',
+                            'nexthop': '135.207.111.113'}]
+        expected_dst = '135.207.111.111/32'
+        expected_next_hops = [{'via': '135.207.111.112'},
+                              {'via': '135.207.111.113'}]
+        ri.update_routing_table_ecmp(fake_route_list)
+        self.mock_add_ip_route.assert_called_once_with(
+            ri.ns_name,
+            expected_dst,
+            via=expected_next_hops)
+
+    def test_check_and_remove_ecmp_route(self):
+        ri = router_info.RouterInfo(mock.Mock(), _uuid(), {}, **self.ri_kwargs)
+        ri.router = {}
+        fake_old_routes1 = [{'destination': '135.207.111.111/32',
+                             'nexthop': '135.207.111.112'},
+                            {'destination': '135.207.111.111/32',
+                             'nexthop': '135.207.111.113'}]
+        fake_route1 = {'destination': '135.207.111.111/32',
+                       'nexthop': '135.207.111.113'}
+        fake_old_routes2 = [{'destination': '135.207.111.111/32',
+                             'nexthop': '135.207.111.112'},
+                            {'destination': '135.207.111.111/32',
+                             'nexthop': '135.207.111.113'},
+                            {'destination': '135.207.111.111/32',
+                             'nexthop': '135.207.111.114'}]
+        fake_route2 = [{'destination': '135.207.111.111/32',
+                        'nexthop': '135.207.111.113'},
+                       {'destination': '135.207.111.111/32',
+                        'nexthop': '135.207.111.114'}]
+        fake_remove_route = {'destination': '135.207.111.111/32',
+                             'nexthop': '135.207.111.112'}
+        ri.update_routing_table = mock.Mock()
+
+        ri.check_and_remove_ecmp_route(fake_old_routes1, fake_remove_route)
+        ri.update_routing_table.assert_called_once_with('replace',
+                                                        fake_route1)
+
+        ri.update_routing_table_ecmp = mock.Mock()
+        ri.check_and_remove_ecmp_route(fake_old_routes2, fake_remove_route)
+        ri.update_routing_table_ecmp.assert_called_once_with(fake_route2)
+
+    def test_check_and_add_ecmp_route(self):
+        ri = router_info.RouterInfo(mock.Mock(), _uuid(), {}, **self.ri_kwargs)
+        ri.router = {}
+        fake_old_routes = [{'destination': '135.207.111.111/32',
+                            'nexthop': '135.207.111.112'}]
+        fake_new_route = {'destination': '135.207.111.111/32',
+                          'nexthop': '135.207.111.113'}
+        ri.update_routing_table_ecmp = mock.Mock()
+
+        ri.check_and_add_ecmp_route(fake_old_routes, fake_new_route)
+        expected_routes = [{'destination': '135.207.111.111/32',
+                            'nexthop': '135.207.111.112'},
+                           {'destination': '135.207.111.111/32',
+                            'nexthop': '135.207.111.113'}]
+        ri.update_routing_table_ecmp.assert_called_once_with(expected_routes)
 
     def test_routing_table_update(self):
         ri = router_info.RouterInfo(mock.Mock(), _uuid(), {}, **self.ri_kwargs)
@@ -55,24 +130,20 @@ class TestRouterInfo(base.BaseTestCase):
                        'nexthop': '1.2.3.4'}
 
         ri.update_routing_table('replace', fake_route1)
-        expected = [['ip', 'route', 'replace', 'to', '135.207.0.0/16',
-                     'via', '1.2.3.4']]
-        self._check_agent_method_called(expected)
+        expected = {'replace': [('135.207.0.0/16', '1.2.3.4')]}
+        self._check_agent_method_called(ri, expected)
 
         ri.update_routing_table('delete', fake_route1)
-        expected = [['ip', 'route', 'delete', 'to', '135.207.0.0/16',
-                     'via', '1.2.3.4']]
-        self._check_agent_method_called(expected)
+        expected = {'delete': [('135.207.0.0/16', '1.2.3.4')]}
+        self._check_agent_method_called(ri, expected)
 
         ri.update_routing_table('replace', fake_route2)
-        expected = [['ip', 'route', 'replace', 'to', '135.207.111.111/32',
-                     'via', '1.2.3.4']]
-        self._check_agent_method_called(expected)
+        expected = {'replace': [('135.207.111.111/32', '1.2.3.4')]}
+        self._check_agent_method_called(ri, expected)
 
         ri.update_routing_table('delete', fake_route2)
-        expected = [['ip', 'route', 'delete', 'to', '135.207.111.111/32',
-                     'via', '1.2.3.4']]
-        self._check_agent_method_called(expected)
+        expected = {'delete': [('135.207.111.111/32', '1.2.3.4')]}
+        self._check_agent_method_called(ri, expected)
 
     def test_update_routing_table(self):
         # Just verify the correct namespace was used in the call
@@ -103,50 +174,22 @@ class TestRouterInfo(base.BaseTestCase):
         ri.router['routes'] = fake_new_routes
         ri.routes_updated(fake_old_routes, fake_new_routes)
 
-        expected = [['ip', 'route', 'replace', 'to', '110.100.30.0/24',
-                    'via', '10.100.10.30'],
-                    ['ip', 'route', 'replace', 'to', '110.100.31.0/24',
-                     'via', '10.100.10.30']]
-
-        self._check_agent_method_called(expected)
+        expected = {'replace': [('110.100.30.0/24', '10.100.10.30'),
+                                ('110.100.31.0/24', '10.100.10.30')]}
+        self._check_agent_method_called(ri, expected)
         ri.routes = fake_new_routes
         fake_new_routes = [{'destination': "110.100.30.0/24",
                             'nexthop': "10.100.10.30"}]
         ri.router['routes'] = fake_new_routes
         ri.routes_updated(ri.routes, fake_new_routes)
-        expected = [['ip', 'route', 'delete', 'to', '110.100.31.0/24',
-                    'via', '10.100.10.30']]
-
-        self._check_agent_method_called(expected)
+        expected = {'delete': [('110.100.31.0/24', '10.100.10.30')]}
+        self._check_agent_method_called(ri, expected)
         fake_new_routes = []
         ri.router['routes'] = fake_new_routes
         ri.routes_updated(ri.routes, fake_new_routes)
 
-        expected = [['ip', 'route', 'delete', 'to', '110.100.30.0/24',
-                    'via', '10.100.10.30']]
-        self._check_agent_method_called(expected)
-
-    def test__process_pd_iptables_rules(self):
-        subnet_id = _uuid()
-        ex_gw_port = {'id': _uuid()}
-        prefix = '2001:db8:cafe::/64'
-
-        ri = router_info.RouterInfo(mock.Mock(), _uuid(), {}, **self.ri_kwargs)
-
-        ipv6_mangle = ri.iptables_manager.ipv6['mangle'] = mock.MagicMock()
-        ri.get_ex_gw_port = mock.Mock(return_value=ex_gw_port)
-        ri.get_external_device_name = mock.Mock(return_value='fake_device')
-        ri.get_address_scope_mark_mask = mock.Mock(return_value='fake_mark')
-
-        ri._process_pd_iptables_rules(prefix, subnet_id)
-
-        mangle_rule = '-d %s ' % prefix
-        mangle_rule += ri.address_scope_mangle_rule('fake_device', 'fake_mark')
-
-        ipv6_mangle.add_rule.assert_called_once_with(
-            'scope',
-            mangle_rule,
-            tag='prefix_delegation_%s' % subnet_id)
+        expected = {'delete': [('110.100.30.0/24', '10.100.10.30')]}
+        self._check_agent_method_called(ri, expected)
 
     def test_add_ports_address_scope_iptables(self):
         ri = router_info.RouterInfo(mock.Mock(), _uuid(), {}, **self.ri_kwargs)
@@ -305,21 +348,23 @@ class TestBasicRouterOperations(BasicRouterTestCaseFramework):
         ri.get_floating_ips = mock.Mock(return_value=fips)
         ri._get_external_address_scope = mock.Mock(return_value='scope2')
         ipv4_mangle = ri.iptables_manager.ipv4['mangle'] = mock.MagicMock()
-        ri.floating_mangle_rules = mock.Mock(
-            return_value=[(mock.sentinel.chain1, mock.sentinel.rule1)])
         ri.get_external_device_name = mock.Mock()
 
         ri.process_floating_ip_address_scope_rules()
 
-        # Be sure that the rules are cleared first
-        self.assertEqual(mock.call.clear_rules_by_tag('floating_ip'),
-                         ipv4_mangle.mock_calls[0])
-        # Be sure that add_rule is called somewhere in the middle
-        self.assertEqual(1, ipv4_mangle.add_rule.call_count)
-        self.assertEqual(mock.call.add_rule(mock.sentinel.chain1,
-                                            mock.sentinel.rule1,
-                                            tag='floating_ip'),
-                         ipv4_mangle.mock_calls[1])
+        internal_mark = ri.get_address_scope_mark_mask('scope1')
+        self.assertEqual(2, ipv4_mangle.add_rule.call_count)
+        expected_calls = [
+            mock.call.clear_rules_by_tag('floating_ip'),
+            mock.call.add_rule('floatingip',
+                               '-d %s/32 -j MARK --set-xmark %s' %
+                               (mock.sentinel.fip, internal_mark),
+                               tag='floating_ip'),
+            mock.call.add_rule('FORWARD',
+                               '-s %s/32 -j $float-snat' % mock.sentinel.ip,
+                               tag='floating_ip')
+        ]
+        ipv4_mangle.assert_has_calls(expected_calls)
 
     def test_process_floating_ip_address_scope_rules_same_scopes(self):
         ri = self._create_router()

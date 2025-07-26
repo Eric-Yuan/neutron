@@ -21,10 +21,8 @@ from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
 from neutron_lib import constants as lib_constants
 
-from neutron.agent.l3 import agent as l3_agent
 from neutron.agent.l3 import namespace_manager
 from neutron.agent.l3 import namespaces
-from neutron.agent.l3 import router_info
 from neutron.agent.linux import ip_lib
 from neutron.common import utils
 from neutron.tests.common import machine_fixtures
@@ -65,12 +63,12 @@ class L3AgentTestCase(framework.L3AgentTestFramework):
                 check.assert_called_once_with(router.router_id, None)
 
         expected_calls = [
-            mock.call('router', 'before_create', self.agent, router=router),
-            mock.call('router', 'after_create', self.agent, router=router),
-            mock.call('router', 'before_update', self.agent, router=router),
-            mock.call('router', 'after_update', self.agent, router=router),
+            mock.call('router', 'before_create', self.agent, payload=mock.ANY),
+            mock.call('router', 'after_create', self.agent, payload=mock.ANY),
+            mock.call('router', 'before_update', self.agent, payload=mock.ANY),
+            mock.call('router', 'after_update', self.agent, payload=mock.ANY),
             mock.call('router', 'before_delete', self.agent, payload=mock.ANY),
-            mock.call('router', 'after_delete', self.agent, router=router)]
+            mock.call('router', 'after_delete', self.agent, payload=mock.ANY)]
         event_handler.assert_has_calls(expected_calls)
 
     def test_agent_notifications_for_router_events(self):
@@ -109,47 +107,6 @@ class L3AgentTestCase(framework.L3AgentTestFramework):
 
         self.assertIsNone(device.route.get_gateway())
 
-    def test_router_processing_pool_size(self):
-        mock.patch.object(router_info.RouterInfo, 'initialize').start()
-        mock.patch.object(router_info.RouterInfo, 'process').start()
-        self.agent.l3_ext_manager = mock.Mock()
-        mock.patch.object(router_info.RouterInfo, 'delete').start()
-        mock.patch.object(registry, 'notify').start()
-
-        router_info_1 = self.generate_router_info(False)
-        r1 = self.manage_router(self.agent, router_info_1)
-        self.assertEqual(l3_agent.ROUTER_PROCESS_GREENLET_MIN,
-                         self.agent._pool.size)
-
-        router_info_2 = self.generate_router_info(False)
-        r2 = self.manage_router(self.agent, router_info_2)
-        self.assertEqual(l3_agent.ROUTER_PROCESS_GREENLET_MIN,
-                         self.agent._pool.size)
-
-        router_info_list = [r1, r2]
-        for _i in range(l3_agent.ROUTER_PROCESS_GREENLET_MAX + 1):
-            ri = self.generate_router_info(False)
-            rtr = self.manage_router(self.agent, ri)
-            router_info_list.append(rtr)
-
-        self.assertEqual(l3_agent.ROUTER_PROCESS_GREENLET_MAX,
-                         self.agent._pool.size)
-
-        for router in router_info_list:
-            self.agent._safe_router_removed(router.router_id)
-
-        agent_router_info_len = len(self.agent.router_info)
-        if agent_router_info_len < l3_agent.ROUTER_PROCESS_GREENLET_MIN:
-            self.assertEqual(l3_agent.ROUTER_PROCESS_GREENLET_MIN,
-                             self.agent._pool.size)
-        elif (l3_agent.ROUTER_PROCESS_GREENLET_MIN <= agent_router_info_len <=
-                l3_agent.ROUTER_PROCESS_GREENLET_MAX):
-            self.assertEqual(agent_router_info_len,
-                             self.agent._pool.size)
-        else:
-            self.assertEqual(l3_agent.ROUTER_PROCESS_GREENLET_MAX,
-                             self.agent._pool.size)
-
     def _make_bridge(self):
         bridge = framework.get_ovs_bridge(utils.get_rand_name())
         bridge.create()
@@ -173,7 +130,7 @@ class L3AgentTestCase(framework.L3AgentTestFramework):
         # l3 agent should be able to rebuild the ns when it is deleted
         self.manage_router(self.agent, router_info)
         # Assert the router ports are there in namespace
-        self.assertTrue(all([port.exists() for port in router_ports]))
+        self.assertTrue(all(port.exists() for port in router_ports))
 
         self._delete_router(self.agent, router.router_id)
 
@@ -226,7 +183,7 @@ class L3AgentTestCase(framework.L3AgentTestFramework):
 
         # make sure all events are processed
         while not self.agent._queue._queue.empty():
-            self.agent._process_router_update()
+            self.agent._process_update()
 
         for r in routers_to_keep:
             self.assertIn(r['id'], self.agent.router_info)
@@ -320,7 +277,7 @@ class L3AgentTestCase(framework.L3AgentTestFramework):
         # Verify that the ping replys with fip
         ns_ip_wrapper = ip_lib.IPWrapper(src_machine.namespace)
         result = ns_ip_wrapper.netns.execute(
-            ['ping', '-W', 5, '-c', 1, dst_fip])
+            ['ping', '-W', 5, '-c', 1, dst_fip], privsep_exec=True)
         self._assert_ping_reply_from_expected_address(result, dst_fip)
 
     def _setup_address_scope(self, internal_address_scope1,
@@ -436,3 +393,68 @@ class L3AgentTestCase(framework.L3AgentTestFramework):
         # networks that are in the same address scope as external network
         net_helpers.assert_ping(machine_diff_scope.namespace,
                                 machine_same_scope.ip)
+
+    def test_router_interface_mtu_update(self):
+        original_mtu = 1450
+        router_info = self.generate_router_info(False)
+        router_info['_interfaces'][0]['mtu'] = original_mtu
+        router_info['gw_port']['mtu'] = original_mtu
+
+        router = self.manage_router(self.agent, router_info)
+
+        interface_name = router.get_internal_device_name(
+            router_info['_interfaces'][0]['id'])
+        gw_interface_name = router.get_external_device_name(
+            router_info['gw_port']['id'])
+
+        self.assertEqual(
+            original_mtu,
+            ip_lib.IPDevice(interface_name, router.ns_name).link.mtu)
+        self.assertEqual(
+            original_mtu,
+            ip_lib.IPDevice(gw_interface_name, router.ns_name).link.mtu)
+
+        updated_mtu = original_mtu + 1
+        router_info_copy = copy.deepcopy(router_info)
+        router_info_copy['_interfaces'][0]['mtu'] = updated_mtu
+        router_info_copy['gw_port']['mtu'] = updated_mtu
+
+        self.agent._process_updated_router(router_info_copy)
+
+        self.assertEqual(
+            updated_mtu,
+            ip_lib.IPDevice(interface_name, router.ns_name).link.mtu)
+        self.assertEqual(
+            updated_mtu,
+            ip_lib.IPDevice(gw_interface_name, router.ns_name).link.mtu)
+
+    def test_legacy_router_update_ecmp_routes(self):
+        self.agent.conf.agent_mode = 'legacy'
+        dest_cidr = '8.8.8.0/24'
+        nexthop1 = '19.4.4.4'
+        nexthop2 = '19.4.4.5'
+
+        router_i_non_ha = self.generate_router_info(enable_ha=False,
+                                                    extra_routes=False)
+        router1 = self.manage_router(self.agent, router_i_non_ha)
+
+        router1.router['routes'] = [
+            {'destination': dest_cidr, 'nexthop': nexthop1},
+            {'destination': dest_cidr, 'nexthop': nexthop2}]
+        self.agent._process_updated_router(router1.router)
+        route_expected = {'cidr': dest_cidr,
+                          'table': 'main',
+                          'via': [{'via': nexthop1},
+                                  {'via': nexthop2}]
+                          }
+
+        self._assert_ecmp_route_in_routes(router=router1,
+                                          expected_route=route_expected)
+
+        # Delete one route
+        router1.router['routes'] = [
+            {'destination': dest_cidr, 'nexthop': nexthop1}]
+        self.agent._process_updated_router(router1.router)
+        expected_route = {'cidr': dest_cidr, 'table': 'main', 'via': nexthop1}
+        self._assert_route_in_routes(router=router1,
+                                     expected_route=expected_route)

@@ -17,7 +17,7 @@ neutron-sanity-check usage
    usage: neutron-sanity-check [-h] [--arp_header_match] [--arp_responder]
                                [--bridge_firewalling] [--config-dir DIR]
                                [--config-file PATH] [--debug] [--dhcp_release6]
-                               [--dibbler_version] [--dnsmasq_version]
+                               [--dnsmasq_version]
                                [--ebtables_installed] [--icmpv6_header_match]
                                [--ip6tables_installed] [--ip_nonlocal_bind]
                                [--iproute2_vxlan] [--ipset_installed]
@@ -27,7 +27,7 @@ neutron-sanity-check usage
                                [--log-dir LOG_DIR] [--log-file PATH]
                                [--noarp_header_match] [--noarp_responder]
                                [--nobridge_firewalling] [--nodebug]
-                               [--nodhcp_release6] [--nodibbler_version]
+                               [--nodhcp_release6]
                                [--nodnsmasq_version] [--noebtables_installed]
                                [--noicmpv6_header_match]
                                [--noip6tables_installed] [--noip_nonlocal_bind]
@@ -36,14 +36,12 @@ neutron-sanity-check usage
                                [--noovs_conntrack] [--noovs_geneve]
                                [--noovs_patch] [--noovs_vxlan] [--noovsdb_native]
                                [--noread_netns] [--nouse-syslog] [--nova_notify]
-                               [--noverbose] [--novf_extended_management]
-                               [--novf_management] [--nowatch-log-file]
+                               [--noverbose] [--nowatch-log-file]
                                [--ovs_conntrack] [--ovs_geneve] [--ovs_patch]
                                [--ovs_vxlan] [--ovsdb_native] [--read_netns]
                                [--state_path STATE_PATH]
                                [--syslog-log-facility SYSLOG_LOG_FACILITY]
                                [--use-syslog] [--verbose] [--version]
-                               [--vf_extended_management] [--vf_management]
                                [--watch-log-file]
 
 neutron-sanity-check optional arguments
@@ -81,9 +79,6 @@ neutron-sanity-check optional arguments
 
 ``--dhcp_release6``
   Check dhcp_release6 installation
-
-``--dibbler_version``
-  Check minimal dibbler version
 
 ``--dnsmasq_version``
   Check minimal dnsmasq version
@@ -143,9 +138,6 @@ neutron-sanity-check optional arguments
 ``--nodhcp_release6``
    The inverse of --dhcp_release6
 
-``--nodibbler_version``
-  The inverse of --dibbler_version
-
 ``--nodnsmasq_version``
   The inverse of --dnsmasq_version
 
@@ -200,12 +192,6 @@ neutron-sanity-check optional arguments
 ``--noverbose``
   The inverse of --verbose
 
-``--novf_extended_management``
-   The inverse of --vf_extended_management
-
-``--novf_management``
-  The inverse of --vf_management
-
 ``--nowatch-log-file``
   The inverse of --watch-log-file
 
@@ -243,12 +229,6 @@ neutron-sanity-check optional arguments
 
 ``--version``
   show program's version number and exit
-
-``--vf_extended_management``
-  Check for VF extended management support
-
-``--vf_management``
-  Check for VF management support
 
 ``--watch-log-file``
   Uses logging handler designed to watch file system.

@@ -14,9 +14,12 @@
 
 from unittest import mock
 
+from neutron_lib.api import attributes
 from neutron_lib.api.definitions import dvr as dvr_apidef
 from neutron_lib.api.definitions import external_net as extnet_apidef
+from neutron_lib.api.definitions import l3 as l3_apidef
 from neutron_lib.api.definitions import l3_ext_ha_mode
+from neutron_lib.api.definitions import network_ha
 from neutron_lib.api.definitions import port as port_def
 from neutron_lib.api.definitions import portbindings
 from neutron_lib.api.definitions import provider_net as providernet
@@ -30,11 +33,9 @@ from neutron_lib.db import api as db_api
 from neutron_lib import exceptions as n_exc
 from neutron_lib.exceptions import l3 as l3_exc
 from neutron_lib.exceptions import l3_ext_ha_mode as l3ha_exc
-from neutron_lib.objects import exceptions
 from neutron_lib.plugins import constants as plugin_constants
 from neutron_lib.plugins import directory
 from oslo_config import cfg
-from oslo_db import exception as db_exc
 from oslo_utils import uuidutils
 import sqlalchemy as sa
 from sqlalchemy import orm
@@ -46,6 +47,9 @@ from neutron.db import agents_db
 from neutron.db import l3_agentschedulers_db
 from neutron.db import l3_hamode_db
 from neutron.objects import l3_hamode
+from neutron.objects import network as network_obj
+from neutron.objects import subnet as subnet_obj
+from neutron.plugins.ml2 import plugin as ml2_plugin
 from neutron import quota
 from neutron.scheduler import l3_agent_scheduler
 from neutron.services.revisions import revision_plugin
@@ -65,7 +69,7 @@ class FakeL3PluginWithAgents(test_l3.TestL3PluginBaseAttributes,
 
 class L3HATestFramework(testlib_api.SqlTestCase):
     def setUp(self):
-        super(L3HATestFramework, self).setUp()
+        super().setUp()
 
         self.setup_coreplugin('ml2')
         self.core_plugin = directory.get_plugin()
@@ -76,7 +80,6 @@ class L3HATestFramework(testlib_api.SqlTestCase):
         self.mock_quota_make_res = make_res.start()
         commit_res = mock.patch.object(quota.QuotaEngine, 'commit_reservation')
         self.mock_quota_commit_res = commit_res.start()
-        cfg.CONF.set_override('allow_overlapping_ips', True)
 
         self.plugin = FakeL3PluginWithAgents()
         directory.add_plugin(plugin_constants.L3, self.plugin)
@@ -84,6 +87,16 @@ class L3HATestFramework(testlib_api.SqlTestCase):
         self.agent1 = helpers.register_l3_agent()
         self.agent2 = helpers.register_l3_agent(
             'host_2', constants.L3_AGENT_MODE_DVR_SNAT)
+        # Extend network HA extension.
+        rname = network_ha.COLLECTION_NAME
+        attributes.RESOURCES[rname].update(
+            network_ha.RESOURCE_ATTRIBUTE_MAP[rname])
+        self._max_bind_retries = ml2_plugin.MAX_BIND_TRIES
+        ml2_plugin.MAX_BIND_TRIES = 1
+        self.addCleanup(self._restore_max_bind_retries)
+
+    def _restore_max_bind_retries(self):
+        ml2_plugin.MAX_BIND_TRIES = self._max_bind_retries
 
     @property
     def admin_ctx(self):
@@ -289,8 +302,8 @@ class L3HATestCase(L3HATestFramework):
 
         def jam_in_interface(*args, **kwargs):
             ctx = context.get_admin_context()
-            net = self.plugin._ensure_vr_id_and_network(
-                ctx, self.plugin._get_router(ctx, router['id']))
+            net = self.plugin.get_ha_network(self.admin_ctx,
+                                             router['tenant_id'])
             self.plugin.add_ha_port(
                 ctx, router['id'], net.network_id, router['tenant_id'])
             registry.unsubscribe(jam_in_interface, resources.ROUTER,
@@ -602,6 +615,7 @@ class L3HATestCase(L3HATestFramework):
     def test_add_ha_port_subtransactions_blocked(self):
         ctx = self.admin_ctx
         with db_api.CONTEXT_WRITER.using(ctx):
+            network_obj.Network(ctx).create()
             self.assertRaises(RuntimeError, self.plugin.add_ha_port,
                               ctx, 'id', 'id', 'id')
 
@@ -629,7 +643,8 @@ class L3HATestCase(L3HATestFramework):
 
         with mock.patch.object(l3_hamode, 'L3HARouterNetwork',
                                side_effect=ValueError):
-            self.assertRaises(ValueError, self.plugin._create_ha_network,
+            self.assertRaises(c_exc.CallbackFailure,
+                              self.plugin._create_ha_network,
                               self.admin_ctx, _uuid())
 
         networks_after = self.core_plugin.get_networks(self.admin_ctx)
@@ -668,90 +683,37 @@ class L3HATestCase(L3HATestFramework):
                           self.admin_ctx, ports[0]['id'],
                           port)
 
-    def test_ensure_vr_id_and_network_net_exists(self):
-        router = self._create_router()
-        router_db = self.plugin._get_router(self.admin_ctx, router['id'])
-        with mock.patch.object(self.plugin, '_create_ha_network') as create:
-            self.plugin._ensure_vr_id_and_network(
-                self.admin_ctx, router_db)
-            self.assertFalse(create.called)
-
-    def test_ensure_vr_id_and_network_concurrent_create(self):
-        # create a non-ha router so we can manually invoke the create ha
-        # interfaces call down below
-        router = self._create_router(ha=False)
-        router_db = self.plugin._get_router(self.admin_ctx, router['id'])
-        orig_create = self.plugin._create_ha_network
-        created_nets = []
-
-        def _create_ha_network(*args, **kwargs):
-            # create the network and then raise the error to simulate another
-            # worker creating the network before us.
-            created_nets.append(orig_create(*args, **kwargs))
-            raise db_exc.DBDuplicateEntry(columns=['tenant_id'])
-        with mock.patch.object(self.plugin, '_create_ha_network',
-                               new=_create_ha_network):
-            net = self.plugin._ensure_vr_id_and_network(
-                self.admin_ctx, router_db)
-        # ensure that it used the concurrently created network
-        self.assertEqual([net], created_nets)
-
-    def _test_ensure_with_patched_ensure_vr_id(self, _ensure_vr_id):
-        # create a non-ha router so we can manually invoke the create ha
-        # interfaces call down below
-        router = self._create_router(ha=False)
-        router_db = self.plugin._get_router(self.admin_ctx, router['id'])
-        with mock.patch.object(self.plugin, '_ensure_vr_id',
-                               new=_ensure_vr_id):
-            self.plugin._ensure_vr_id_and_network(
-                self.admin_ctx, router_db)
-            self.assertTrue(_ensure_vr_id.called)
-
-    def test_ensure_vr_id_and_network_interface_failure(self):
-
-        def _ensure_vr_id(ctx, rdb, ha_net):
-            raise ValueError('broken')
-        with testtools.ExpectedException(ValueError):
-            self._test_ensure_with_patched_ensure_vr_id(_ensure_vr_id)
-        self.assertEqual([], self.core_plugin.get_networks(self.admin_ctx))
-
-    def test_ensure_vr_id_and_network_concurrent_delete(self):
-        orig_create = self.plugin._ensure_vr_id
-
-        def _ensure_vr_id(ctx, rdb, ha_net):
-            # concurrent delete on the first attempt
-            if not getattr(_ensure_vr_id, 'called', False):
-                setattr(_ensure_vr_id, 'called', True)
-                self.core_plugin.delete_network(self.admin_ctx,
-                                                ha_net['network_id'])
-            return orig_create(ctx, rdb, ha_net)
-        self._test_ensure_with_patched_ensure_vr_id(_ensure_vr_id)
-
-    def test_ensure_vr_id_and_network_concurrent_swap(self):
-        orig_create = self.plugin._ensure_vr_id
-
-        def _ensure_vr_id(ctx, rdb, ha_net):
-            # concurrent delete on the first attempt
-            if not getattr(_ensure_vr_id, 'called', False):
-                setattr(_ensure_vr_id, 'called', True)
-                self.core_plugin.delete_network(self.admin_ctx,
-                                                ha_net['network_id'])
-                self.plugin._create_ha_network(self.admin_ctx,
-                                               rdb.tenant_id)
-            return orig_create(ctx, rdb, ha_net)
-
-        self._test_ensure_with_patched_ensure_vr_id(_ensure_vr_id)
-
-    def test_create_ha_network_tenant_binding_raises_duplicate(self):
+    def test_delete_router_ha_interface_port(self):
         router = self._create_router()
         network = self.plugin.get_ha_network(self.admin_ctx,
                                              router['tenant_id'])
-        self.plugin._create_ha_network_tenant_binding(
-            self.admin_ctx, 't1', network['network_id'])
-        with testtools.ExpectedException(
-                exceptions.NeutronDbObjectDuplicateEntry):
+        binding = self.plugin.add_ha_port(
+            self.admin_ctx, router['id'], network.network_id,
+            router['tenant_id'])
+
+        self.assertRaises(n_exc.ServicePortInUse,
+                          self.core_plugin.delete_port,
+                          self.admin_ctx, binding.port_id)
+
+    def test_create_ha_network_tenant_binding_raises_duplicate(self):
+        # The router creation calls first the HA network creation and the
+        # HA network-tenant binding ("ha_router_networks" register)
+        project_id = uuidutils.generate_uuid()
+        self._create_router(tenant_id=project_id)
+        network = self.core_plugin.get_networks(self.admin_ctx)[0]
+        ha_network = self.plugin.get_ha_network(self.admin_ctx, project_id)
+        self.assertEqual(project_id, ha_network.project_id)
+        self.assertEqual(network['id'], ha_network.network_id)
+
+        with testtools.ExpectedException(l3ha_exc.DuplicatedHANetwork):
+            network[network_ha.HA] = True
+            ctx = self.admin_ctx  # That will create a new admin context
+            ctx.project_id = project_id
+            payload = events.DBEventPayload(
+                ctx, states=(network, ), resource_id=network['id'],
+                request_body=network)
             self.plugin._create_ha_network_tenant_binding(
-                self.admin_ctx, 't1', network['network_id'])
+                mock.ANY, mock.ANY, mock.ANY, payload=payload)
 
     def test_create_router_db_vr_id_allocation_goes_to_error(self):
         for method in ('_ensure_vr_id',
@@ -850,9 +812,10 @@ class L3HATestCase(L3HATestFramework):
         router1 = self._create_router()
         router2 = self._create_router()
         ctx = self.admin_ctx
-        bindings = self.plugin.get_ha_router_port_bindings(
-            ctx, [router1['id'], router2['id']])
-        self.plugin.delete_router(self.admin_ctx, router1['id'])
+        with db_api.CONTEXT_READER.using(ctx):
+            bindings = self.plugin.get_ha_router_port_bindings(
+                ctx, [router1['id'], router2['id']])
+        self.plugin.delete_router(ctx, router1['id'])
         self.plugin._set_router_states(
             ctx, bindings, {router1['id']: 'active',
                             router2['id']: 'active'})
@@ -1016,27 +979,30 @@ class L3HATestCase(L3HATestFramework):
 class L3HAModeDbTestCase(L3HATestFramework):
 
     def _create_network(self, plugin, ctx, name='net',
-                        tenant_id='tenant1', external=False):
+                        tenant_id='tenant1', external=False, ha=False):
         network = {'network': {'name': name,
                                'shared': False,
                                'admin_state_up': True,
                                'tenant_id': tenant_id,
-                               extnet_apidef.EXTERNAL: external}}
+                               'project_id': tenant_id,
+                               extnet_apidef.EXTERNAL: external,
+                               network_ha.HA: ha,
+                               }}
         return plugin.create_network(ctx, network)['id']
 
     def _create_subnet(self, plugin, ctx, network_id, cidr='10.0.0.0/8',
                        name='subnet', tenant_id='tenant1'):
         subnet = {'subnet': {'name': name,
                   'ip_version': constants.IP_VERSION_4,
-                  'network_id': network_id,
-                  'cidr': cidr,
-                  'gateway_ip': constants.ATTR_NOT_SPECIFIED,
-                  'allocation_pools': constants.ATTR_NOT_SPECIFIED,
-                  'dns_nameservers': constants.ATTR_NOT_SPECIFIED,
-                  'host_routes': constants.ATTR_NOT_SPECIFIED,
-                  'tenant_id': tenant_id,
-                  'enable_dhcp': True,
-                  'ipv6_ra_mode': constants.ATTR_NOT_SPECIFIED}}
+                             'network_id': network_id,
+                             'cidr': cidr,
+                             'gateway_ip': constants.ATTR_NOT_SPECIFIED,
+                             'allocation_pools': constants.ATTR_NOT_SPECIFIED,
+                             'dns_nameservers': constants.ATTR_NOT_SPECIFIED,
+                             'host_routes': constants.ATTR_NOT_SPECIFIED,
+                             'tenant_id': tenant_id,
+                             'enable_dhcp': True,
+                             'ipv6_ra_mode': constants.ATTR_NOT_SPECIFIED}}
         created_subnet = plugin.create_subnet(ctx, subnet)
         return created_subnet
 
@@ -1108,11 +1074,17 @@ class L3HAModeDbTestCase(L3HATestFramework):
         subnet = self._create_subnet(self.core_plugin, self.admin_ctx,
                                      network_id)
         interface_info = {'subnet_id': subnet['id']}
-        self.plugin.add_router_interface(self.admin_ctx,
-                                         router['id'],
-                                         interface_info)
-        self.assertRaises(l3_exc.RouterInUse, self.plugin.delete_router,
-                          self.admin_ctx, router['id'])
+        interface = self.plugin.add_router_interface(
+            self.admin_ctx, router['id'], interface_info)
+        try:
+            self.plugin.delete_router(self.admin_ctx, router['id'])
+        except l3_exc.RouterInUse as exc:
+            msg = 'Router {} has ports still attached: {}'.format(
+                router['id'], interface['port_id'])
+            self.assertEqual(msg, exc.msg)
+        else:
+            self.fail('The router %s deletion should have raised a '
+                      '"RouterInUse" exception' % router['id'])
         bindings = self.plugin.get_ha_router_port_bindings(
             self.admin_ctx, [router['id']])
         self.assertEqual(2, len(bindings))
@@ -1168,8 +1140,11 @@ class L3HAModeDbTestCase(L3HATestFramework):
         interface_info = {'subnet_id': subnet['id']}
 
         router = self._create_router()
+        gw_info = {'network_id': ext_net}
+        request_body = {
+            l3_apidef.EXTERNAL_GW_INFO: gw_info}
         self.plugin._update_router_gw_info(self.admin_ctx, router['id'],
-                                           {'network_id': ext_net})
+                                           gw_info, request_body)
         self.plugin.add_router_interface(self.admin_ctx,
                                          router['id'],
                                          interface_info)
@@ -1194,8 +1169,11 @@ class L3HAModeDbTestCase(L3HATestFramework):
         interface_info = {'subnet_id': subnet['id']}
 
         router = self._create_router()
+        gw_info = {'network_id': ext_net}
+        request_body = {
+            l3_apidef.EXTERNAL_GW_INFO: gw_info}
         self.plugin._update_router_gw_info(self.admin_ctx, router['id'],
-                                           {'network_id': ext_net})
+                                           gw_info, request_body)
         iface = self.plugin.add_router_interface(self.admin_ctx,
                                                  router['id'],
                                                  interface_info)
@@ -1252,17 +1230,21 @@ class L3HAModeDbTestCase(L3HATestFramework):
                                      int_net)
         interface_info = {'subnet_id': subnet['id']}
         router = self._create_router(ha=True, distributed=True)
+        gw_info = {'network_id': ext_net}
+        request_body = {
+            l3_apidef.EXTERNAL_GW_INFO: gw_info}
         self.plugin._update_router_gw_info(self.admin_ctx, router['id'],
-                                           {'network_id': ext_net})
+                                           gw_info, request_body)
         self.plugin.add_router_interface(self.admin_ctx,
                                          router['id'],
                                          interface_info)
         ctx = self.admin_ctx
-        bindings = self.plugin.get_ha_router_port_bindings(
-            ctx, router_ids=[router['id']],
-            host=self.agent2['host'])
-        self.plugin._set_router_states(ctx, bindings,
-                                       {router['id']: 'active'})
+        with db_api.CONTEXT_WRITER.using(ctx):
+            bindings = self.plugin.get_ha_router_port_bindings(
+                ctx, router_ids=[router['id']],
+                host=self.agent2['host'])
+            self.plugin._set_router_states(ctx, bindings,
+                                           {router['id']: 'active'})
         callback = l3_rpc.L3RpcCallback()
         callback._l3plugin = self.plugin
         # Get router with interfaces
@@ -1304,9 +1286,19 @@ class L3HAModeDbTestCase(L3HATestFramework):
             self.plugin.list_active_sync_routers_on_active_l3_agent(
                 self.admin_ctx, self.agent1['host'], [router['id']]))[0]
 
-        # ensure_host_set_on_ports binds an unbound port
         callback = l3_rpc.L3RpcCallback()
         callback._l3plugin = self.plugin
+        # First ensure that port is not bound if router is not active on any
+        # agent
+        callback._ensure_host_set_on_ports(
+            self.admin_ctx, self.agent1['host'], [router])
+        port = self._get_first_interface(router['id'])
+        self.assertEqual('', port[portbindings.HOST_ID])
+
+        # Now update router to be active on agent1
+        # and ensure_host_set_on_ports binds an unbound port
+        self.plugin.update_routers_states(
+            self.admin_ctx, {router['id']: 'active'}, self.agent1['host'])
         callback._ensure_host_set_on_ports(
             self.admin_ctx, self.agent1['host'], [router])
         port = self._get_first_interface(router['id'])
@@ -1384,8 +1376,11 @@ class L3HAModeDbTestCase(L3HATestFramework):
         interface_info = {'subnet_id': subnet['id']}
 
         router = self._create_router()
+        gw_info = {'network_id': ext_net}
+        request_body = {
+            l3_apidef.EXTERNAL_GW_INFO: gw_info}
         self.plugin._update_router_gw_info(self.admin_ctx, router['id'],
-                                           {'network_id': ext_net})
+                                           gw_info, request_body)
         self.plugin.add_router_interface(self.admin_ctx,
                                          router['id'],
                                          interface_info)
@@ -1411,11 +1406,55 @@ class L3HAModeDbTestCase(L3HATestFramework):
                                                 router_ids=[router['id']])
         self.assertEqual(self.agent2['host'], routers[0]['gw_port_host'])
 
+    def test__before_router_create_no_network(self):
+        project_id = uuidutils.generate_uuid()
+        ha_network = self.plugin.get_ha_network(self.admin_ctx, project_id)
+        self.assertIsNone(ha_network)
+
+        router = {'ha': True, 'project_id': project_id}
+        self.plugin._before_router_create(mock.ANY, self.admin_ctx, router)
+        ha_network = self.plugin.get_ha_network(self.admin_ctx, project_id)
+        self.assertEqual(project_id, ha_network.project_id)
+
+        # This second call ensures the method is idempotent.
+        self.plugin._before_router_create(mock.ANY, self.admin_ctx, router)
+        ha_network = self.plugin.get_ha_network(self.admin_ctx, project_id)
+        self.assertEqual(project_id, ha_network.project_id)
+
+    def test__before_router_create_no_subnet(self):
+        project_id = uuidutils.generate_uuid()
+        admin_ctx = self.admin_ctx
+        admin_ctx.project_id = project_id
+        self._create_network(self.core_plugin, admin_ctx,
+                             tenant_id=project_id, ha=True)
+        ha_network = self.plugin.get_ha_network(self.admin_ctx, project_id)
+        self.assertEqual(project_id, ha_network.project_id)
+        subnets = subnet_obj.Subnet.get_objects(
+            admin_ctx, network_id=ha_network.network_id)
+        self.assertEqual([], subnets)
+
+        router = {'ha': True, 'project_id': project_id}
+        self.plugin._before_router_create(mock.ANY, admin_ctx, router)
+        ha_network = self.plugin.get_ha_network(admin_ctx, project_id)
+        self.assertEqual(project_id, ha_network.project_id)
+        subnets = subnet_obj.Subnet.get_objects(
+            admin_ctx, network_id=ha_network.network_id)
+        self.assertEqual(1, len(subnets))
+
+        # This test is simulating a concurrent update. The "Subnet.count"
+        # method returns 0 and "_before_router_create" tries to create the
+        # subnet again. The exception is catch and dismissed.
+        with mock.patch.object(subnet_obj.Subnet, 'count', return_value=0):
+            self.plugin._before_router_create(mock.ANY, admin_ctx, router)
+        subnets = subnet_obj.Subnet.get_objects(
+            admin_ctx, network_id=ha_network.network_id)
+        self.assertEqual(1, len(subnets))
+
 
 class L3HAUserTestCase(L3HATestFramework):
 
     def setUp(self):
-        super(L3HAUserTestCase, self).setUp()
+        super().setUp()
         self.user_ctx = context.Context('', _uuid())
 
     def test_create_ha_router(self):
@@ -1425,8 +1464,8 @@ class L3HAUserTestCase(L3HATestFramework):
         router = self._create_router(ctx=self.user_ctx)
         with mock.patch.object(registry, 'publish') as mock_cb:
             self._update_router(router['id'], ctx=self.user_ctx)
-            mock_cb.assert_called_with('router', events.PRECOMMIT_UPDATE,
-                                       self.plugin, payload=mock.ANY)
+            mock_cb.assert_any_call('router', events.PRECOMMIT_UPDATE,
+                                    self.plugin, payload=mock.ANY)
 
     def test_delete_router(self):
         router = self._create_router(ctx=self.user_ctx)

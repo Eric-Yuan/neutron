@@ -51,7 +51,7 @@ class FipNamespace(namespaces.Namespace):
 
     def __init__(self, ext_net_id, agent_conf, driver, use_ipv6):
         name = self._get_ns_name(ext_net_id)
-        super(FipNamespace, self).__init__(
+        super().__init__(
             name, agent_conf, driver, use_ipv6)
 
         self._ext_net_id = ext_net_id
@@ -89,6 +89,14 @@ class FipNamespace(namespaces.Namespace):
     def get_rtr_ext_device_name(self, router_id):
         return (ROUTER_2_FIP_DEV_PREFIX + router_id)[:self.driver.DEV_NAME_LEN]
 
+    def get_fip_2_rtr_device(self, ri):
+        fip_2_rtr_name = self.get_int_device_name(ri.router_id)
+        return ip_lib.IPDevice(fip_2_rtr_name, ri.fip_ns.name)
+
+    def get_rtr_2_fip_device(self, ri):
+        rtr_2_fip_name = self.get_rtr_ext_device_name(ri.router_id)
+        return ip_lib.IPDevice(rtr_2_fip_name, ri.ns_name)
+
     def has_subscribers(self):
         return len(self._subscribers) != 0
 
@@ -100,6 +108,9 @@ class FipNamespace(namespaces.Namespace):
     def unsubscribe(self, external_net_id):
         self._subscribers.discard(external_net_id)
         return not self.has_subscribers()
+
+    def lookup_rule_priority(self, floating_ip):
+        return self._rule_priorities.lookup(floating_ip)
 
     def allocate_rule_priority(self, floating_ip):
         return self._rule_priorities.allocate(floating_ip)
@@ -151,7 +162,7 @@ class FipNamespace(namespaces.Namespace):
                                       'FIP namespace failed')
 
     def _create_gateway_port(self, ex_gw_port, interface_name):
-        """Create namespace, request port creationg from Plugin,
+        """Create namespace, request port creation from Plugin,
            then configure Floating IP gateway port.
         """
         self.create()
@@ -188,13 +199,16 @@ class FipNamespace(namespaces.Namespace):
 
         self.agent_gateway_port = ex_gw_port
 
+        cmd = ['sysctl', '-w', 'net.ipv4.neigh.%s.proxy_delay=1' %
+               interface_name]
+        ip_wrapper.netns.execute(cmd, check_exit_code=False, privsep_exec=True)
         cmd = ['sysctl', '-w', 'net.ipv4.conf.%s.proxy_arp=1' % interface_name]
-        ip_wrapper.netns.execute(cmd, check_exit_code=False)
+        ip_wrapper.netns.execute(cmd, check_exit_code=False, privsep_exec=True)
 
     def create(self):
         LOG.debug("DVR: add fip namespace: %s", self.name)
         # parent class will ensure the namespace exists and turn-on forwarding
-        super(FipNamespace, self).create()
+        super().create()
         ip_lib.set_ip_nonlocal_bind_for_namespace(self.name, 1,
                                                   root_namespace=True)
 
@@ -225,7 +239,7 @@ class FipNamespace(namespaces.Namespace):
 
         # TODO(mrsmith): add LOG warn if fip count != 0
         LOG.debug('DVR: destroy fip namespace: %s', self.name)
-        super(FipNamespace, self).delete()
+        super().delete()
 
     def _check_for_gateway_ip_change(self, new_agent_gateway_port):
 
@@ -340,7 +354,7 @@ class FipNamespace(namespaces.Namespace):
             gw_ip = subnet.get('gateway_ip')
             if gw_ip:
                 is_gateway_not_in_subnet = not ipam_utils.check_subnet_ip(
-                                                subnet.get('cidr'), gw_ip)
+                    subnet.get('cidr'), gw_ip)
                 if is_gateway_not_in_subnet:
                     ipd.route.add_route(gw_ip, scope='link')
                 self._add_default_gateway_for_fip(gw_ip, ipd, tbl_index)
@@ -407,22 +421,19 @@ class FipNamespace(namespaces.Namespace):
     def create_rtr_2_fip_link(self, ri):
         """Create interface between router and Floating IP namespace."""
         LOG.debug("Create FIP link interfaces for router %s", ri.router_id)
-        rtr_2_fip_name = self.get_rtr_ext_device_name(ri.router_id)
-        fip_2_rtr_name = self.get_int_device_name(ri.router_id)
         fip_ns_name = self.get_name()
 
         # add link local IP to interface
         if ri.rtr_fip_subnet is None:
             ri.rtr_fip_subnet = self.local_subnets.allocate(ri.router_id)
         rtr_2_fip, fip_2_rtr = ri.rtr_fip_subnet.get_pair()
-        rtr_2_fip_dev = ip_lib.IPDevice(rtr_2_fip_name, namespace=ri.ns_name)
-        fip_2_rtr_dev = ip_lib.IPDevice(fip_2_rtr_name, namespace=fip_ns_name)
+        rtr_2_fip_dev = self.get_rtr_2_fip_device(ri)
+        fip_2_rtr_dev = self.get_fip_2_rtr_device(ri)
 
         if not rtr_2_fip_dev.exists():
             ip_wrapper = ip_lib.IPWrapper(namespace=ri.ns_name)
-            rtr_2_fip_dev, fip_2_rtr_dev = ip_wrapper.add_veth(rtr_2_fip_name,
-                                                               fip_2_rtr_name,
-                                                               fip_ns_name)
+            rtr_2_fip_dev, fip_2_rtr_dev = ip_wrapper.add_veth(
+                rtr_2_fip_dev.name, fip_2_rtr_dev.name, fip_ns_name)
             rtr_2_fip_dev.link.set_up()
             fip_2_rtr_dev.link.set_up()
 
@@ -434,17 +445,20 @@ class FipNamespace(namespaces.Namespace):
         self._add_cidr_to_device(rtr_2_fip_dev, str(rtr_2_fip))
         self._add_cidr_to_device(fip_2_rtr_dev, str(fip_2_rtr))
 
-        # Add permanant ARP entries on each side of veth pair
+        # Add permanent ARP entries on each side of veth pair
         rtr_2_fip_dev.neigh.add(common_utils.cidr_to_ip(fip_2_rtr),
                                 fip_2_rtr_dev.link.address)
         fip_2_rtr_dev.neigh.add(common_utils.cidr_to_ip(rtr_2_fip),
                                 rtr_2_fip_dev.link.address)
 
         self._add_rtr_ext_route_rule_to_route_table(ri, fip_2_rtr,
-                                                    fip_2_rtr_name)
+                                                    fip_2_rtr_dev.name)
 
         # add default route for the link local interface
         rtr_2_fip_dev.route.add_gateway(str(fip_2_rtr.ip), table=FIP_RT_TBL)
+        v6_gateway = common_utils.cidr_to_ip(
+            ip_lib.get_ipv6_lladdr(fip_2_rtr_dev.link.address))
+        rtr_2_fip_dev.route.add_gateway(v6_gateway)
 
     def scan_fip_ports(self, ri):
         # scan system for any existing fip ports

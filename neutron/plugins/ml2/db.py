@@ -19,11 +19,11 @@ from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
 from neutron_lib import constants as n_const
 from neutron_lib.db import api as db_api
+from neutron_lib import exceptions as nlib_exc
 from neutron_lib.plugins import directory
 from oslo_db import exception as db_exc
 from oslo_log import log
 from oslo_utils import uuidutils
-import six
 from sqlalchemy import or_
 from sqlalchemy.orm import exc
 
@@ -33,6 +33,7 @@ from neutron.db import models_v2
 from neutron.objects import base as objects_base
 from neutron.objects import ports as port_obj
 from neutron.plugins.ml2 import models
+from neutron.services.segments import db as seg_db
 from neutron.services.segments import exceptions as seg_exc
 
 LOG = log.getLogger(__name__)
@@ -119,6 +120,14 @@ def delete_distributed_port_binding_if_stale(context, binding):
         with db_api.CONTEXT_WRITER.using(context):
             LOG.debug("Distributed port: Deleting binding %s", binding)
             context.session.delete(binding)
+            for bindlv in (context.session.query(models.PortBindingLevel).
+                           filter_by(port_id=binding.port_id,
+                                     host=binding.host)):
+                context.session.delete(bindlv)
+            LOG.debug("For port %(port_id)s, host %(host)s, "
+                      "cleared binding levels",
+                      {'port_id': binding.port_id,
+                       'host': binding.host})
 
 
 def get_port(context, port_id):
@@ -141,13 +150,6 @@ def get_port(context, port_id):
             return
 
 
-@db_api.CONTEXT_READER
-def get_port_from_device_mac(context, device_mac):
-    LOG.debug("get_port_from_device_mac() called for mac %s", device_mac)
-    ports = port_obj.Port.get_objects(context, mac_address=device_mac)
-    return ports.pop() if ports else None
-
-
 def get_ports_and_sgs(context, port_ids):
     """Get ports from database with security group info."""
 
@@ -166,7 +168,7 @@ def get_ports_and_sgs(context, port_ids):
         return []
     ports_to_sg_ids = get_sg_ids_grouped_by_port(context, port_ids)
     return [make_port_dict_with_security_groups(port, sec_groups)
-            for port, sec_groups in six.iteritems(ports_to_sg_ids)]
+            for port, sec_groups in ports_to_sg_ids.items()]
 
 
 def get_sg_ids_grouped_by_port(context, port_ids):
@@ -176,8 +178,8 @@ def get_sg_ids_grouped_by_port(context, port_ids):
     with db_api.CONTEXT_READER.using(context):
         # partial UUIDs must be individually matched with startswith.
         # full UUIDs may be matched directly in an IN statement
-        partial_uuids = set(port_id for port_id in port_ids
-                            if not uuidutils.is_uuid_like(port_id))
+        partial_uuids = {port_id for port_id in port_ids
+                         if not uuidutils.is_uuid_like(port_id)}
         full_uuids = set(port_ids) - partial_uuids
         or_criteria = [models_v2.Port.id.startswith(port_id)
                        for port_id in partial_uuids]
@@ -205,6 +207,7 @@ def make_port_dict_with_security_groups(port, sec_groups):
     port_dict['security_groups'] = sec_groups
     port_dict['security_group_rules'] = []
     port_dict['security_group_source_groups'] = []
+    port_dict['security_group_remote_address_groups'] = []
     port_dict['fixed_ips'] = [ip['ip_address']
                               for ip in port['fixed_ips']]
     return port_dict
@@ -237,7 +240,7 @@ def generate_distributed_port_status(context, port_id):
     for bind in query.filter(models.DistributedPortBinding.port_id == port_id):
         if bind.status == n_const.PORT_STATUS_ACTIVE:
             return bind.status
-        elif bind.status == n_const.PORT_STATUS_DOWN:
+        if bind.status == n_const.PORT_STATUS_DOWN:
             final_status = bind.status
     return final_status
 
@@ -254,11 +257,22 @@ def get_distributed_port_binding_by_host(context, port_id, host):
     return binding
 
 
+def update_distributed_port_binding_by_host(context, port_id, host, router_id):
+    with db_api.CONTEXT_WRITER.using(context):
+        bindings = (
+            context.session.query(models.DistributedPortBinding).
+            filter(models.DistributedPortBinding.port_id.startswith(port_id),
+                   models.DistributedPortBinding.host == host).all())
+        for binding in bindings or []:
+            binding['router_id'] = router_id or None
+            binding.update(binding)
+
+
 def get_distributed_port_bindings(context, port_id):
     with db_api.CONTEXT_READER.using(context):
         bindings = (context.session.query(models.DistributedPortBinding).
                     filter(models.DistributedPortBinding.port_id.startswith(
-                           port_id)).all())
+                        port_id)).all())
     if not bindings:
         LOG.debug("No bindings for distributed port %s", port_id)
     return bindings
@@ -316,21 +330,31 @@ def is_dhcp_active_on_any_subnet(context, subnet_ids):
 def _prevent_segment_delete_with_port_bound(resource, event, trigger,
                                             payload=None):
     """Raise exception if there are any ports bound with segment_id."""
-    if payload.metadata.get('for_net_delete'):
+    if payload.metadata.get(seg_db.FOR_NET_DELETE):
         # don't check for network deletes
         return
 
-    with db_api.CONTEXT_READER.using(payload.context):
-        port_ids = port_obj.Port.get_port_ids_filter_by_segment_id(
+    auto_delete_port_ids, proper_port_count = port_obj.Port.\
+        get_auto_deletable_port_ids_and_proper_port_count_by_segment(
             payload.context, segment_id=payload.resource_id)
 
-    # There are still some ports in the segment, segment should not be deleted
-    # TODO(xiaohhui): Should we delete the dhcp port automatically here?
-    if port_ids:
-        reason = _("The segment is still bound with port(s) "
-                   "%s") % ", ".join(port_ids)
+    if proper_port_count:
+        reason = (_("The segment is still bound with %s port(s)") %
+                  (proper_port_count + len(auto_delete_port_ids)))
         raise seg_exc.SegmentInUse(segment_id=payload.resource_id,
                                    reason=reason)
+
+    if auto_delete_port_ids:
+        LOG.debug("Auto-deleting dhcp port(s) on segment %s: %s",
+                  payload.resource_id, ", ".join(auto_delete_port_ids))
+        plugin = directory.get_plugin()
+    for port_id in auto_delete_port_ids:
+        try:
+            plugin.delete_port(payload.context.elevated(), port_id)
+        except nlib_exc.PortNotFound:
+            # Don't raise if something else concurrently deleted the port
+            LOG.debug("Ignoring PortNotFound when deleting port '%s'. "
+                      "The port has already been deleted.", port_id)
 
 
 def subscribe():

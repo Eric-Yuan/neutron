@@ -35,7 +35,7 @@ from neutron.tests import base
 class TestDhcpAgentNotifyAPI(base.BaseTestCase):
 
     def setUp(self):
-        super(TestDhcpAgentNotifyAPI, self).setUp()
+        super().setUp()
         self.notifier = (
             dhcp_rpc_agent_api.DhcpAgentNotifyAPI(plugin=mock.Mock()))
 
@@ -85,12 +85,12 @@ class TestDhcpAgentNotifyAPI(base.BaseTestCase):
                                      new_agents=None, existing_agents=[],
                                      expected_casts=0, expected_warnings=1)
 
-    def _test__get_enabled_agents(self, network,
+    def _test__get_enabled_agents(self, network_id,
                                   agents=None, port_count=0,
                                   expected_warnings=0, expected_errors=0):
         self.notifier.plugin.get_ports_count.return_value = port_count
         enabled_agents = self.notifier._get_enabled_agents(
-            mock.ANY, network, agents, mock.ANY, mock.ANY)
+            mock.Mock(), network_id, None, agents, mock.ANY, mock.ANY)
         if not cfg.CONF.enable_services_on_agents_with_admin_state_down:
             agents = [x for x in agents if x.admin_state_up]
         self.assertEqual(agents, enabled_agents)
@@ -104,8 +104,8 @@ class TestDhcpAgentNotifyAPI(base.BaseTestCase):
         agent2 = agent_obj.Agent(mock.ANY, id=uuidutils.generate_uuid())
         agent2.admin_state_up = False
         agent2.heartbeat_timestamp = timeutils.utcnow()
-        network = {'id': 'foo_network_id'}
-        self._test__get_enabled_agents(network, agents=[agent1])
+        self._test__get_enabled_agents(network_id='foo_network_id',
+                                       agents=[agent1])
 
     def test__get_enabled_agents_with_inactive_ones(self):
         agent1 = agent_obj.Agent(mock.ANY, id=uuidutils.generate_uuid())
@@ -115,17 +115,18 @@ class TestDhcpAgentNotifyAPI(base.BaseTestCase):
         agent2.admin_state_up = True
         # This is effectively an inactive agent
         agent2.heartbeat_timestamp = datetime.datetime(2000, 1, 1, 0, 0)
-        network = {'id': 'foo_network_id'}
-        self._test__get_enabled_agents(network,
+        self._test__get_enabled_agents(network_id='foo_network_id',
                                        agents=[agent1, agent2],
                                        expected_warnings=1, expected_errors=0)
 
     def test__get_enabled_agents_with_notification_required(self):
         network = {'id': 'foo_network_id', 'subnets': ['foo_subnet_id']}
+        self.notifier.plugin.get_network.return_value = network
         agent = agent_obj.Agent(mock.ANY, id=uuidutils.generate_uuid())
         agent.admin_state_up = False
         agent.heartbeat_timestamp = timeutils.utcnow()
-        self._test__get_enabled_agents(network, [agent], port_count=20,
+        self._test__get_enabled_agents('foo_network_id',
+                                       [agent], port_count=20,
                                        expected_warnings=0, expected_errors=1)
 
     def test__get_enabled_agents_with_admin_state_down(self):
@@ -137,16 +138,16 @@ class TestDhcpAgentNotifyAPI(base.BaseTestCase):
         agent2 = agent_obj.Agent(mock.ANY, id=uuidutils.generate_uuid())
         agent2.admin_state_up = False
         agent2.heartbeat_timestamp = timeutils.utcnow()
-        network = {'id': 'foo_network_id'}
-        self._test__get_enabled_agents(network, agents=[agent1, agent2])
+        self._test__get_enabled_agents(network_id='foo_network_id',
+                                       agents=[agent1, agent2])
 
     def test__notify_agents_allocate_priority(self):
         mock_context = mock.MagicMock()
         mock_context.is_admin = True
         methods = ['network_create_end', 'network_update_end',
-                  'network_delete_end', 'subnet_create_end',
-                  'subnet_update_end', 'subnet_delete_end',
-                  'port_create_end', 'port_update_end', 'port_delete_end']
+                   'network_delete_end', 'subnet_create_end',
+                   'subnet_update_end', 'subnet_delete_end',
+                   'port_create_end', 'port_update_end', 'port_delete_end']
         with mock.patch.object(self.notifier, '_schedule_network') as f:
             with mock.patch.object(self.notifier, '_get_enabled_agents') as g:
                 for method in methods:
@@ -237,17 +238,24 @@ class TestDhcpAgentNotifyAPI(base.BaseTestCase):
                                   expected_scheduling=0, expected_casts=0)
 
     def test__notify_agents_with_router_interface_add(self):
+        payload = events.DBEventPayload(
+            mock.Mock(), metadata={
+                'port': {'id': 'foo_port_id',
+                         'network_id': 'foo_network_id'}})
         self._test__notify_agents_with_function(
             lambda: self.notifier._after_router_interface_created(
-                mock.ANY, mock.ANY, mock.ANY, context=mock.Mock(),
-                port={'id': 'foo_port_id', 'network_id': 'foo_network_id'}),
+                mock.ANY, mock.ANY, mock.ANY, payload=payload),
             expected_scheduling=1, expected_casts=1)
 
     def test__notify_agents_with_router_interface_delete(self):
+        payload = events.DBEventPayload(
+            mock.Mock(), metadata={
+                'port': {'id': 'foo_port_id',
+                         'fixed_ips': mock.ANY,
+                         'network_id': 'foo_network_id'}})
         self._test__notify_agents_with_function(
             lambda: self.notifier._after_router_interface_deleted(
-                mock.ANY, mock.ANY, mock.ANY, context=mock.Mock(),
-                port={'id': 'foo_port_id', 'network_id': 'foo_network_id'}),
+                mock.ANY, mock.ANY, mock.ANY, payload=payload),
             expected_scheduling=0, expected_casts=1)
 
     def test__fanout_message(self):
@@ -262,33 +270,56 @@ class TestDhcpAgentNotifyAPI(base.BaseTestCase):
         self.assertFalse(self.notifier._unsubscribed_resources)
         for res in (resources.PORT, resources.NETWORK, resources.SUBNET):
             self.notifier._unsubscribed_resources = []
-            kwargs = {res: {}}
-            registry.notify(res, events.AFTER_CREATE, self,
-                            context=mock.Mock(), **kwargs)
+            registry.publish(res, events.AFTER_CREATE, self,
+                             payload=events.DBEventPayload(mock.Mock()))
             # don't unsubscribe until all three types are observed
             self.assertEqual([], self.notifier._unsubscribed_resources)
-            registry.notify(res, events.AFTER_UPDATE, self,
-                            context=mock.Mock(), **kwargs)
+            registry.publish(res, events.AFTER_UPDATE, self,
+                             payload=events.DBEventPayload(mock.Mock()))
             self.assertEqual([], self.notifier._unsubscribed_resources)
-            registry.notify(res, events.AFTER_DELETE, self,
-                            context=mock.Mock(), **kwargs)
+            registry.publish(res, events.AFTER_DELETE, self,
+                             payload=events.DBEventPayload(mock.Mock()))
             self.assertEqual([res], self.notifier._unsubscribed_resources)
             # after first time, no further unsubscribing should happen
-            registry.notify(res, events.AFTER_CREATE, self,
-                            context=mock.Mock(), **kwargs)
+            registry.publish(res, events.AFTER_CREATE, self,
+                             payload=events.DBEventPayload(mock.Mock()))
             self.assertEqual([res], self.notifier._unsubscribed_resources)
 
-    def test__only_status_changed(self):
+    def test__notification_is_needed(self):
         p1 = {'id': 1, 'status': 'DOWN', 'updated_at': '10:00:00',
-              'revision_number': 1}
+              'revision_number': 1,
+              'fixed_ips': [{'ip_address': '10.0.0.10', 'subnet_id': 'aaa'}],
+              'mac_address': 'aa:bb:cc:dd:ee:ff'}
         p2 = dict(p1)
         p2['status'] = 'ACTIVE'
         p2['revision_number'] = 2
         p2['updated_at'] = '10:00:01'
-        self.assertTrue(self.notifier._only_status_changed(p1, p2))
+        self.assertFalse(self.notifier._notification_is_needed(p1, p2))
+
         p2['name'] = 'test'
-        self.assertFalse(self.notifier._only_status_changed(p1, p2))
-        p1['name'] = 'test'
-        self.assertTrue(self.notifier._only_status_changed(p1, p2))
-        p1['name'] = 'test1'
-        self.assertFalse(self.notifier._only_status_changed(p1, p2))
+        self.assertFalse(self.notifier._notification_is_needed(p1, p2))
+        p2.pop('name')
+
+        p2['mac_address'] = '11:22:33:44:55:66'
+        self.assertTrue(self.notifier._notification_is_needed(p1, p2))
+        p2['mac_address'] = p1['mac_address']
+
+        p2['fixed_ips'] = [{'ip_address': '10.0.0.11', 'subnet_id': 'aaa'}]
+        self.assertTrue(self.notifier._notification_is_needed(p1, p2))
+        p2['fixed_ips'] = p1['fixed_ips']
+
+        p2['extra_dhcp_opts'] = 'some-test-opt'
+        self.assertTrue(self.notifier._notification_is_needed(p1, p2))
+        p2.pop('extra_dhcp_opts')
+
+        p2['dns_name'] = 'test-dns-name'
+        self.assertTrue(self.notifier._notification_is_needed(p1, p2))
+        p2.pop('dns_name')
+
+        p2['dns_assignment'] = 'test-dns-assignment'
+        self.assertTrue(self.notifier._notification_is_needed(p1, p2))
+        p2.pop('dns_assignment')
+
+        p2['dns_domain'] = 'test-dns-domain'
+        self.assertTrue(self.notifier._notification_is_needed(p1, p2))
+        p2.pop('dns_domain')

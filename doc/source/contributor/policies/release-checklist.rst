@@ -11,7 +11,7 @@ Major release
 ~~~~~~~~~~~~~
 
 A Major release is cut off once per development cycle and has an assigned name
-(Liberty, Mitaka, ...)
+(Victoria, Wallaby, ...)
 
 Prior to major release,
 
@@ -22,11 +22,11 @@ Prior to major release,
    new features land in master after so called feature freeze is claimed by
    release team; there is a feature freeze exception (FFE) process described in
    release engineering documentation in more details:
-   http://docs.openstack.org/project-team-guide/release-management.html);
+   http://docs.openstack.org/project-team-guide/release-management.html );
 #. start collecting state for targeted features from the team. For example,
    propose a post-mortem patch for neutron-specs as in:
-   https://review.opendev.org/#/c/286413/
-#. revise deprecation warnings collected in latest Jenkins runs: some of them
+   https://review.opendev.org/c/openstack/neutron-specs/+/286413/
+#. revise deprecation warnings collected in latest Zuul runs: some of them
    may indicate a problem that should be fixed prior to release (see
    deprecations.txt file in those log directories); also, check whether any
    Launchpad bugs with the 'deprecation' tag need a clean-up or a follow-up in
@@ -43,7 +43,7 @@ New major release process contains several phases:
    the release;
 #. once the team is ready to release the first release candidate (RC1), either
    PTL or one of release liaisons proposes a patch for openstack/releases repo.
-   For example, see: https://review.opendev.org/#/c/292445/
+   For example, see: https://review.opendev.org/c/openstack/releases/+/753039/
 #. once the openstack/releases patch lands, release team creates a new stable
    branch using hash values specified in the patch;
 #. at this point, master branch is open for patches targeted to the next
@@ -63,25 +63,51 @@ Release candidate (RC) process allows for stabilization of the final release.
 The following technical steps should be taken before the final release is cut
 off:
 
-#. the latest alembic scripts are tagged with a milestone label. For example,
-   see: https://review.opendev.org/#/c/288212/
+#. the latest alembic script of the version that is being released is tagged
+   with a milestone label; for example, in
+   https://review.opendev.org/c/openstack/neutron/+/944804 the latest script
+   is being tagged with ``RELEASE_2025_1``
+#. the new release tag must be created; using the previous example, the tag
+   ``RELEASE_2025_2`` is created.
+#. add the released version tag to the ``NEUTRON_MILESTONES`` list; in the
+   previous example, the tag ``RELEASE_2025_1`` is added to this list.
+#. update the ``CURRENT_RELEASE`` variable with the new tag created and
+   add it to the ``RELEASES`` tuple; in the previous example,
+   ``RELEASE_2025_2`` is added to the ``RELEASES`` tuple and used as the
+   current release milestone.
 
 In the new stable branch, you should make sure that:
 
 #. .gitreview file points to the new branch;
+   https://review.opendev.org/c/openstack/neutron/+/754738/
 #. if the branch uses constraints to manage gated dependency versions, the
    default constraints file name points to corresponding stable branch in
    openstack/requirements repo;
-#. if the branch fetches any other projects as dependencies, e.g. by using
-   tox_install.sh as an install_command in tox.ini, git repository links point
-   to corresponding stable branches of those dependency projects.
+   https://review.opendev.org/c/openstack/neutron/+/754739/
+#. job templates are updated to use versions for that branch;
+   https://review.opendev.org/c/openstack/neutron-tempest-plugin/+/756585/ and
+   https://review.opendev.org/c/openstack/neutron/+/759856/
+#. all CI jobs running against master branch of another project are dropped;
+   https://review.opendev.org/c/openstack/neutron/+/756695/
+#. neutron itself is capped in requirements in the new branch;
+   https://review.opendev.org/c/openstack/requirements/+/764022/
+#. all new Neutron features without an API extension which have new tempest
+   tests (in ``tempest`` or in ``neutron-tempest-plugin``) must have a new
+   item in ``available_features`` list under ``network-feature-enabled``
+   section in ``tempest.conf``.
+   To make stable jobs execute only the necessary tests the list in devstack
+   (devstack/lib/tempest) must be checked and filled;
+   https://review.opendev.org/c/openstack/devstack/+/769885
+#. Grafana dashboards for stable branches should be updated to point to the
+   latest releases;
+   https://review.opendev.org/c/openstack/project-config/+/757102
+#. Check API extensions list in devstack:
+   https://review.opendev.org/c/openstack/devstack/+/811485
+   (Full list of QA related release checks can be found here:
+   https://wiki.openstack.org/wiki/QA/releases#Projects_with_only_Branches
 
-Note that some of those steps may be covered by the OpenStack release team.
-
-In the opened master branch, you should:
-
-#. update CURRENT_RELEASE in neutron.db.migration.cli to point to the next
-   release name.
+Note that some of those steps are covered by the OpenStack release team and its
+release bot.
 
 While preparing the next release and even in the middle of development, it's
 worth keeping the infrastructure clean. Consider using these tools to declutter
@@ -120,9 +146,9 @@ a patch which introduces for example:
 #. requirement change,
 #. API visible change,
 
-The above list doesn't cover all possible cases. Those are only examples of fixes
-which require bump of minor version number but there can be also other types of
-changes requiring the same.
+The above list doesn't cover all possible cases. Those are only examples of
+fixes which require bump of minor version number but there can be also other
+types of changes requiring the same.
 
 Changes that require the minor version number to be bumped should always have a
 release note added.

@@ -15,6 +15,7 @@
 #    under the License.
 
 from neutron_lib.api.definitions import constants as api_const
+from neutron_lib.api.definitions import external_net as external_net_apidef
 from neutron_lib.api.definitions import l3 as l3_apidef
 from neutron_lib.api.definitions import network as net_def
 from neutron_lib.callbacks import events
@@ -41,26 +42,20 @@ CHECK_REQUIREMENTS = 'dry-run'
 
 
 def _ensure_external_network_default_value_callback(
-        resource, event, trigger, **kwargs):
+        resource, event, trigger, payload=None):
     """Ensure the is_default db field matches the create/update request."""
 
-    # TODO(boden): remove shim once all callbacks use payloads
-    if 'payload' in kwargs:
-        _request = kwargs['payload'].request_body
-        _context = kwargs['payload'].context
-        _network = kwargs['payload'].desired_state
-        _orig = kwargs['payload'].states[0]
-    else:
-        _request = kwargs['request']
-        _context = kwargs['context']
-        _network = kwargs['network']
-        _orig = kwargs.get('original_network')
+    _request = payload.request_body
+    _context = payload.context
+    _network = payload.desired_state or payload.latest_state
+    _orig = payload.states[0]
 
     @db_api.retry_if_session_inactive()
     def _do_ensure_external_network_default_value_callback(
             context, request, orig, network):
         is_default = request.get(api_const.IS_DEFAULT)
-        if is_default is None:
+        is_external = request.get(external_net_apidef.EXTERNAL)
+        if is_default is None or not is_external:
             return
         if is_default:
             # ensure only one default external network at any given time
@@ -87,13 +82,13 @@ def _ensure_external_network_default_value_callback(
 
 
 @resource_extend.has_resource_extenders
-class AutoAllocatedTopologyMixin(object):
+class AutoAllocatedTopologyMixin:
 
     def __new__(cls, *args, **kwargs):
         # NOTE(kevinbenton): we subscribe on object construction because
         # the tests blow away the callback manager for each run
-        new = super(AutoAllocatedTopologyMixin, cls).__new__(cls, *args,
-                                                             **kwargs)
+        new = super().__new__(cls, *args,
+                              **kwargs)
         registry.subscribe(_ensure_external_network_default_value_callback,
                            resources.NETWORK, events.PRECOMMIT_UPDATE)
         registry.subscribe(_ensure_external_network_default_value_callback,
@@ -142,7 +137,7 @@ class AutoAllocatedTopologyMixin(object):
             # requests can be fulfilled based on a set of requirements
             # such as existence of default networks, pools, etc.
             return self._check_requirements(context, tenant_id)
-        elif fields:
+        if fields:
             raise n_exc.BadRequest(resource='auto_allocate',
                                    msg=_("Unrecognized field"))
 
@@ -201,7 +196,9 @@ class AutoAllocatedTopologyMixin(object):
         except n_exc.NotFound:
             raise exceptions.AutoAllocationFailure(
                 reason=_("No default subnetpools defined"))
-        return {'id': 'dry-run=pass', 'tenant_id': tenant_id}
+        return {'id': 'dry-run=pass',
+                'tenant_id': tenant_id,
+                'project_id': tenant_id}
 
     def _validate(self, context, tenant_id):
         """Validate and return the tenant to be associated to the topology."""

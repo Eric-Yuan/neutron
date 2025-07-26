@@ -14,28 +14,31 @@
 #    under the License.
 
 import errno
+from os import path
+import queue as pqueue
 import re
 import threading
 import time
 
-import eventlet
 import netaddr
 from neutron_lib import constants
 from neutron_lib import exceptions
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import excutils
 from oslo_utils import netutils
 from pyroute2.netlink import exceptions as netlink_exceptions
 from pyroute2.netlink import rtnl
 from pyroute2.netlink.rtnl import ifaddrmsg
 from pyroute2.netlink.rtnl import ifinfmsg
-from pyroute2 import NetlinkError
 from pyroute2 import netns
 
 from neutron._i18n import _
 from neutron.agent.common import utils
+from neutron.agent.linux import utils as linux_utils
 from neutron.common import utils as common_utils
 from neutron.privileged.agent.linux import ip_lib as privileged
+from neutron.privileged.agent.linux import utils as priv_utils
 
 LOG = logging.getLogger(__name__)
 
@@ -83,6 +86,8 @@ DEVICE_NAME_PATTERN = re.compile(r"(\d+?): (\S+?):.*")
 IP_ROUTE_METRIC_DEFAULT = {constants.IP_VERSION_4: 0,
                            constants.IP_VERSION_6: 1024}
 
+ARPING_SLEEP = 2
+
 
 def remove_interface_suffix(interface):
     """Remove a possible "<if>@<endpoint>" suffix from an interface' name.
@@ -100,12 +105,14 @@ class AddressNotReady(exceptions.NeutronException):
                 "become ready: %(reason)s")
 
 
-class InvalidArgument(exceptions.NeutronException):
-    message = _("Invalid value %(value)s for parameter %(parameter)s "
-                "provided.")
+class DADFailed(AddressNotReady):
+    pass
 
 
-class SubProcessBase(object):
+InvalidArgument = privileged.InvalidArgument
+
+
+class SubProcessBase:
     def __init__(self, namespace=None,
                  log_fail_as_error=True):
         self.namespace = namespace
@@ -120,12 +127,11 @@ class SubProcessBase(object):
     def _run(self, options, command, args):
         if self.namespace:
             return self._as_root(options, command, args)
-        elif self.force_root:
+        if self.force_root:
             # Force use of the root helper to ensure that commands
             # will execute in dom0 when running under XenServer/XCP.
             return self._execute(options, command, args, run_as_root=True)
-        else:
-            return self._execute(options, command, args)
+        return self._execute(options, command, args)
 
     def _as_root(self, options, command, args, use_root_namespace=False):
         namespace = self.namespace if not use_root_namespace else None
@@ -138,7 +144,7 @@ class SubProcessBase(object):
         opt_list = ['-%s' % o for o in options]
         ip_cmd = add_namespace_to_cmd(['ip'], namespace)
         cmd = ip_cmd + opt_list + [command] + list(args)
-        return utils.execute(cmd, run_as_root=run_as_root,
+        return utils.execute(cmd, run_as_root=run_as_root, privsep_exec=True,
                              log_fail_as_error=self.log_fail_as_error)
 
     def set_log_fail_as_error(self, fail_with_error):
@@ -150,7 +156,7 @@ class SubProcessBase(object):
 
 class IPWrapper(SubProcessBase):
     def __init__(self, namespace=None):
-        super(IPWrapper, self).__init__(namespace=namespace)
+        super().__init__(namespace=namespace)
         self.netns = IpNetnsCommand(self)
 
     def device(self, name):
@@ -255,7 +261,22 @@ class IPWrapper(SubProcessBase):
         return ip
 
     def namespace_is_empty(self):
-        return not self.get_devices()
+        try:
+            return not self.get_devices()
+        except OSError as e:
+            # This can happen if we previously got terminated in the middle of
+            # removing this namespace. In this case the bind mount of the
+            # namespace under /var/run/netns will be removed, but the namespace
+            # file is still there. As the bind mount is gone we can no longer
+            # access the namespace to validate that it is empty. But since it
+            # should have already been removed we are sure that the check has
+            # passed the last time and since the namespace is unuseable that
+            # can not have changed.
+            # Future calls to pyroute2 to remove that namespace will clean up
+            # the leftover file.
+            if e.errno == errno.EINVAL:
+                return True
+            raise e
 
     def garbage_collect_namespace(self):
         """Conditionally destroy the namespace if it is empty."""
@@ -277,11 +298,20 @@ class IPWrapper(SubProcessBase):
                                     vlan_id=vlan_id)
         return IPDevice(name, namespace=self.namespace)
 
-    def add_vxlan(self, name, vni, group=None, dev=None, ttl=None, tos=None,
+    def add_vxlan(self, name, vni, dev, group=None, ttl=None, tos=None,
                   local=None, srcport=None, dstport=None, proxy=False):
-        kwargs = {'vxlan_id': vni}
+        kwargs = {'vxlan_id': vni,
+                  'physical_interface': dev}
         if group:
-            kwargs['vxlan_group'] = group
+            try:
+                ip_version = common_utils.get_ip_version(group)
+                if ip_version == constants.IP_VERSION_6:
+                    kwargs['vxlan_group6'] = group
+                else:
+                    kwargs['vxlan_group'] = group
+            except netaddr.core.AddrFormatError:
+                err_msg = _("Invalid group address: %s") % group
+                raise exceptions.InvalidInput(error_message=err_msg)
         if dev:
             kwargs['physical_interface'] = dev
         if ttl:
@@ -289,7 +319,15 @@ class IPWrapper(SubProcessBase):
         if tos:
             kwargs['vxlan_tos'] = tos
         if local:
-            kwargs['vxlan_local'] = local
+            try:
+                ip_version = common_utils.get_ip_version(local)
+                if ip_version == constants.IP_VERSION_6:
+                    kwargs['vxlan_local6'] = local
+                else:
+                    kwargs['vxlan_local'] = local
+            except netaddr.core.AddrFormatError:
+                err_msg = _("Invalid local address: %s") % local
+                raise exceptions.InvalidInput(error_message=err_msg)
         if proxy:
             kwargs['vxlan_proxy'] = proxy
         # tuple: min,max
@@ -307,7 +345,7 @@ class IPWrapper(SubProcessBase):
 
 class IPDevice(SubProcessBase):
     def __init__(self, name, namespace=None, kind='link'):
-        super(IPDevice, self).__init__(namespace=namespace)
+        super().__init__(namespace=namespace)
         self._name = name
         self.kind = kind
         self.link = IpLinkCommand(self)
@@ -323,8 +361,8 @@ class IPDevice(SubProcessBase):
         return self.name
 
     def __repr__(self):
-        return "<IPDevice(name=%s, namespace=%s)>" % (self._name,
-                                                      self.namespace)
+        return "<IPDevice(name={}, namespace={})>".format(self._name,
+                                                          self.namespace)
 
     def exists(self):
         """Return True if the device exists in the namespace."""
@@ -357,7 +395,7 @@ class IPDevice(SubProcessBase):
         try:
             ip_wrapper.netns.execute(["conntrack", "-D", "-d", ip_str],
                                      check_exit_code=True,
-                                     extra_ok_codes=[1])
+                                     extra_ok_codes=[1], privsep_exec=True)
 
         except RuntimeError:
             LOG.exception("Failed deleting ingress connection state of"
@@ -367,7 +405,7 @@ class IPDevice(SubProcessBase):
         try:
             ip_wrapper.netns.execute(["conntrack", "-D", "-q", ip_str],
                                      check_exit_code=True,
-                                     extra_ok_codes=[1])
+                                     extra_ok_codes=[1], privsep_exec=True)
         except RuntimeError:
             LOG.exception("Failed deleting egress connection state of"
                           " floatingip %s", ip_str)
@@ -379,7 +417,7 @@ class IPDevice(SubProcessBase):
                '--dport', dport]
         try:
             ip_wrapper.netns.execute(cmd, check_exit_code=True,
-                                     extra_ok_codes=[1])
+                                     extra_ok_codes=[1], privsep_exec=True)
 
         except RuntimeError:
             LOG.exception("Failed deleting ingress connection state of "
@@ -404,23 +442,11 @@ class IPDevice(SubProcessBase):
         self._name = name
 
 
-class IpCommandBase(object):
-    COMMAND = ''
+class IpDeviceCommandBase:
 
     def __init__(self, parent):
         self._parent = parent
 
-    def _run(self, options, args):
-        return self._parent._run(options, self.COMMAND, args)
-
-    def _as_root(self, options, args, use_root_namespace=False):
-        return self._parent._as_root(options,
-                                     self.COMMAND,
-                                     args,
-                                     use_root_namespace=use_root_namespace)
-
-
-class IpDeviceCommandBase(IpCommandBase):
     @property
     def name(self):
         return self._parent.name
@@ -431,7 +457,6 @@ class IpDeviceCommandBase(IpCommandBase):
 
 
 class IpLinkCommand(IpDeviceCommandBase):
-    COMMAND = 'link'
 
     def set_address(self, mac_address):
         privileged.set_link_attribute(
@@ -442,13 +467,8 @@ class IpLinkCommand(IpDeviceCommandBase):
             self.name, self._parent.namespace, ifinfmsg.IFF_ALLMULTI)
 
     def set_mtu(self, mtu_size):
-        try:
-            privileged.set_link_attribute(
-                self.name, self._parent.namespace, mtu=mtu_size)
-        except NetlinkError as e:
-            if e.code == errno.EINVAL:
-                raise InvalidArgument(parameter="MTU", value=mtu_size)
-            raise
+        privileged.set_link_attribute(
+            self.name, self._parent.namespace, mtu=mtu_size)
 
     def set_up(self):
         privileged.set_link_attribute(
@@ -459,9 +479,16 @@ class IpLinkCommand(IpDeviceCommandBase):
             self.name, self._parent.namespace, state='down')
 
     def set_netns(self, namespace):
-        privileged.set_link_attribute(
-            self.name, self._parent.namespace, net_ns_fd=namespace)
-        self._parent.namespace = namespace
+        old_namespace = self._parent.namespace
+        try:
+            privileged.set_link_attribute(
+                self.name, self._parent.namespace, net_ns_fd=namespace)
+            self._parent.namespace = namespace
+            common_utils.wait_until_true(lambda: self.exists, timeout=3,
+                                         sleep=0.5)
+        except common_utils.WaitTimeout:
+            with excutils.save_and_reraise_exception():
+                self._parent.namespace = old_namespace
 
     def set_name(self, name):
         privileged.set_link_attribute(
@@ -520,16 +547,29 @@ class IpLinkCommand(IpDeviceCommandBase):
     def exists(self):
         return privileged.interface_exists(self.name, self._parent.namespace)
 
+    def get_vfs(self):
+        return privileged.get_link_vfs(self.name, self._parent.namespace)
+
+    def set_vf_feature(self, vf_config):
+        privileged.set_link_vf_feature(self.name, self._parent.namespace,
+                                       vf_config)
+
 
 class IpAddrCommand(IpDeviceCommandBase):
-    COMMAND = 'addr'
 
     def add(self, cidr, scope='global', add_broadcast=True):
         add_ip_address(cidr, self.name, self._parent.namespace, scope,
                        add_broadcast)
 
+    def add_multiple(self, cidrs, scope='global', add_broadcast=True):
+        add_ip_addresses(cidrs, self.name, self._parent.namespace, scope,
+                         add_broadcast)
+
     def delete(self, cidr):
         delete_ip_address(cidr, self.name, self._parent.namespace)
+
+    def delete_multiple(self, cidrs):
+        delete_ip_addresses(cidrs, self.name, self._parent.namespace)
 
     def flush(self, ip_version):
         flush_ip_addresses(ip_version, self.name, self._parent.namespace)
@@ -541,7 +581,7 @@ class IpAddrCommand(IpDeviceCommandBase):
             for filter in filters:
                 if filter == 'permanent' and device['dynamic']:
                     return False
-                elif not device[filter]:
+                if not device[filter]:
                     return False
             return True
 
@@ -552,7 +592,7 @@ class IpAddrCommand(IpDeviceCommandBase):
             if not common_utils.is_cidr_host(cidr):
                 kwargs['mask'] = common_utils.cidr_mask_length(cidr)
         if scope:
-            kwargs['scope'] = IP_ADDRESS_SCOPE_NAME[scope]
+            kwargs['scope'] = scope
         if ip_version:
             kwargs['family'] = common_utils.get_socket_address_family(
                 ip_version)
@@ -570,9 +610,10 @@ class IpAddrCommand(IpDeviceCommandBase):
         return filtered_devices
 
     def wait_until_address_ready(self, address, wait_time=30):
-        """Wait until an address is no longer marked 'tentative'
+        """Wait until an address is no longer marked 'tentative' or 'dadfailed'
 
-        raises AddressNotReady if times out or address not present on interface
+        raises AddressNotReady if times out, address not present on interface
+        raises DADFailed if Duplicate Address Detection fails
         """
         def is_address_ready():
             try:
@@ -581,12 +622,14 @@ class IpAddrCommand(IpDeviceCommandBase):
                 raise AddressNotReady(
                     address=address,
                     reason=_('Address not present on interface'))
-            if not addr_info['tentative']:
-                return True
+            # Since both 'dadfailed' and 'tentative' will be set if DAD fails,
+            # check 'dadfailed' first just to be explicit
             if addr_info['dadfailed']:
-                raise AddressNotReady(
+                raise DADFailed(
                     address=address, reason=_('Duplicate address detected'))
-            return False
+            if addr_info['tentative']:
+                return False
+            return True
         errmsg = _("Exceeded %s second limit waiting for "
                    "address to leave the tentative state.") % wait_time
         common_utils.wait_until_true(
@@ -595,10 +638,9 @@ class IpAddrCommand(IpDeviceCommandBase):
 
 
 class IpRouteCommand(IpDeviceCommandBase):
-    COMMAND = 'route'
 
     def __init__(self, parent, table=None):
-        super(IpRouteCommand, self).__init__(parent)
+        super().__init__(parent)
         self._table = table
 
     def add_gateway(self, gateway, metric=None, table=None, scope='global'):
@@ -652,19 +694,19 @@ class IpRouteCommand(IpDeviceCommandBase):
 
 class IPRoute(SubProcessBase):
     def __init__(self, namespace=None, table=None):
-        super(IPRoute, self).__init__(namespace=namespace)
+        super().__init__(namespace=namespace)
         self.name = None
         self.route = IpRouteCommand(self, table=table)
 
 
 class IpNeighCommand(IpDeviceCommandBase):
-    COMMAND = 'neigh'
 
-    def add(self, ip_address, mac_address, **kwargs):
+    def add(self, ip_address, mac_address, nud_state=None, **kwargs):
         add_neigh_entry(ip_address,
                         mac_address,
                         self.name,
-                        self._parent.namespace,
+                        namespace=self._parent.namespace,
+                        nud_state=nud_state,
                         **kwargs)
 
     def delete(self, ip_address, mac_address, **kwargs):
@@ -686,21 +728,33 @@ class IpNeighCommand(IpDeviceCommandBase):
         Given address entry is removed from neighbour cache (ARP or NDP). To
         flush all entries pass string 'all' as an address.
 
+        From https://man.archlinux.org/man/core/iproute2/ip-neighbour.8.en:
+          "the default neighbour states to be flushed do not include permanent
+           and noarp".
+
         :param ip_version: Either 4 or 6 for IPv4 or IPv6 respectively
-        :param ip_address: The prefix selecting the neighbours to flush
+        :param ip_address: The prefix selecting the neighbours to flush or
+                           "all"
         """
-        # NOTE(haleyb): There is no equivalent to 'flush' in pyroute2
-        self._as_root([ip_version], ('flush', 'to', ip_address))
+        cidr = netaddr.IPNetwork(ip_address) if ip_address != 'all' else None
+        for entry in self.dump(ip_version):
+            if entry['state'] in ('permanent', 'noarp'):
+                continue
+            if ip_address == 'all' or entry['dst'] in cidr:
+                self.delete(entry['dst'], entry['lladdr'])
 
 
-class IpNetnsCommand(IpCommandBase):
-    COMMAND = 'netns'
+class IpNetnsCommand:
+
+    def __init__(self, parent):
+        self._parent = parent
 
     def add(self, name):
         create_network_namespace(name)
         wrapper = IPWrapper(namespace=name)
         wrapper.netns.execute(['sysctl', '-w',
-                               'net.ipv4.conf.all.promote_secondaries=1'])
+                               'net.ipv4.conf.all.promote_secondaries=1'],
+                              privsep_exec=True)
         return wrapper
 
     def delete(self, name):
@@ -708,7 +762,7 @@ class IpNetnsCommand(IpCommandBase):
 
     def execute(self, cmds, addl_env=None, check_exit_code=True,
                 log_fail_as_error=True, extra_ok_codes=None,
-                run_as_root=False):
+                run_as_root=False, privsep_exec=False):
         ns_params = []
         if self._parent.namespace:
             run_as_root = True
@@ -722,7 +776,8 @@ class IpNetnsCommand(IpCommandBase):
         return utils.execute(cmd, check_exit_code=check_exit_code,
                              extra_ok_codes=extra_ok_codes,
                              log_fail_as_error=log_fail_as_error,
-                             run_as_root=run_as_root)
+                             run_as_root=run_as_root,
+                             privsep_exec=privsep_exec)
 
     def exists(self, name):
         return network_namespace_exists(name)
@@ -749,7 +804,8 @@ def device_exists(device_name, namespace=None):
     return IPDevice(device_name, namespace=namespace).exists()
 
 
-def device_exists_with_ips_and_mac(device_name, ip_cidrs, mac, namespace=None):
+def device_exists_with_ips_and_mac(device_name, ip_cidrs,
+                                   mac, namespace=None) -> bool:
     """Return True if the device with the given IP addresses and MAC address
     exists in the namespace.
     """
@@ -757,14 +813,10 @@ def device_exists_with_ips_and_mac(device_name, ip_cidrs, mac, namespace=None):
         device = IPDevice(device_name, namespace=namespace)
         if mac and mac != device.link.address:
             return False
-        device_ip_cidrs = [ip['cidr'] for ip in device.addr.list()]
-        for ip_cidr in ip_cidrs:
-            if ip_cidr not in device_ip_cidrs:
-                return False
+        device_ip_cidrs = {ip['cidr'] for ip in device.addr.list()}
     except RuntimeError:
         return False
-    else:
-        return True
+    return not bool(set(ip_cidrs) - device_ip_cidrs)
 
 
 def get_device_mac(device_name, namespace=None):
@@ -794,13 +846,25 @@ def add_ip_address(cidr, device, namespace=None, scope='global',
     """
     net = netaddr.IPNetwork(cidr)
     broadcast = None
-    if add_broadcast and net.version == 4:
-        # NOTE(slaweq): in case if cidr is /32 net.broadcast is None so
-        # same IP address as cidr should be set as broadcast
-        broadcast = str(net.broadcast or net.ip)
+    if add_broadcast:
+        broadcast = common_utils.cidr_broadcast_address_alternative(cidr)
     privileged.add_ip_address(
         net.version, str(net.ip), net.prefixlen,
         device, namespace, scope, broadcast)
+
+
+def add_ip_addresses(cidrs, device, namespace=None, scope='global',
+                     add_broadcast=True):
+    """Add multiple IP addresses.
+
+    :param cidrs: A list of IP addresses to add, in CIDR notation
+    :param device: Device name to use in adding address
+    :param namespace: The name of the namespace in which to add the address
+    :param scope: scope of address being added
+    :param add_broadcast: should broadcast address be added
+    """
+    privileged.add_ip_addresses(
+        cidrs, device, namespace, scope, add_broadcast)
 
 
 def delete_ip_address(cidr, device, namespace=None):
@@ -815,6 +879,16 @@ def delete_ip_address(cidr, device, namespace=None):
         net.version, str(net.ip), net.prefixlen, device, namespace)
 
 
+def delete_ip_addresses(cidrs, device, namespace=None):
+    """Delete multiple IP address.
+
+    :param cidrs: A list of IP addresses to delete, in CIDR notation
+    :param device: Device name to use in deleting address
+    :param namespace: The name of the namespace in which to delete the address
+    """
+    privileged.delete_ip_addresses(cidrs, device, namespace)
+
+
 def flush_ip_addresses(ip_version, device, namespace=None):
     """Flush all IP addresses.
 
@@ -825,37 +899,27 @@ def flush_ip_addresses(ip_version, device, namespace=None):
     privileged.flush_ip_addresses(ip_version, device, namespace)
 
 
-def get_routing_table(ip_version, namespace=None):
-    """Return a list of dictionaries, each representing a route.
-
-    @param ip_version: the routes of version to return, for example 4
-    @param namespace
-    @return: a list of dictionaries, each representing a route.
-    The dictionary format is: {'destination': cidr,
-                               'nexthop': ip,
-                               'device': device_name,
-                               'scope': scope}
-    """
-    # oslo.privsep turns lists to tuples in its IPC code. Change it back
-    return list(privileged.get_routing_table(ip_version, namespace))
-
-
 # NOTE(haleyb): These neighbour functions live outside the IpNeighCommand
 # class since not all callers require it.
-def add_neigh_entry(ip_address, mac_address, device, namespace=None, **kwargs):
+def add_neigh_entry(ip_address, mac_address, device, namespace=None,
+                    nud_state=None, **kwargs):
     """Add a neighbour entry.
 
     :param ip_address: IP address of entry to add
     :param mac_address: MAC address of entry to add
     :param device: Device name to use in adding entry
     :param namespace: The name of the namespace in which to add the entry
+    :param nud_state: The NUD (Neighbour Unreachability Detection) state of
+                      the entry; defaults to "permanent"
     """
     ip_version = common_utils.get_ip_version(ip_address)
+    nud_state = nud_state or 'permanent'
     privileged.add_neigh_entry(ip_version,
                                ip_address,
                                mac_address,
                                device,
                                namespace,
+                               nud_state,
                                **kwargs)
 
 
@@ -920,8 +984,7 @@ def list_network_namespaces(**kwargs):
     """
     if cfg.CONF.AGENT.use_helper_for_ns_read:
         return privileged.list_netns(**kwargs)
-    else:
-        return netns.listnetns(**kwargs)
+    return netns.listnetns(**kwargs)
 
 
 def network_namespace_exists(namespace, try_is_ready=False, **kwargs):
@@ -932,9 +995,15 @@ def network_namespace_exists(namespace, try_is_ready=False, **kwargs):
                          is ready to be operated.
     :param kwargs: Callers add any filters they use as kwargs
     """
+    if not namespace:
+        return False
+
     if not try_is_ready:
-        output = list_network_namespaces(**kwargs)
-        return namespace in output
+        nspath = kwargs.get('nspath') or netns.NETNS_RUN_DIR
+        nspath += '/' + namespace
+        if cfg.CONF.AGENT.use_helper_for_ns_read:
+            return priv_utils.path_exists(nspath)
+        return path.exists(nspath)
 
     try:
         privileged.open_namespace(namespace)
@@ -959,8 +1028,8 @@ def ensure_device_is_ready(device_name, namespace=None):
         # Ensure the device has a MAC address and is up, even if it is already
         # up.
         if not dev.link.exists or not dev.link.address:
-            LOG.error("Device %s cannot be used as it has no MAC "
-                      "address", device_name)
+            LOG.info("Device %s cannot be used as it has no MAC "
+                     "address", device_name)
             return False
         dev.link.set_up()
     except RuntimeError:
@@ -993,7 +1062,7 @@ def _arping(ns_name, iface_name, address, count, log_exception):
     for i in range(count):
         if not first:
             # hopefully enough for kernel to get out of locktime loop
-            time.sleep(2)
+            time.sleep(ARPING_SLEEP)
             # On the second (and subsequent) arping calls, we can get a
             # "bind: Cannot assign requested address" error since
             # the IP address might have been deleted concurrently.
@@ -1012,10 +1081,11 @@ def _arping(ns_name, iface_name, address, count, log_exception):
             arping_cmd = ['arping', arg, '-I', iface_name, '-c', 1,
                           # Pass -w to set timeout to ensure exit if interface
                           # removed while running
-                          '-w', 1.5, address]
+                          '-w', 2, address]
             try:
                 ip_wrapper.netns.execute(arping_cmd,
-                                         extra_ok_codes=extra_ok_codes)
+                                         extra_ok_codes=extra_ok_codes,
+                                         privsep_exec=True)
             except Exception as exc:
                 # Since this is spawned in a thread and executed 2 seconds
                 # apart, something may have been deleted while we were
@@ -1025,8 +1095,8 @@ def _arping(ns_name, iface_name, address, count, log_exception):
                                                         [address],
                                                         mac=None,
                                                         namespace=ns_name)
-                msg = _("Failed sending gratuitous ARP to %(addr)s on "
-                        "%(iface)s in namespace %(ns)s: %(err)s")
+                msg = ("Failed sending gratuitous ARP to %(addr)s on "
+                       "%(iface)s in namespace %(ns)s: %(err)s")
                 logger_method = LOG.exception
                 if not (log_exception and (first or exists)):
                     logger_method = LOG.info
@@ -1044,8 +1114,7 @@ def _arping(ns_name, iface_name, address, count, log_exception):
 
 
 def send_ip_addr_adv_notif(
-        ns_name, iface_name, address, count=3, log_exception=True,
-        use_eventlet=True):
+        ns_name, iface_name, address, count=3, log_exception=True):
     """Send advance notification of an IP address assignment.
 
     If the address is in the IPv4 family, send gratuitous ARP.
@@ -1063,18 +1132,12 @@ def send_ip_addr_adv_notif(
     :param log_exception: (Optional) True if possible failures should be logged
                           on exception level. Otherwise they are logged on
                           WARNING level. Default is True.
-    :param use_eventlet: (Optional) True if the arping command will be spawned
-                         using eventlet, False to use Python threads
-                         (threading).
     """
     def arping():
         _arping(ns_name, iface_name, address, count, log_exception)
 
     if count > 0 and netaddr.IPAddress(address).version == 4:
-        if use_eventlet:
-            eventlet.spawn_n(arping)
-        else:
-            threading.Thread(target=arping).start()
+        threading.Thread(target=arping).start()
 
 
 def sysctl(cmd, namespace=None, log_fail_as_error=True):
@@ -1102,7 +1165,8 @@ def sysctl(cmd, namespace=None, log_fail_as_error=True):
     ip_wrapper = IPWrapper(namespace=namespace)
     try:
         ip_wrapper.netns.execute(cmd, run_as_root=True,
-                                 log_fail_as_error=log_fail_as_error)
+                                 log_fail_as_error=log_fail_as_error,
+                                 privsep_exec=True)
     except RuntimeError as rte:
         LOG.warning(
             "Setting %(cmd)s in namespace %(ns)s failed: %(err)s.",
@@ -1128,7 +1192,8 @@ def get_ip_nonlocal_bind(namespace=None):
     """Get kernel option value of ip_nonlocal_bind in given namespace."""
     cmd = ['sysctl', '-bn', IP_NONLOCAL_BIND]
     ip_wrapper = IPWrapper(namespace)
-    return int(ip_wrapper.netns.execute(cmd, run_as_root=True))
+    return int(ip_wrapper.netns.execute(cmd, run_as_root=True,
+                                        privsep_exec=True))
 
 
 def set_ip_nonlocal_bind(value, namespace=None, log_fail_as_error=True):
@@ -1163,7 +1228,8 @@ def get_ipv6_forwarding(device, namespace=None):
     """Get kernel value of IPv6 forwarding for device in given namespace."""
     cmd = ['sysctl', '-b', "net.ipv6.conf.%s.forwarding" % device]
     ip_wrapper = IPWrapper(namespace)
-    return int(ip_wrapper.netns.execute(cmd, run_as_root=True))
+    return int(ip_wrapper.netns.execute(cmd, run_as_root=True,
+                                        privsep_exec=True))
 
 
 def _parse_ip_rule(rule, ip_version):
@@ -1209,7 +1275,7 @@ def _parse_ip_rule(rule, ip_version):
     fwmark = rule['attrs'].get('FRA_FWMARK')
     if fwmark:
         fwmask = rule['attrs'].get('FRA_FWMASK')
-        parsed_rule['fwmark'] = '{0:#x}/{1:#x}'.format(fwmark, fwmask)
+        parsed_rule['fwmark'] = f'{fwmark:#x}/{fwmask:#x}'
     iifname = rule['attrs'].get('FRA_IIFNAME')
     if iifname:
         parsed_rule['iif'] = iifname
@@ -1281,8 +1347,12 @@ def _exist_ip_rule(rules, ip, iif, table, priority, to):
     return True
 
 
-def add_ip_rule(namespace, ip, iif=None, table=None, priority=None, to=None):
+def add_ip_rule(namespace, ip, iif=None, table=IP_RULE_TABLES['default'],
+                priority=None, to=None):
     """Create an IP rule in a namespace
+
+    "table" parameter cannot be an empty value (None). By default, this method
+    will assign "IP_RULE_TABLES['default']" value if None is passed.
 
     :param namespace: (string) namespace name
     :param ip: (string) source IP or CIDR address (IPv4, IPv6)
@@ -1291,6 +1361,7 @@ def add_ip_rule(namespace, ip, iif=None, table=None, priority=None, to=None):
     :param priority: (Optional) (string, int) rule priority
     :param to: (Optional) (string) destination IP or CIDR address (IPv4, IPv6)
     """
+    table = table if table is not None else IP_RULE_TABLES['default']
     ip_version = common_utils.get_ip_version(ip)
     rules = list_ip_rules(namespace, ip_version)
     if _exist_ip_rule(rules, ip, iif, table, priority, to):
@@ -1314,19 +1385,12 @@ def delete_ip_rule(namespace, ip, iif=None, table=None, priority=None,
     privileged.delete_ip_rule(namespace, **cmd_args)
 
 
-def get_attr(pyroute2_obj, attr_name):
-    """Get an attribute from a PyRoute2 object"""
-    rule_attrs = pyroute2_obj.get('attrs', [])
-    for attr in (attr for attr in rule_attrs if attr[0] == attr_name):
-        return attr[1]
-
-
 def _parse_ip_address(pyroute2_address, device_name):
-    ip = get_attr(pyroute2_address, 'IFA_ADDRESS')
+    ip = linux_utils.get_attr(pyroute2_address, 'IFA_ADDRESS')
     ip_length = pyroute2_address['prefixlen']
     event = IP_ADDRESS_EVENTS.get(pyroute2_address.get('event'))
     cidr = common_utils.ip_to_cidr(ip, prefix=ip_length)
-    flags = get_attr(pyroute2_address, 'IFA_FLAGS')
+    flags = linux_utils.get_attr(pyroute2_address, 'IFA_FLAGS')
     dynamic = not bool(flags & ifaddrmsg.IFA_F_PERMANENT)
     tentative = bool(flags & ifaddrmsg.IFA_F_TENTATIVE)
     dadfailed = bool(flags & ifaddrmsg.IFA_F_DADFAILED)
@@ -1334,39 +1398,46 @@ def _parse_ip_address(pyroute2_address, device_name):
     return {'name': device_name,
             'cidr': cidr,
             'scope': scope,
-            'broadcast': get_attr(pyroute2_address, 'IFA_BROADCAST'),
+            'broadcast': linux_utils.get_attr(pyroute2_address,
+                                              'IFA_BROADCAST'),
             'dynamic': dynamic,
             'tentative': tentative,
             'dadfailed': dadfailed,
             'event': event}
 
 
-def _parse_link_device(namespace, device, **kwargs):
-    """Parse pytoute2 link device information
-
-    For each link device, the IP address information is retrieved and returned
-    in a dictionary.
-    IP address scope: http://linux-ip.net/html/tools-ip-address.html
-    """
-    retval = []
-    name = get_attr(device, 'IFLA_IFNAME')
-    ip_addresses = privileged.get_ip_addresses(namespace,
-                                               index=device['index'],
-                                               **kwargs)
-    for ip_address in ip_addresses:
-        retval.append(_parse_ip_address(ip_address, name))
-    return retval
-
-
 def get_devices_with_ip(namespace, name=None, **kwargs):
+    retval = []
     link_args = {}
     if name:
         link_args['ifname'] = name
-    devices = privileged.get_link_devices(namespace, **link_args)
-    retval = []
-    for parsed_ips in (_parse_link_device(namespace, device, **kwargs)
-                       for device in devices):
-        retval += parsed_ips
+    scope = kwargs.pop('scope', None)
+    if scope:
+        kwargs['scope'] = IP_ADDRESS_SCOPE_NAME[scope]
+
+    if not link_args:
+        ip_addresses = privileged.get_ip_addresses(namespace, **kwargs)
+    else:
+        device = get_devices_info(namespace, **link_args)
+        if not device:
+            return retval
+        ip_addresses = privileged.get_ip_addresses(
+            namespace, index=device[0]['index'], **kwargs)
+
+    devices = {}  # {device index: name}
+    for ip_address in ip_addresses:
+        index = ip_address['index']
+        name = (linux_utils.get_attr(ip_address, 'IFA_LABEL') or
+                devices.get(index))
+        if not name:
+            device = get_devices_info(namespace, index=index)
+            if not device:
+                continue
+            name = device[0]['name']
+
+        retval.append(_parse_ip_address(ip_address, name))
+        devices[index] = name
+
     return retval
 
 
@@ -1375,27 +1446,35 @@ def get_devices_info(namespace, **kwargs):
     retval = {}
     for device in devices:
         ret = {'index': device['index'],
-               'name': get_attr(device, 'IFLA_IFNAME'),
-               'operstate': get_attr(device, 'IFLA_OPERSTATE'),
-               'linkmode': get_attr(device, 'IFLA_LINKMODE'),
-               'mtu': get_attr(device, 'IFLA_MTU'),
-               'promiscuity': get_attr(device, 'IFLA_PROMISCUITY'),
-               'mac': get_attr(device, 'IFLA_ADDRESS'),
-               'broadcast': get_attr(device, 'IFLA_BROADCAST')}
-        ifla_link = get_attr(device, 'IFLA_LINK')
+               'name': linux_utils.get_attr(device, 'IFLA_IFNAME'),
+               'operstate': linux_utils.get_attr(device, 'IFLA_OPERSTATE'),
+               'linkmode': linux_utils.get_attr(device, 'IFLA_LINKMODE'),
+               'mtu': linux_utils.get_attr(device, 'IFLA_MTU'),
+               'promiscuity': linux_utils.get_attr(device, 'IFLA_PROMISCUITY'),
+               'mac': linux_utils.get_attr(device, 'IFLA_ADDRESS'),
+               'broadcast': linux_utils.get_attr(device, 'IFLA_BROADCAST')}
+        ifla_link = linux_utils.get_attr(device, 'IFLA_LINK')
         if ifla_link:
             ret['parent_index'] = ifla_link
-        ifla_linkinfo = get_attr(device, 'IFLA_LINKINFO')
+        ifla_linkinfo = linux_utils.get_attr(device, 'IFLA_LINKINFO')
         if ifla_linkinfo:
-            ret['kind'] = get_attr(ifla_linkinfo, 'IFLA_INFO_KIND')
-            ifla_data = get_attr(ifla_linkinfo, 'IFLA_INFO_DATA')
+            ret['kind'] = linux_utils.get_attr(ifla_linkinfo, 'IFLA_INFO_KIND')
+            ifla_data = linux_utils.get_attr(ifla_linkinfo, 'IFLA_INFO_DATA')
             if ret['kind'] == 'vxlan':
-                ret['vxlan_id'] = get_attr(ifla_data, 'IFLA_VXLAN_ID')
-                ret['vxlan_group'] = get_attr(ifla_data, 'IFLA_VXLAN_GROUP')
-                ret['vxlan_link_index'] = get_attr(ifla_data,
-                                                   'IFLA_VXLAN_LINK')
+                ret['vxlan_id'] = linux_utils.get_attr(ifla_data,
+                                                       'IFLA_VXLAN_ID')
+                ret['vxlan_group'] = linux_utils.get_attr(ifla_data,
+                                                          'IFLA_VXLAN_GROUP')
+                ret['vxlan_link_index'] = linux_utils.get_attr(
+                    ifla_data, 'IFLA_VXLAN_LINK')
             elif ret['kind'] == 'vlan':
-                ret['vlan_id'] = get_attr(ifla_data, 'IFLA_VLAN_ID')
+                ret['vlan_id'] = linux_utils.get_attr(ifla_data,
+                                                      'IFLA_VLAN_ID')
+            elif ret['kind'] == 'bridge':
+                ret['stp'] = linux_utils.get_attr(ifla_data,
+                                                  'IFLA_BR_STP_STATE')
+                ret['forward_delay'] = linux_utils.get_attr(
+                    ifla_data, 'IFLA_BR_FORWARD_DELAY')
         retval[device['index']] = ret
 
     for device in retval.values():
@@ -1444,17 +1523,19 @@ def ip_monitor(namespace, queue, event_stop, event_started):
             while True:
                 ip_addresses = _ip.get()
                 for ip_address in ip_addresses:
+                    LOG.debug("IP monitor %s; Adding IP address: %s "
+                              "to the queue.", namespace, ip_address)
                     _queue.put(ip_address)
         except EOFError:
             pass
 
-    _queue = eventlet.Queue()
+    _queue = pqueue.Queue()
     try:
         cache_devices = {}
         with privileged.get_iproute(namespace) as ip:
             for device in ip.get_links():
-                cache_devices[device['index']] = get_attr(device,
-                                                          'IFLA_IFNAME')
+                cache_devices[device['index']] = linux_utils.get_attr(
+                    device, 'IFLA_IFNAME')
         _ip = privileged.get_iproute(namespace)
         ip_updates_thread = threading.Thread(target=read_ip_updates,
                                              args=(_ip, _queue))
@@ -1463,7 +1544,9 @@ def ip_monitor(namespace, queue, event_stop, event_started):
         while not event_stop.is_set():
             try:
                 ip_address = _queue.get(timeout=1)
-            except eventlet.queue.Empty:
+                LOG.debug("IP monitor %s; IP address to process: %s",
+                          namespace, ip_address)
+            except pqueue.Empty:
                 continue
             if 'index' in ip_address and 'prefixlen' in ip_address:
                 index = ip_address['index']
@@ -1472,6 +1555,8 @@ def ip_monitor(namespace, queue, event_stop, event_started):
                 if not name:
                     continue
 
+                LOG.debug("IP monitor %s; Queueing IP address: %s; device: %s",
+                          namespace, ip_address, name)
                 cache_devices[index] = name
                 queue.put(_parse_ip_address(ip_address, name))
 
@@ -1485,14 +1570,14 @@ def ip_monitor(namespace, queue, event_stop, event_started):
 
 
 def add_ip_route(namespace, cidr, device=None, via=None, table=None,
-                 metric=None, scope=None, **kwargs):
+                 metric=None, scope=None, proto='static', **kwargs):
     """Add an IP route"""
     if table:
         table = IP_RULE_TABLES.get(table, table)
     ip_version = common_utils.get_ip_version(cidr or via)
     privileged.add_ip_route(namespace, cidr, ip_version,
                             device=device, via=via, table=table,
-                            metric=metric, scope=scope, **kwargs)
+                            metric=metric, scope=scope, proto=proto, **kwargs)
 
 
 def list_ip_routes(namespace, ip_version, scope=None, via=None, table=None,
@@ -1500,7 +1585,15 @@ def list_ip_routes(namespace, ip_version, scope=None, via=None, table=None,
     """List IP routes"""
     def get_device(index, devices):
         for device in (d for d in devices if d['index'] == index):
-            return get_attr(device, 'IFLA_IFNAME')
+            return linux_utils.get_attr(device, 'IFLA_IFNAME')
+
+    def get_proto(proto_number):
+        if isinstance(proto_number, int) and proto_number in rtnl.rt_proto:
+            return rtnl.rt_proto[proto_number]
+        if isinstance(proto_number, str) and proto_number.isnumeric():
+            return rtnl.rt_proto[int(proto_number)]
+        if str(proto_number) in constants.IP_PROTOCOL_NUM_TO_NAME_MAP:
+            return constants.IP_PROTOCOL_NUM_TO_NAME_MAP[str(proto_number)]
 
     table = table if table else 'main'
     table = IP_RULE_TABLES.get(table, table)
@@ -1509,23 +1602,38 @@ def list_ip_routes(namespace, ip_version, scope=None, via=None, table=None,
     devices = privileged.get_link_devices(namespace)
     ret = []
     for route in routes:
-        cidr = get_attr(route, 'RTA_DST')
+        cidr = linux_utils.get_attr(route, 'RTA_DST')
         if cidr:
-            cidr = '%s/%s' % (cidr, route['dst_len'])
+            cidr = '{}/{}'.format(cidr, route['dst_len'])
         else:
             cidr = constants.IP_ANY[ip_version]
-        table = int(get_attr(route, 'RTA_TABLE'))
-        metric = (get_attr(route, 'RTA_PRIORITY') or
+        table = int(linux_utils.get_attr(route, 'RTA_TABLE'))
+        metric = (linux_utils.get_attr(route, 'RTA_PRIORITY') or
                   IP_ROUTE_METRIC_DEFAULT[ip_version])
+        proto = get_proto(route['proto'])
         value = {
             'table': IP_RULE_TABLES_NAMES.get(table, table),
-            'source_prefix': get_attr(route, 'RTA_PREFSRC'),
+            'source_prefix': linux_utils.get_attr(route, 'RTA_PREFSRC'),
             'cidr': cidr,
             'scope': IP_ADDRESS_SCOPE[int(route['scope'])],
-            'device': get_device(int(get_attr(route, 'RTA_OIF')), devices),
-            'via': get_attr(route, 'RTA_GATEWAY'),
             'metric': metric,
+            'proto': proto,
         }
+
+        multipath = linux_utils.get_attr(route, 'RTA_MULTIPATH')
+        if multipath:
+            value['device'] = None
+            mp_via = []
+            for mp in multipath:
+                mp_via.append({'device': get_device(int(mp['oif']), devices),
+                               'via': linux_utils.get_attr(mp, 'RTA_GATEWAY'),
+                               'weight': int(mp['hops']) + 1})
+            value['via'] = mp_via
+        else:
+            value['device'] = get_device(
+                int(linux_utils.get_attr(route, 'RTA_OIF')),
+                devices)
+            value['via'] = linux_utils.get_attr(route, 'RTA_GATEWAY')
 
         ret.append(value)
 

@@ -16,9 +16,9 @@
 
 from unittest import mock
 
+from neutron_lib.plugins.ml2 import ovs_constants
 from oslo_utils import importutils
 
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants
 from neutron.tests.unit.plugins.ml2.drivers.openvswitch.agent \
     import ovs_test_base
 
@@ -26,7 +26,7 @@ from neutron.tests.unit.plugins.ml2.drivers.openvswitch.agent \
 call = mock.call  # short hand
 
 
-class OVSBridgeTestBase(ovs_test_base.OVSOSKenTestBase):
+class OVSBridgeTestMixin(ovs_test_base.OVSOSKenTestBase):
     _ARP_MODULE = 'os_ken.lib.packet.arp'
     _ETHER_TYPES_MODULE = 'os_ken.lib.packet.ether_types'
     _ICMPV6_MODULE = 'os_ken.lib.packet.icmpv6'
@@ -34,9 +34,9 @@ class OVSBridgeTestBase(ovs_test_base.OVSOSKenTestBase):
     _OFP_MODULE = 'os_ken.ofproto.ofproto_v1_3'
     _OFPP_MODULE = 'os_ken.ofproto.ofproto_v1_3_parser'
 
-    def setup_bridge_mock(self, name, cls):
-        self.br = cls(name)
-        self.stamp = self.br.default_cookie
+    def mock_bridge_cls(self, name, cls):
+        br = cls(name)
+        self.stamp = br.default_cookie
         self.dp = mock.Mock()
         self.ofp = importutils.import_module(self._OFP_MODULE)
         self.ofpp = importutils.import_module(self._OFPP_MODULE)
@@ -44,17 +44,24 @@ class OVSBridgeTestBase(ovs_test_base.OVSOSKenTestBase):
         self.ether_types = importutils.import_module(self._ETHER_TYPES_MODULE)
         self.icmpv6 = importutils.import_module(self._ICMPV6_MODULE)
         self.in_proto = importutils.import_module(self._IN_PROTO_MODULE)
-        mock.patch.object(self.br, '_get_dp', autospec=True,
+        mock.patch.object(br, '_get_dp', autospec=True,
                           return_value=self._get_dp()).start()
-        mock__send_msg = mock.patch.object(self.br, '_send_msg').start()
-        mock_delete_flows = mock.patch.object(self.br,
+        mock__send_msg = mock.patch.object(br, '_send_msg').start()
+        mock_delete_flows = mock.patch.object(br,
                                               'uninstall_flows').start()
         self.mock = mock.Mock()
         self.mock.attach_mock(mock__send_msg, '_send_msg')
         self.mock.attach_mock(mock_delete_flows, 'uninstall_flows')
+        return br
 
     def _get_dp(self):
         return self.dp, self.ofp, self.ofpp
+
+
+class OVSBridgeTestBase(OVSBridgeTestMixin):
+
+    def setup_bridge_mock(self, name, cls):
+        self.br = self.mock_bridge_cls(name, cls)
 
     def test_drop_port(self):
         in_port = 2345
@@ -63,11 +70,11 @@ class OVSBridgeTestBase(ovs_test_base.OVSOSKenTestBase):
         expected = [
             call._send_msg(
                 ofpp.OFPFlowMod(dp,
-                    cookie=self.stamp,
-                    instructions=[],
-                    match=ofpp.OFPMatch(in_port=in_port),
-                    priority=2,
-                    table_id=0),
+                                cookie=self.stamp,
+                                instructions=[],
+                                match=ofpp.OFPMatch(in_port=in_port),
+                                priority=2,
+                                table_id=0),
                 active_bundle=None),
         ]
         self.assertEqual(expected, self.mock.mock_calls)
@@ -81,7 +88,8 @@ class OVSBridgeTestBase(ovs_test_base.OVSOSKenTestBase):
         (dp, ofp, ofpp) = self._get_dp()
         expected = [
             call._send_msg(
-                ofpp.OFPFlowMod(dp,
+                ofpp.OFPFlowMod(
+                    dp,
                     cookie=self.stamp,
                     instructions=[
                         ofpp.OFPInstructionGotoTable(table_id=dest_table_id),
@@ -101,11 +109,11 @@ class OVSBridgeTestBase(ovs_test_base.OVSOSKenTestBase):
         expected = [
             call._send_msg(
                 ofpp.OFPFlowMod(dp,
-                    cookie=self.stamp,
-                    instructions=[],
-                    match=ofpp.OFPMatch(in_port=in_port),
-                    priority=priority,
-                    table_id=0),
+                                cookie=self.stamp,
+                                instructions=[],
+                                match=ofpp.OFPMatch(in_port=in_port),
+                                priority=priority,
+                                table_id=0),
                 active_bundle=None),
         ]
         self.assertEqual(expected, self.mock.mock_calls)
@@ -117,7 +125,8 @@ class OVSBridgeTestBase(ovs_test_base.OVSOSKenTestBase):
         (dp, ofp, ofpp) = self._get_dp()
         expected = [
             call._send_msg(
-                ofpp.OFPFlowMod(dp,
+                ofpp.OFPFlowMod(
+                    dp,
                     cookie=self.stamp,
                     instructions=[
                         ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [
@@ -137,25 +146,93 @@ class OVSBridgeTestBase(ovs_test_base.OVSOSKenTestBase):
         self.assertEqual('192.168.0.1', f('192.168.0.1/32'))
         self.assertEqual(('192.168.0.0', '255.255.255.0'), f('192.168.0.0/24'))
 
-    def test__setup_controllers__out_of_band(self):
+    def _test_setup_controllers(self, existing_controllers):
         cfg = mock.MagicMock()
-        cfg.OVS.of_listen_address = ""
-        cfg.OVS.of_listen_port = ""
+        cfg.OVS.of_listen_address = "127.0.0.1"
+        cfg.OVS.of_listen_port = "6633"
 
-        m_add_protocols = mock.patch.object(self.br, 'add_protocols')
-        m_set_controller = mock.patch.object(self.br, 'set_controller')
-        m_set_probe = mock.patch.object(self.br,
-                                        'set_controllers_inactivity_probe')
-        m_set_ccm = mock.patch.object(self.br,
-                                      'set_controllers_connection_mode')
+        with mock.patch.object(
+            self.br, 'disable_in_band'
+        ) as disable_in_band, mock.patch.object(
+            self.br, 'add_protocols'
+        ) as add_protocols, mock.patch.object(
+            self.br, 'set_controller'
+        ) as set_controller, mock.patch.object(
+            self.br, 'get_controller'
+        ) as get_controller, mock.patch.object(
+                self.br, 'set_controllers_inactivity_probe'):
+            get_controller.return_value = existing_controllers
 
-        with m_set_ccm as set_ccm:
-            with m_set_controller, m_add_protocols, m_set_probe:
-                self.br.setup_controllers(cfg)
-                set_ccm.assert_called_once_with("out-of-band")
+            self.br.setup_controllers(cfg)
+
+            if existing_controllers:
+                set_controller.assert_not_called()
+            else:
+                set_controller.assert_called_once_with(["tcp:127.0.0.1:6633"])
+            disable_in_band.assert_called_once_with()
+            add_protocols.assert_called_once_with(
+                ovs_constants.OPENFLOW10, ovs_constants.OPENFLOW13)
+
+    def test_setup_controllers(self):
+        self._test_setup_controllers(existing_controllers=[])
+
+    def test_setup_controllers_when_already_exists(self):
+        self._test_setup_controllers(
+            existing_controllers=["tcp:127.0.0.1:6633"])
+
+    def test_install_arp_responder(self):
+        vlan = 3333
+        ip = '192.0.2.1'
+        mac = '08:60:6e:7f:74:e7'
+        self.br.install_arp_responder(vlan=vlan, ip=ip, mac=mac)
+        (dp, ofp, ofpp) = self._get_dp()
+        expected = [
+            call._send_msg(
+                ofpp.OFPFlowMod(
+                    dp,
+                    cookie=self.stamp,
+                    instructions=[
+                        ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [
+                            ofpp.OFPActionSetField(arp_op=2),
+                            ofpp.NXActionRegMove(
+                                dst_field='arp_tha',
+                                n_bits=48,
+                                src_field='arp_sha'),
+                            ofpp.NXActionRegMove(
+                                dst_field='arp_tpa',
+                                n_bits=32,
+                                src_field='arp_spa'),
+                            ofpp.OFPActionSetField(arp_sha=mac),
+                            ofpp.OFPActionSetField(arp_spa=ip),
+                            ofpp.NXActionRegMove(src_field='eth_src',
+                                                 dst_field='eth_dst',
+                                                 n_bits=48),
+                            ofpp.OFPActionSetField(eth_src=mac),
+                            ofpp.OFPActionOutput(ofp.OFPP_IN_PORT, 0),
+                        ]),
+                    ],
+                    match=self.br._arp_responder_match(ofp, ofpp, vlan, ip),
+                    priority=1,
+                    table_id=21),
+                active_bundle=None),
+        ]
+        self.assertEqual(expected, self.mock.mock_calls)
+
+    def test_delete_arp_responder(self):
+        vlan = 3333
+        ip = '192.0.2.1'
+        self.br.delete_arp_responder(vlan=vlan, ip=ip)
+        (dp, ofp, ofpp) = self._get_dp()
+        expected = [
+            call.uninstall_flows(
+                table_id=21,
+                priority=1,
+                match=self.br._arp_responder_match(ofp, ofpp, vlan, ip))
+        ]
+        self.assertEqual(expected, self.mock.mock_calls)
 
 
-class OVSDVRProcessTestMixin(object):
+class OVSDVRProcessTestMixin:
     def test_install_dvr_process_ipv4(self):
         vlan_tag = 999
         gateway_ip = '192.0.2.1'
@@ -163,16 +240,18 @@ class OVSDVRProcessTestMixin(object):
                                          gateway_ip=gateway_ip)
         (dp, ofp, ofpp) = self._get_dp()
         expected = [
-            call._send_msg(ofpp.OFPFlowMod(dp,
-                cookie=self.stamp,
-                instructions=[],
-                match=ofpp.OFPMatch(
-                    eth_type=self.ether_types.ETH_TYPE_ARP,
-                    arp_tpa=gateway_ip,
-                    vlan_vid=vlan_tag | ofp.OFPVID_PRESENT),
-                priority=3,
-                table_id=constants.FLOOD_TO_TUN),
-                           active_bundle=None),
+            call._send_msg(
+                ofpp.OFPFlowMod(
+                    dp,
+                    cookie=self.stamp,
+                    instructions=[],
+                    match=ofpp.OFPMatch(
+                        eth_type=self.ether_types.ETH_TYPE_ARP,
+                        arp_tpa=gateway_ip,
+                        vlan_vid=vlan_tag | ofp.OFPVID_PRESENT),
+                    priority=3,
+                    table_id=ovs_constants.FLOOD_TO_TUN),
+                active_bundle=None),
         ]
         self.assertEqual(expected, self.mock.mock_calls)
 
@@ -183,7 +262,8 @@ class OVSDVRProcessTestMixin(object):
                                         gateway_ip=gateway_ip)
         (dp, ofp, ofpp) = self._get_dp()
         expected = [
-            call.uninstall_flows(table_id=constants.FLOOD_TO_TUN,
+            call.uninstall_flows(
+                table_id=ovs_constants.FLOOD_TO_TUN,
                 match=ofpp.OFPMatch(
                     eth_type=self.ether_types.ETH_TYPE_ARP,
                     arp_tpa=gateway_ip,
@@ -198,18 +278,19 @@ class OVSDVRProcessTestMixin(object):
                                          gateway_mac=gateway_mac)
         (dp, ofp, ofpp) = self._get_dp()
         expected = [
-            call._send_msg(ofpp.OFPFlowMod(dp,
-                cookie=self.stamp,
-                instructions=[],
-                match=ofpp.OFPMatch(
-                    eth_src=gateway_mac,
-                    eth_type=self.ether_types.ETH_TYPE_IPV6,
-                    icmpv6_type=self.icmpv6.ND_ROUTER_ADVERT,
-                    ip_proto=self.in_proto.IPPROTO_ICMPV6,
-                    vlan_vid=vlan_tag | ofp.OFPVID_PRESENT),
-                priority=3,
-                table_id=constants.FLOOD_TO_TUN),
-                           active_bundle=None),
+            call._send_msg(
+                ofpp.OFPFlowMod(dp,
+                                cookie=self.stamp,
+                                instructions=[],
+                                match=ofpp.OFPMatch(
+                                    eth_src=gateway_mac,
+                                    eth_type=self.ether_types.ETH_TYPE_IPV6,
+                                    icmpv6_type=self.icmpv6.ND_ROUTER_ADVERT,
+                                    ip_proto=self.in_proto.IPPROTO_ICMPV6,
+                                    vlan_vid=vlan_tag | ofp.OFPVID_PRESENT),
+                                priority=3,
+                                table_id=ovs_constants.FLOOD_TO_TUN),
+                active_bundle=None),
         ]
         self.assertEqual(expected, self.mock.mock_calls)
 
@@ -220,7 +301,8 @@ class OVSDVRProcessTestMixin(object):
                                         gateway_mac=gateway_mac)
         (dp, ofp, ofpp) = self._get_dp()
         expected = [
-            call.uninstall_flows(table_id=constants.FLOOD_TO_TUN,
+            call.uninstall_flows(
+                table_id=ovs_constants.FLOOD_TO_TUN,
                 match=ofpp.OFPMatch(
                     eth_src=gateway_mac,
                     eth_type=self.ether_types.ETH_TYPE_IPV6,
@@ -239,30 +321,33 @@ class OVSDVRProcessTestMixin(object):
                                     dvr_mac_address=dvr_mac_address)
         (dp, ofp, ofpp) = self._get_dp()
         expected = [
-            call._send_msg(ofpp.OFPFlowMod(dp,
-                cookie=self.stamp,
-                instructions=[],
-                match=ofpp.OFPMatch(
-                    eth_dst=vif_mac,
-                    vlan_vid=vlan_tag | ofp.OFPVID_PRESENT),
-                priority=2,
-                table_id=self.dvr_process_table_id),
-                           active_bundle=None),
-            call._send_msg(ofpp.OFPFlowMod(dp,
-                cookie=self.stamp,
-                instructions=[
-                    ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [
-                        ofpp.OFPActionSetField(eth_src=dvr_mac_address),
-                    ]),
-                    ofpp.OFPInstructionGotoTable(
-                        table_id=self.dvr_process_next_table_id),
-                ],
-                match=ofpp.OFPMatch(
-                    eth_src=vif_mac,
-                    vlan_vid=vlan_tag | ofp.OFPVID_PRESENT),
-                priority=1,
-                table_id=self.dvr_process_table_id),
-                           active_bundle=None),
+            call._send_msg(
+                ofpp.OFPFlowMod(dp,
+                                cookie=self.stamp,
+                                instructions=[],
+                                match=ofpp.OFPMatch(
+                                    eth_dst=vif_mac,
+                                    vlan_vid=vlan_tag | ofp.OFPVID_PRESENT),
+                                priority=2,
+                                table_id=self.dvr_process_table_id),
+                active_bundle=None),
+            call._send_msg(
+                ofpp.OFPFlowMod(
+                    dp,
+                    cookie=self.stamp,
+                    instructions=[
+                        ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [
+                            ofpp.OFPActionSetField(eth_src=dvr_mac_address),
+                        ]),
+                        ofpp.OFPInstructionGotoTable(
+                            table_id=self.dvr_process_next_table_id),
+                    ],
+                    match=ofpp.OFPMatch(
+                        eth_src=vif_mac,
+                        vlan_vid=vlan_tag | ofp.OFPVID_PRESENT),
+                    priority=1,
+                    table_id=self.dvr_process_table_id),
+                active_bundle=None),
         ]
         self.assertEqual(expected, self.mock.mock_calls)
 
@@ -273,11 +358,13 @@ class OVSDVRProcessTestMixin(object):
                                    vif_mac=vif_mac)
         (dp, ofp, ofpp) = self._get_dp()
         expected = [
-            call.uninstall_flows(table_id=self.dvr_process_table_id,
+            call.uninstall_flows(
+                table_id=self.dvr_process_table_id,
                 match=ofpp.OFPMatch(
                     eth_dst=vif_mac,
                     vlan_vid=vlan_tag | ofp.OFPVID_PRESENT)),
-            call.uninstall_flows(table_id=self.dvr_process_table_id,
+            call.uninstall_flows(
+                table_id=self.dvr_process_table_id,
                 match=ofpp.OFPMatch(
                     eth_src=vif_mac,
                     vlan_vid=vlan_tag | ofp.OFPVID_PRESENT)),

@@ -15,6 +15,7 @@
 
 import copy
 import functools
+import os
 from unittest import mock
 
 import netaddr
@@ -26,25 +27,28 @@ import testtools
 
 from neutron.agent.common import ovs_lib
 from neutron.agent.l3 import agent as neutron_l3_agent
+from neutron.agent.l3 import dvr_local_router
+from neutron.agent.l3 import ha
 from neutron.agent.l3 import namespaces
 from neutron.agent.l3 import router_info as l3_router_info
 from neutron.agent import l3_agent as l3_agent_main
 from neutron.agent.linux import external_process
-from neutron.agent.linux import interface
 from neutron.agent.linux import ip_lib
 from neutron.agent.linux import keepalived
-from neutron.agent.metadata import driver as metadata_driver
+from neutron.agent.metadata import driver_base
 from neutron.common import utils as common_utils
 from neutron.conf.agent import common as agent_config
+from neutron.conf.agent.l3 import config as l3_config
 from neutron.conf import common as common_config
+from neutron.tests import base as test_base
 from neutron.tests.common import l3_test_common
 from neutron.tests.common import net_helpers
 from neutron.tests.functional import base
 
 
-_uuid = uuidutils.generate_uuid
+LOG = logging.getLogger(__name__)
 
-OVS_INTERFACE_DRIVER = 'neutron.agent.linux.interface.OVSInterfaceDriver'
+_uuid = uuidutils.generate_uuid
 
 KEEPALIVED_CONFIG = """\
 global_defs {
@@ -73,11 +77,11 @@ vrrp_instance VR_1 {
         %(int_port_ipv6)s dev %(internal_device_name)s scope link no_track
     }
     virtual_routes {
-        0.0.0.0/0 via %(default_gateway_ip)s dev %(ex_device_name)s no_track
-        8.8.8.0/24 via 19.4.4.4 no_track
-        %(extra_subnet_cidr)s dev %(ex_device_name)s scope link no_track
+        0.0.0.0/0 via %(default_gateway_ip)s dev %(ex_device_name)s no_track protocol static
+        8.8.8.0/24 via 19.4.4.4 no_track protocol static
+        %(extra_subnet_cidr)s dev %(ex_device_name)s scope link no_track protocol static
     }
-}"""
+}"""  # noqa: E501 # pylint: disable=line-too-long
 
 
 def get_ovs_bridge(br_name):
@@ -85,17 +89,25 @@ def get_ovs_bridge(br_name):
 
 
 class L3AgentTestFramework(base.BaseSudoTestCase):
-    INTERFACE_DRIVER = OVS_INTERFACE_DRIVER
     NESTED_NAMESPACE_SEPARATOR = '@'
 
     def setUp(self):
-        super(L3AgentTestFramework, self).setUp()
+        super().setUp()
         self.mock_plugin_api = mock.patch(
             'neutron.agent.l3.agent.L3PluginApi').start().return_value
         mock.patch('neutron.agent.rpc.PluginReportStateAPI').start()
+        mock.patch('neutron.agent.common.ovs_lib.'
+                   'OVSBridge._set_port_dead').start()
+        l3_config.register_l3_agent_config_opts(l3_config.OPTS, cfg.CONF)
         self.conf = self._configure_agent('agent1')
+        # NOTE(ralonsoh): this mock can be removed once the backend used for
+        # testing is "threading" and eventlet is removed.
+        self.mock_scserver_wait = mock.patch.object(
+            ha.L3AgentKeepalivedStateChangeServer, 'wait')
+        self.mock_scserver_wait.start()
         self.agent = neutron_l3_agent.L3NATAgentWithStateReport('agent1',
                                                                 self.conf)
+        self.agent.init_host()
 
     def _get_config_opts(self):
         config = cfg.ConfigOpts()
@@ -109,7 +121,6 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
     def _configure_agent(self, host, agent_mode='dvr_snat'):
         conf = self._get_config_opts()
         l3_agent_main.register_opts(conf)
-        conf.set_override('interface_driver', self.INTERFACE_DRIVER)
 
         br_int = self.useFixture(net_helpers.OVSBridgeFixture()).bridge
         conf.set_override('integration_bridge', br_int.br_name, 'OVS')
@@ -128,6 +139,14 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
                           get_temp_file_path('external/pids'))
         conf.set_override('host', host)
         conf.set_override('agent_mode', agent_mode)
+
+        # NOTE(slaweq): iptables_manager module checks this option directly in
+        # the cfg.CONF, not in agent.conf parameter so it has to be override
+        # directly in the cfg.CONF module too
+        cfg.CONF.set_override('debug_iptables_rules', True, group='AGENT')
+
+        # Enable conntrackd to get full test coverage
+        conf.set_override('ha_conntrackd_enabled', True)
 
         return conf
 
@@ -165,6 +184,7 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
                                                   qos_policy_id=qos_policy_id)
 
     def change_router_state(self, router_id, state):
+        LOG.debug("Router %s state changed to '%s'", router_id, state)
         ri = self.agent.router_info.get(router_id)
         if not ri:
             self.fail('Router %s is not present in the L3 agent' % router_id)
@@ -196,13 +216,14 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
         self.addCleanup(netcat.stop_processes)
 
         def assert_num_of_conntrack_rules(n):
-            out = router_ns.netns.execute(["conntrack", "-L",
-                                           "--orig-src", client_address])
+            out = router_ns.netns.execute(
+                ["conntrack", "-L", "--orig-src", client_address],
+                privsep_exec=True)
             self.assertEqual(
                 n, len([line for line in out.strip().split('\n') if line]))
 
         if ha:
-            common_utils.wait_until_true(lambda: router.ha_state == 'master')
+            self.wait_until_ha_router_has_state(router, 'primary')
 
         with self.assert_max_execution_time(100):
             assert_num_of_conntrack_rules(0)
@@ -223,12 +244,11 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
         self.assertTrue(rpc.called)
 
         # Assert that every defined FIP is updated via RPC
-        expected_fips = set([
+        expected_fips = {
             (fip['id'], constants.FLOATINGIP_STATUS_ACTIVE) for fip in
-            router.router[constants.FLOATINGIP_KEY]])
+            router.router[constants.FLOATINGIP_KEY]}
         call = [args[0] for args in rpc.call_args_list][0]
-        actual_fips = set(
-            [(fip_id, status) for fip_id, status in call[2].items()])
+        actual_fips = set(list(call[2].items()))
         self.assertEqual(expected_fips, actual_fips)
 
     def _gateway_check(self, gateway_ip, external_device):
@@ -266,13 +286,27 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
     def _assert_external_device(self, router):
         self.assertTrue(self._check_external_device(router))
 
+    def _wait_until_addr_gen_mode_has_state(
+            self, ns_name, state):
+        ip_wrapper = ip_lib.IPWrapper(namespace=ns_name)
+
+        def _addr_gen_mode_state():
+            addr_gen_mode_state = ip_wrapper.netns.execute(
+                ['sysctl', '-b', 'net.ipv6.conf.all.addr_gen_mode'],
+                privsep_exec=True)
+            return (
+                state == int(addr_gen_mode_state))
+
+        common_utils.wait_until_true(_addr_gen_mode_state)
+
     def _wait_until_ipv6_accept_ra_has_state(
             self, ns_name, device_name, enabled):
         ip_wrapper = ip_lib.IPWrapper(namespace=ns_name)
 
         def _ipv6_accept_ra_state():
-            ra_state = ip_wrapper.netns.execute(['sysctl', '-b',
-                'net.ipv6.conf.%s.accept_ra' % device_name])
+            ra_state = ip_wrapper.netns.execute(
+                ['sysctl', '-b', 'net.ipv6.conf.%s.accept_ra' % device_name],
+                privsep_exec=True)
             return (
                 enabled == (int(ra_state) != constants.ACCEPT_RA_DISABLED))
 
@@ -316,13 +350,13 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
         slaac = constants.IPV6_SLAAC
         slaac_mode = {'ra_mode': slaac, 'address_mode': slaac}
         subnet_modes = [slaac_mode] * 2
-        self._add_internal_interface_by_subnet(router.router,
-            count=2, ip_version=constants.IP_VERSION_6,
+        self._add_internal_interface_by_subnet(
+            router.router, count=2, ip_version=constants.IP_VERSION_6,
             ipv6_subnet_modes=subnet_modes)
         router.process()
 
         if enable_ha:
-            common_utils.wait_until_true(lambda: router.ha_state == 'master')
+            self.wait_until_ha_router_has_state(router, 'primary')
 
             # Keepalived notifies of a state transition when it starts,
             # not when it ends. Thus, we have to wait until keepalived finishes
@@ -382,28 +416,11 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
                 timeout=15)
         return return_copy
 
+    @test_base.unstable_test("bug 1961740")
     def manage_router(self, agent, router):
         self.addCleanup(agent._safe_router_removed, router['id'])
-
-        # NOTE(mangelajo): Neutron functional for l3 don't rely on openvswitch
-        #                  agent tagging ports, and all ports remain untagged
-        #                  during test execution.
-        #                  Workaround related to lp#1767422 plugs new ports as
-        #                  dead vlan (4095) to avoid issues, we need to remove
-        #                  such tag during functional l3 testing.
-        original_plug_new = interface.OVSInterfaceDriver.plug_new
-
-        def new_ovs_plug(self, *args, **kwargs):
-            original_plug_new(self, *args, **kwargs)
-            bridge = (kwargs.get('bridge') or args[4] or
-                      self.conf.OVS.integration_bridge)
-            device_name = kwargs.get('device_name') or args[2]
-            ovsbr = ovs_lib.OVSBridge(bridge)
-            ovsbr.clear_db_attribute('Port', device_name, 'tag')
-
-        with mock.patch(OVS_INTERFACE_DRIVER + '.plug_new', autospec=True) as (
-                ovs_plug):
-            ovs_plug.side_effect = new_ovs_plug
+        with mock.patch.object(dvr_local_router.DvrLocalRouter,
+                               '_load_used_fip_information'):
             agent._process_added_router(router)
 
         return agent.router_info[router['id']]
@@ -433,12 +450,15 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
     def _namespace_exists(self, namespace):
         return ip_lib.network_namespace_exists(namespace)
 
-    def _metadata_proxy_exists(self, conf, router):
-        pm = external_process.ProcessManager(
+    def _metadata_proxy(self, conf, router):
+        return external_process.ProcessManager(
             conf,
             router.router_id,
             router.ns_name,
-            service=metadata_driver.HAPROXY_SERVICE)
+            service=driver_base.HAPROXY_SERVICE)
+
+    def _metadata_proxy_exists(self, conf, router):
+        pm = self._metadata_proxy(conf, router)
         return pm.active
 
     def device_exists_with_ips_and_mac(self, expected_device, name_getter,
@@ -499,23 +519,36 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
         # then the devices and iptable rules have also been deleted,
         # so there's no need to check that explicitly.
         self.assertFalse(self._namespace_exists(router.ns_name))
-        common_utils.wait_until_true(
-            lambda: not self._metadata_proxy_exists(self.agent.conf, router),
-            timeout=10)
+        try:
+            common_utils.wait_until_true(
+                lambda: not self._metadata_proxy_exists(self.agent.conf,
+                                                        router),
+                timeout=10)
+        except common_utils.WaitTimeout:
+            pm = self._metadata_proxy(self.agent.conf, router)
+            pid_file = pm.get_pid_file_name()
+            if os.path.exists(pid_file):
+                msg = 'PID file %s still exists and it should not.' % pid_file
+            else:
+                msg = 'PID file %s is not present.' % pid_file
+            self.fail(msg)
 
-    def _assert_snat_chains(self, router):
-        self.assertFalse(router.iptables_manager.is_chain_empty(
-            'nat', 'snat'))
-        self.assertFalse(router.iptables_manager.is_chain_empty(
-            'nat', 'POSTROUTING'))
+    def _assert_snat_chains(self, router, enable_gw=True):
+        check = self.assertFalse if enable_gw else self.assertTrue
+        check(router.iptables_manager.is_chain_empty('nat', 'snat'))
+        check(router.iptables_manager.is_chain_empty('nat', 'POSTROUTING'))
 
-    def _assert_floating_ip_chains(self, router, snat_bound_fip=False):
+    def _assert_floating_ip_chains(self, router, snat_bound_fip=False,
+                                   enable_gw=True):
         if snat_bound_fip:
-            self.assertFalse(router.snat_iptables_manager.is_chain_empty(
-                'nat', 'float-snat'))
+            if enable_gw:
+                self.assertFalse(router.snat_iptables_manager.is_chain_empty(
+                    'nat', 'float-snat'))
+            else:
+                self.assertIsNone(router.snat_iptables_manager)
 
-        self.assertFalse(router.iptables_manager.is_chain_empty(
-            'nat', 'float-snat'))
+        check = self.assertFalse if enable_gw else self.assertTrue
+        check(router.iptables_manager.is_chain_empty('nat', 'float-snat'))
 
     def _assert_iptables_rules_converged(self, router):
         # if your code is failing on this line, it means you are not generating
@@ -524,8 +557,9 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
         self.assertFalse(router.iptables_manager.apply())
 
     def _assert_metadata_chains(self, router):
-        metadata_port_filter = lambda rule: (
-            str(self.agent.conf.metadata_port) in rule.rule)
+        def metadata_port_filter(rule):
+            return (str(self.agent.conf.metadata_port) in rule.rule)
+
         self.assertTrue(self._get_rule(router.iptables_manager,
                                        'nat',
                                        'PREROUTING',
@@ -542,26 +576,32 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
             self.assertTrue(self.device_exists_with_ips_and_mac(
                 device, router.get_internal_device_name, router.ns_name))
 
-    def _assert_extra_routes(self, router, namespace=None):
+    def _assert_extra_routes(self, router, namespace=None, enable_gw=True):
         if namespace is None:
             namespace = router.ns_name
-        routes = ip_lib.get_routing_table(4, namespace=namespace)
-        routes = [{'nexthop': route['nexthop'],
-                   'destination': route['destination']} for route in routes]
+        routes = ip_lib.list_ip_routes(namespace, constants.IP_VERSION_4)
+        routes = [{'nexthop': route['via'],
+                   'destination': route['cidr']} for route in routes]
 
         for extra_route in router.router['routes']:
-            self.assertIn(extra_route, routes)
+            check = self.assertIn if enable_gw else self.assertNotIn
+            check(extra_route, routes)
 
     def _assert_onlink_subnet_routes(
-            self, router, ip_versions, namespace=None):
+            self, router, ip_versions, namespace=None, enable_gw=True):
         ns_name = namespace or router.ns_name
         routes = []
         for ip_version in ip_versions:
-            _routes = ip_lib.get_routing_table(ip_version,
-                                               namespace=ns_name)
+            _routes = ip_lib.list_ip_routes(ns_name, ip_version)
             routes.extend(_routes)
-        routes = set(route['destination'] for route in routes)
-        extra_subnets = router.get_ex_gw_port()['extra_subnets']
+        routes = {route['cidr'] for route in routes}
+        ex_gw_port = router.get_ex_gw_port()
+        if not ex_gw_port:
+            if not enable_gw:
+                return
+            self.fail('GW port is enabled but not present in the router')
+
+        extra_subnets = ex_gw_port['extra_subnets']
         for extra_subnet in (route['cidr'] for route in extra_subnets):
             self.assertIn(extra_subnet, routes)
 
@@ -581,29 +621,29 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
 
     def _create_router(self, router_info, agent):
 
-        ns_name = "%s%s%s" % (
+        ns_name = "{}{}{}".format(
             'qrouter-' + router_info['id'],
             self.NESTED_NAMESPACE_SEPARATOR, agent.host)
-        ext_name = "qg-%s-%s" % (agent.host, _uuid()[-4:])
-        int_name = "qr-%s-%s" % (agent.host, _uuid()[-4:])
+        ext_name = f"qg-{agent.host}-{_uuid()[-4:]}"
+        int_name = f"qr-{agent.host}-{_uuid()[-4:]}"
 
         get_ns_name = mock.patch.object(
             namespaces.RouterNamespace, '_get_ns_name').start()
         get_ns_name.return_value = ns_name
         get_ext_name = mock.patch.object(l3_router_info.RouterInfo,
-            'get_external_device_name').start()
+                                         'get_external_device_name').start()
         get_ext_name.return_value = ext_name
         get_int_name = mock.patch.object(l3_router_info.RouterInfo,
-            'get_internal_device_name').start()
+                                         'get_internal_device_name').start()
         get_int_name.return_value = int_name
 
         router = self.manage_router(agent, router_info)
 
         router_ext_name = mock.patch.object(router,
-            'get_external_device_name').start()
+                                            'get_external_device_name').start()
         router_ext_name.return_value = get_ext_name.return_value
         router_int_name = mock.patch.object(router,
-            'get_internal_device_name').start()
+                                            'get_internal_device_name').start()
         router_int_name.return_value = get_int_name.return_value
 
         return router
@@ -629,39 +669,52 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
 
         return (router1, router2)
 
-    def _get_master_and_slave_routers(self, router1, router2,
-                                      check_external_device=True):
+    def _get_primary_and_backup_routers(self, router1, router2,
+                                        check_external_device=True):
 
         try:
-            common_utils.wait_until_true(
-                lambda: router1.ha_state == 'master')
+            self.wait_until_ha_router_has_state(router1, 'primary')
             if check_external_device:
                 common_utils.wait_until_true(
                     lambda: self._check_external_device(router1))
-            master_router = router1
-            slave_router = router2
+            primary_router = router1
+            backup_router = router2
         except common_utils.WaitTimeout:
-            common_utils.wait_until_true(
-                lambda: router2.ha_state == 'master')
+            self.wait_until_ha_router_has_state(router2, 'primary')
             if check_external_device:
                 common_utils.wait_until_true(
                     lambda: self._check_external_device(router2))
-            master_router = router2
-            slave_router = router1
+            primary_router = router2
+            backup_router = router1
 
-        common_utils.wait_until_true(
-                lambda: master_router.ha_state == 'master')
+        self.wait_until_ha_router_has_state(primary_router, 'primary')
         if check_external_device:
             common_utils.wait_until_true(
-                lambda: self._check_external_device(master_router))
-        common_utils.wait_until_true(
-            lambda: slave_router.ha_state == 'backup')
-        return master_router, slave_router
+                lambda: self._check_external_device(primary_router))
+        self.wait_until_ha_router_has_state(backup_router, 'backup')
+
+        LOG.debug("Found primary router %s and backup router %s",
+                  primary_router.router_id, backup_router.router_id)
+        return primary_router, backup_router
 
     def fail_ha_router(self, router):
         device_name = router.get_ha_device_name()
+        LOG.debug("Failing HA router %s by setting device %s to DOWN",
+                  router.router_id, device_name)
         ha_device = ip_lib.IPDevice(device_name, router.ha_namespace)
         ha_device.link.set_down()
+
+    @test_base.unstable_test("bug 1956958")
+    def wait_until_ha_router_has_state(self, router, expected_state):
+
+        def router_has_expected_state():
+            state = router.ha_state
+            LOG.debug("Router %s; current state is '%s', "
+                      "expected state is '%s'",
+                      router.router_id, state, expected_state)
+            return state == expected_state
+
+        common_utils.wait_until_true(router_has_expected_state)
 
     @staticmethod
     def fail_gw_router_port(router):
@@ -708,3 +761,26 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
             expected_address, ping_results[1],
             ("Expect to see %s in the reply of ping, but failed" %
              expected_address))
+
+    def _assert_route_in_routes(self, router, expected_route):
+        updated_route = ip_lib.list_ip_routes(
+            router.ns_name,
+            ip_version=constants.IP_VERSION_4, )
+
+        actual_routes = [{key: route[key] for key in expected_route.keys()}
+                         for route in updated_route]
+        self.assertIn(expected_route, actual_routes)
+
+    def _assert_ecmp_route_in_routes(self, router, expected_route):
+        updated_route = ip_lib.list_ip_routes(
+            router.ns_name,
+            ip_version=constants.IP_VERSION_4)
+        routes_actual = [{key: route[key] for key in expected_route.keys()}
+                         for route in updated_route]
+        for entry in routes_actual:
+            if entry['via']:
+                if isinstance(entry['via'], list | tuple):
+                    via_list = [{'via': hop['via']}
+                                for hop in entry['via']]
+                    entry['via'] = sorted(via_list, key=lambda i: i['via'])
+        self.assertIn(expected_route, routes_actual)

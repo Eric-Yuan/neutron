@@ -26,8 +26,8 @@ from neutron.db import agents_db
 from neutron.db import db_base_plugin_v2
 from neutron.extensions import agent
 from neutron.tests.common import helpers
+from neutron.tests.common import test_db_base_plugin_v2
 from neutron.tests.unit.api.v2 import test_base
-from neutron.tests.unit.db import test_db_base_plugin_v2
 
 
 _uuid = uuidutils.generate_uuid
@@ -38,7 +38,7 @@ L3_HOSTB = 'hostb'
 DHCP_HOSTC = 'hostc'
 
 
-class AgentTestExtensionManager(object):
+class AgentTestExtensionManager:
 
     def get_resources(self):
         return agent.Agent.get_resources()
@@ -56,14 +56,13 @@ class TestAgentPlugin(db_base_plugin_v2.NeutronDbPluginV2,
     supported_extension_aliases = [agent_apidef.ALIAS]
 
 
-class AgentDBTestMixIn(object):
+class AgentDBTestMixIn:
 
     def _list_agents(self, expected_res_status=None,
-                     neutron_context=None,
                      query_string=None):
         agent_res = self._list('agents',
-                               neutron_context=neutron_context,
-                               query_params=query_string)
+                               query_params=query_string,
+                               as_admin=True)
         if expected_res_status:
             self.assertEqual(expected_res_status, agent_res.status_int)
         return agent_res
@@ -100,46 +99,43 @@ class AgentDBTestCase(AgentDBTestMixIn,
 
     def setUp(self):
         plugin = 'neutron.tests.unit.extensions.test_agent.TestAgentPlugin'
-        # for these tests we need to enable overlapping ips
-        cfg.CONF.set_default('allow_overlapping_ips', True)
         ext_mgr = AgentTestExtensionManager()
-        super(AgentDBTestCase, self).setUp(plugin=plugin, ext_mgr=ext_mgr)
+        super().setUp(plugin=plugin, ext_mgr=ext_mgr)
         self.adminContext = context.get_admin_context()
 
     def test_create_agent(self):
         data = {'agent': {}}
-        _req = self.new_create_request('agents', data, self.fmt)
-        _req.environ['neutron.context'] = context.Context(
-            '', 'tenant_id')
+        _req = self.new_create_request('agents', data, self.fmt, as_admin=True)
         res = _req.get_response(self.ext_api)
         self.assertEqual(exc.HTTPBadRequest.code, res.status_int)
 
     def test_list_agent(self):
         agents = self._register_agent_states()
-        res = self._list('agents')
+        res = self._list('agents', as_admin=True)
         self.assertEqual(len(agents), len(res['agents']))
 
     def test_show_agent(self):
         self._register_agent_states()
         agents = self._list_agents(
-            query_string='binary=neutron-l3-agent')
+            query_string='binary=' + constants.AGENT_PROCESS_L3)
         self.assertEqual(2, len(agents['agents']))
-        agent = self._show('agents', agents['agents'][0]['id'])
-        self.assertEqual('neutron-l3-agent', agent['agent']['binary'])
+        agent = self._show('agents', agents['agents'][0]['id'], as_admin=True)
+        self.assertEqual(constants.AGENT_PROCESS_L3, agent['agent']['binary'])
 
     def test_update_agent(self):
         self._register_agent_states()
         agents = self._list_agents(
-            query_string='binary=neutron-l3-agent&host=' + L3_HOSTB)
+            query_string=('binary=' + constants.AGENT_PROCESS_L3 +
+                          '&host=' + L3_HOSTB))
         self.assertEqual(1, len(agents['agents']))
         com_id = agents['agents'][0]['id']
-        agent = self._show('agents', com_id)
+        agent = self._show('agents', com_id, as_admin=True)
         new_agent = {}
         new_agent['agent'] = {}
         new_agent['agent']['admin_state_up'] = False
         new_agent['agent']['description'] = 'description'
-        self._update('agents', com_id, new_agent)
-        agent = self._show('agents', com_id)
+        self._update('agents', com_id, new_agent, as_admin=True)
+        agent = self._show('agents', com_id, as_admin=True)
         self.assertFalse(agent['agent']['admin_state_up'])
         self.assertEqual('description', agent['agent']['description'])
 
@@ -148,5 +144,6 @@ class AgentDBTestCase(AgentDBTestMixIn,
         self._register_agent_states()
         time.sleep(1.5)
         agents = self._list_agents(
-            query_string='binary=neutron-l3-agent&host=' + L3_HOSTB)
+            query_string=('binary=' + constants.AGENT_PROCESS_L3 +
+                          '&host=' + L3_HOSTB))
         self.assertFalse(agents['agents'][0]['alive'])

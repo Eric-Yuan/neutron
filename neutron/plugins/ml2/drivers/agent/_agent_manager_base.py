@@ -16,10 +16,8 @@
 
 import abc
 
-import six
 
-
-class NetworkSegment(object):
+class NetworkSegment:
     """Represents a Neutron network segment"""
     def __init__(self, network_type, physical_network, segmentation_id,
                  mtu=None):
@@ -29,8 +27,7 @@ class NetworkSegment(object):
         self.mtu = mtu
 
 
-@six.add_metaclass(abc.ABCMeta)
-class CommonAgentManagerRpcCallBackBase(object):
+class CommonAgentManagerRpcCallBackBase(metaclass=abc.ABCMeta):
     """Base class for managers RPC callbacks.
 
     This class must be inherited by a RPC callback class that is used
@@ -81,8 +78,7 @@ class CommonAgentManagerRpcCallBackBase(object):
         return updated_devices
 
 
-@six.add_metaclass(abc.ABCMeta)
-class CommonAgentManagerBase(object):
+class CommonAgentManagerBase(metaclass=abc.ABCMeta):
     """Base class for managers that are used with the common agent loop.
 
     This class must be inherited by a manager class that is used
@@ -125,9 +121,7 @@ class CommonAgentManagerBase(object):
         This value will be stored in the Plug-in and be part of the
         device_details.
 
-        Typically this list is retrieved from the sysfs. E.g. for linuxbridge
-        it returns all names of devices of type 'tap' that start with a certain
-        prefix.
+        Typically this list is retrieved from the sysfs.
 
         :return: set -- the set of all devices e.g. ['tap1', 'tap2']
         """

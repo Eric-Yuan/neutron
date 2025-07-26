@@ -17,16 +17,21 @@ import abc
 import time
 
 import netaddr
+from neutron_lib.agent.linux import interface
+from neutron_lib.api import converters
 from neutron_lib import constants
 from neutron_lib import exceptions
+from neutron_lib.plugins.ml2 import ovs_constants as ovs_const
 from oslo_log import log as logging
 from oslo_utils import excutils
 from pyroute2.netlink import exceptions as pyroute2_exc
-import six
 
+from neutron._i18n import _
 from neutron.agent.common import ovs_lib
 from neutron.agent.linux import ip_lib
 from neutron.common import utils
+from neutron.conf.plugins.ml2.drivers import ovs_conf
+from neutron.privileged.agent.linux import ethtool
 
 LOG = logging.getLogger(__name__)
 
@@ -36,11 +41,8 @@ def _get_veth(name1, name2, namespace2):
             ip_lib.IPDevice(name2, namespace=namespace2))
 
 
-@six.add_metaclass(abc.ABCMeta)
-class LinuxInterfaceDriver(object):
-
-    DEV_NAME_LEN = constants.LINUX_DEV_LEN
-    DEV_NAME_PREFIX = constants.TAP_DEVICE_PREFIX
+class LinuxInterfaceDriver(interface.LinuxInterfaceDriver,
+                           metaclass=abc.ABCMeta):
 
     def __init__(self, conf, **kwargs):
         self.conf = conf
@@ -186,13 +188,13 @@ class LinuxInterfaceDriver(object):
                              on-link route list
         """
         device = ip_lib.IPDevice(device_name, namespace=namespace)
-        new_onlink_cidrs = set(s['cidr'] for s in extra_subnets or [])
+        new_onlink_cidrs = {s['cidr'] for s in extra_subnets or []}
         preserve_ips = set(preserve_ips if preserve_ips else [])
 
         onlink = device.route.list_onlink_routes(constants.IP_VERSION_4)
         if is_ipv6:
             onlink += device.route.list_onlink_routes(constants.IP_VERSION_6)
-        existing_onlink_cidrs = set(r['cidr'] for r in onlink)
+        existing_onlink_cidrs = {r['cidr'] for r in onlink}
 
         for route in new_onlink_cidrs - existing_onlink_cidrs:
             LOG.debug('Adding onlink route (%s)', route)
@@ -226,7 +228,7 @@ class LinuxInterfaceDriver(object):
 
     def get_ipv6_llas(self, device_name, namespace):
         kwargs = {'family': utils.get_socket_address_family(
-                                constants.IP_VERSION_6),
+            constants.IP_VERSION_6),
                   'scope': 'link'}
         return ip_lib.get_devices_with_ip(namespace, name=device_name,
                                           **kwargs)
@@ -243,8 +245,8 @@ class LinuxInterfaceDriver(object):
         """Configure handling of IPv6 Router Advertisements on an
         interface. See common/constants.py for possible values.
         """
-        cmd = ['net.ipv6.conf.%(dev)s.accept_ra=%(value)s' % {'dev': dev_name,
-                                                              'value': value}]
+        cmd = ['net.ipv6.conf.{dev}.accept_ra={value}'.format(dev=dev_name,
+                                                              value=value)]
         ip_lib.sysctl(cmd, namespace=namespace)
 
     @staticmethod
@@ -256,16 +258,15 @@ class LinuxInterfaceDriver(object):
 
     @abc.abstractmethod
     def plug_new(self, network_id, port_id, device_name, mac_address,
-                 bridge=None, namespace=None, prefix=None, mtu=None,
-                 link_up=True):
+                 bridge=None, namespace=None, prefix=None, mtu=None):
         """Plug in the interface only for new devices that don't exist yet."""
 
     def plug(self, network_id, port_id, device_name, mac_address,
-             bridge=None, namespace=None, prefix=None, mtu=None, link_up=True):
+             bridge=None, namespace=None, prefix=None, mtu=None):
         if not ip_lib.device_exists(device_name,
                                     namespace=namespace):
             self.plug_new(network_id, port_id, device_name, mac_address,
-                          bridge, namespace, prefix, mtu, link_up)
+                          bridge, namespace, prefix, mtu)
         else:
             LOG.info("Device %s already exists", device_name)
             if mtu:
@@ -273,10 +274,6 @@ class LinuxInterfaceDriver(object):
                     device_name, mtu, namespace=namespace, prefix=prefix)
             else:
                 LOG.warning("No MTU configured for port %s", port_id)
-
-    @abc.abstractmethod
-    def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
-        """Unplug the interface."""
 
     @property
     def bridged(self):
@@ -301,21 +298,10 @@ class LinuxInterfaceDriver(object):
             LOG.warning("Interface driver cannot update MTU for ports")
             self._mtu_update_warn_logged = True
 
-    def set_link_status(self, device_name, namespace=None, link_up=True):
-        ns_dev = ip_lib.IPWrapper(namespace=namespace).device(device_name)
-        if not ns_dev.exists():
-            LOG.debug("Device %s may concurrently be deleted.", device_name)
-            return
-        if link_up:
-            ns_dev.link.set_up()
-        else:
-            ns_dev.link.set_down()
-
 
 class NullDriver(LinuxInterfaceDriver):
     def plug_new(self, network_id, port_id, device_name, mac_address,
-                 bridge=None, namespace=None, prefix=None, mtu=None,
-                 link_up=True):
+                 bridge=None, namespace=None, prefix=None, mtu=None):
         pass
 
     def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
@@ -328,7 +314,8 @@ class OVSInterfaceDriver(LinuxInterfaceDriver):
     DEV_NAME_PREFIX = constants.TAP_DEVICE_PREFIX
 
     def __init__(self, conf, **kwargs):
-        super(OVSInterfaceDriver, self).__init__(conf, **kwargs)
+        super().__init__(conf, **kwargs)
+        ovs_conf.register_ovs_agent_opts(self.conf)
         if self.conf.ovs_use_veth:
             self.DEV_NAME_PREFIX = 'ns-'
 
@@ -349,9 +336,59 @@ class OVSInterfaceDriver(LinuxInterfaceDriver):
         ovs = ovs_lib.OVSBridge(bridge)
         ovs.replace_port(device_name, *attrs)
 
+    def _set_device_address(self, device, mac_address):
+        device.link.set_address(mac_address)
+        current_mac = converters.convert_to_sanitized_mac_address(
+            device.link.address)
+        if current_mac != mac_address:
+            msg = _("Failed to set mac address to: %s; "
+                    "Current mac: %s") % (mac_address, current_mac)
+            raise RuntimeError(msg)
+
+    def _ensure_device_address(self, device, mac_address):
+        mac_address = converters.convert_to_sanitized_mac_address(mac_address)
+        for i in range(9):
+            # workaround for the OVS shy port syndrome. ports sometimes
+            # hide for a bit right after they are first created.
+            # see bug/1618987
+            try:
+                self._set_device_address(device, mac_address)
+                return
+            except RuntimeError as e:
+                LOG.warning("Got error trying to set mac, retrying: %s",
+                            str(e))
+                time.sleep(1)
+        # didn't break, we give it one last shot without catching
+        self._set_device_address(device, mac_address)
+
+    def _add_device_to_namespace(self, ip_wrapper, device, namespace):
+        namespace_obj = ip_wrapper.ensure_namespace(namespace)
+        for i in range(9):
+            try:
+                namespace_obj.add_device_to_namespace(device)
+                break
+            except ip_lib.NetworkInterfaceNotFound:
+                # NOTE(slaweq): if the exception was NetworkInterfaceNotFound
+                # then lets try again, otherwise lets simply raise it as this
+                # is some different issue than retry tries to workaround
+                LOG.warning("Failed to set interface %s into namespace %s. "
+                            "Interface not found, attempt: %s, retrying.",
+                            device, namespace, i + 1)
+                time.sleep(1)
+            except utils.WaitTimeout:
+                # NOTE(slaweq): if the exception was WaitTimeout then it means
+                # that probably device wasn't found in the desired namespace
+                # for 5 seconds, so lets try again too
+                LOG.warning("Failed to set interface %s into namespace %s. "
+                            "Interface not found in namespace, attempt: %s, "
+                            "retrying.", device, namespace, i + 1)
+                time.sleep(1)
+        else:
+            # didn't break, we give it one last shot without catching
+            namespace_obj.add_device_to_namespace(device)
+
     def plug_new(self, network_id, port_id, device_name, mac_address,
-                 bridge=None, namespace=None, prefix=None, mtu=None,
-                 link_up=True):
+                 bridge=None, namespace=None, prefix=None, mtu=None):
         """Plug in the interface."""
         if not bridge:
             bridge = self.conf.OVS.integration_bridge
@@ -369,37 +406,41 @@ class OVSInterfaceDriver(LinuxInterfaceDriver):
             root_dev.disable_ipv6()
         else:
             ns_dev = ip.device(device_name)
+        if not ns_dev:
+            LOG.warning("Device %s is not ready in namespace %s!",
+                        device_name, namespace)
 
         internal = not self.conf.ovs_use_veth
         self._ovs_add_port(bridge, tap_name, port_id, mac_address,
                            internal=internal)
-        for i in range(9):
-            # workaround for the OVS shy port syndrome. ports sometimes
-            # hide for a bit right after they are first created.
-            # see bug/1618987
-            try:
-                ns_dev.link.set_address(mac_address)
-                break
-            except RuntimeError as e:
-                LOG.warning("Got error trying to set mac, retrying: %s",
-                            str(e))
-                time.sleep(1)
-        else:
-            # didn't break, we give it one last shot without catching
-            ns_dev.link.set_address(mac_address)
+        try:
+            self._ensure_device_address(ns_dev, mac_address)
+        except Exception:
+            LOG.warning("Failed to set mac for interface %s", ns_dev)
+            with excutils.save_and_reraise_exception():
+                ovs = ovs_lib.OVSBridge(bridge)
+                ovs.delete_port(tap_name)
 
         # Add an interface created by ovs to the namespace.
         if not self.conf.ovs_use_veth and namespace:
             try:
-                namespace_obj = ip.ensure_namespace(namespace)
-                namespace_obj.add_device_to_namespace(ns_dev)
-            except (pyroute2_exc.NetlinkError, OSError):
+                self._add_device_to_namespace(ip, ns_dev, namespace)
+            except (pyroute2_exc.NetlinkError, OSError, RuntimeError):
                 # To prevent the namespace failure from blasting OVS, the OVS
                 # port creation should be reverted. Possible exceptions:
                 # - NetlinkError in case of duplicated interface
                 # - OSError in case of corrupted namespace
+                # - RuntimeError in case of any issue with interface, like e.g.
+                #   Interface not found
                 LOG.warning("Failed to plug interface %s into bridge %s, "
                             "cleaning up", device_name, bridge)
+                with excutils.save_and_reraise_exception():
+                    ovs = ovs_lib.OVSBridge(bridge)
+                    ovs.delete_port(tap_name)
+            except Exception as exc:
+                LOG.warning("Failed to plug interface %s to bridge %s in "
+                            "namespace %s due to unknown reason: %s",
+                            device_name, bridge, namespace, str(exc))
                 with excutils.save_and_reraise_exception():
                     ovs = ovs_lib.OVSBridge(bridge)
                     ovs.delete_port(tap_name)
@@ -413,9 +454,13 @@ class OVSInterfaceDriver(LinuxInterfaceDriver):
         else:
             LOG.warning("No MTU configured for port %s", port_id)
 
-        if link_up:
-            ns_dev.link.set_up()
+        ns_dev.link.set_up()
         if self.conf.ovs_use_veth:
+            # ovs-dpdk does not do checksum calculations for veth interface
+            # (bug 1832021)
+            if self.conf.OVS.datapath_type == ovs_const.OVS_DATAPATH_NETDEV:
+                ethtool.offload(ns_dev.name, rx=False, tx=False,
+                                namespace=namespace)
             root_dev.link.set_up()
 
     def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
@@ -445,52 +490,4 @@ class OVSInterfaceDriver(LinuxInterfaceDriver):
             root_dev.link.set_mtu(mtu)
         else:
             ns_dev = ip_lib.IPWrapper(namespace=namespace).device(device_name)
-        ns_dev.link.set_mtu(mtu)
-
-
-class BridgeInterfaceDriver(LinuxInterfaceDriver):
-    """Driver for creating bridge interfaces."""
-
-    DEV_NAME_PREFIX = 'ns-'
-
-    def plug_new(self, network_id, port_id, device_name, mac_address,
-                 bridge=None, namespace=None, prefix=None, mtu=None,
-                 link_up=True):
-        """Plugin the interface."""
-        ip = ip_lib.IPWrapper()
-
-        # Enable agent to define the prefix
-        tap_name = device_name.replace(prefix or self.DEV_NAME_PREFIX,
-                                       constants.TAP_DEVICE_PREFIX)
-        # Create ns_veth in a namespace if one is configured.
-        root_veth, ns_veth = ip.add_veth(tap_name, device_name,
-                                         namespace2=namespace)
-        root_veth.disable_ipv6()
-        ns_veth.link.set_address(mac_address)
-
-        if mtu:
-            self.set_mtu(device_name, mtu, namespace=namespace, prefix=prefix)
-        else:
-            LOG.warning("No MTU configured for port %s", port_id)
-
-        root_veth.link.set_up()
-        if link_up:
-            ns_veth.link.set_up()
-
-    def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
-        """Unplug the interface."""
-        device = ip_lib.IPDevice(device_name, namespace=namespace)
-        try:
-            device.link.delete()
-            LOG.debug("Unplugged interface '%s'", device_name)
-        except RuntimeError:
-            LOG.error("Failed unplugging interface '%s'",
-                      device_name)
-
-    def set_mtu(self, device_name, mtu, namespace=None, prefix=None):
-        tap_name = device_name.replace(prefix or self.DEV_NAME_PREFIX,
-                                       constants.TAP_DEVICE_PREFIX)
-        root_dev, ns_dev = _get_veth(
-            tap_name, device_name, namespace2=namespace)
-        root_dev.link.set_mtu(mtu)
         ns_dev.link.set_mtu(mtu)

@@ -19,7 +19,6 @@ from neutron_lib import constants as lib_consts
 from neutron_lib.db import constants as db_consts
 from neutron_lib.services.qos import constants as qos_consts
 from oslo_config import cfg
-from oslo_versionedobjects import exception
 
 from neutron import manager
 from neutron.objects.qos import rule_type
@@ -49,7 +48,7 @@ DRIVER_SUPPORTED_PARAMETERS = [
 class QosRuleTypeObjectTestCase(test_base.BaseTestCase):
 
     def setUp(self):
-        super(QosRuleTypeObjectTestCase, self).setUp()
+        super().setUp()
         self.config_parse()
 
         self.setup_coreplugin(load_plugins=False)
@@ -78,18 +77,11 @@ class QosRuleTypeObjectTestCase(test_base.BaseTestCase):
                 qos_consts.RULE_TYPE_BANDWIDTH_LIMIT, rule_type_details.type)
 
     def test_get_objects(self):
-        rule_types_mock = mock.PropertyMock(
-            return_value=set(qos_consts.VALID_RULE_TYPES))
         with mock.patch.object(qos_plugin.QoSPlugin, 'supported_rule_types',
-                               new_callable=rule_types_mock):
+                               return_value=set(qos_consts.VALID_RULE_TYPES)):
             types = rule_type.QosRuleType.get_objects()
             self.assertEqual(sorted(qos_consts.VALID_RULE_TYPES),
                              sorted(type_['type'] for type_ in types))
 
     def test_wrong_type(self):
         self.assertRaises(ValueError, rule_type.QosRuleType, type='bad_type')
-
-    def test_object_version_degradation_less_than_1_3(self):
-        qos_rule_type = rule_type.QosRuleType()
-        self.assertRaises(exception.IncompatibleObjectVersion,
-                          qos_rule_type.obj_to_primitive, '1.2')

@@ -26,13 +26,13 @@ from neutron.tests import base
 
 _uuid = uuidutils.generate_uuid
 
-TENANT_ID = _uuid()
+PROJECT_ID = _uuid()
 LABEL_ID = _uuid()
 ROUTERS = [{'status': 'ACTIVE',
             'name': 'router1',
             'gw_port_id': None,
             'admin_state_up': True,
-            'tenant_id': TENANT_ID,
+            'project_id': PROJECT_ID,
             '_metering_labels': [{'rules': [],
                                   'id': LABEL_ID}],
             'id': _uuid()}]
@@ -41,7 +41,7 @@ ROUTERS_WITH_RULE = [{'status': 'ACTIVE',
                       'name': 'router1',
                       'gw_port_id': None,
                       'admin_state_up': True,
-                      'tenant_id': TENANT_ID,
+                      'project_id': PROJECT_ID,
                       '_metering_labels': [{'rule': {},
                                             'id': LABEL_ID}],
                       'id': _uuid()}]
@@ -50,7 +50,7 @@ ROUTERS_WITH_RULE = [{'status': 'ACTIVE',
 class TestMeteringOperations(base.BaseTestCase):
 
     def setUp(self):
-        super(TestMeteringOperations, self).setUp()
+        super().setUp()
         metering_agent_config.register_metering_agent_opts()
 
         self.noop_driver = ('neutron.services.metering.drivers.noop.'
@@ -58,6 +58,7 @@ class TestMeteringOperations(base.BaseTestCase):
         cfg.CONF.set_override('driver', 'noop')
         cfg.CONF.set_override('measure_interval', 0)
         cfg.CONF.set_override('report_interval', 0)
+        cfg.CONF.set_override('granular_traffic_data', False)
 
         self.setup_notification_driver()
 
@@ -117,14 +118,12 @@ class TestMeteringOperations(base.BaseTestCase):
         self.agent._metering_loop()
 
         self.assertNotEqual(len(fake_notifier.NOTIFICATIONS), 0)
-        for n in fake_notifier.NOTIFICATIONS:
-            if n['event_type'] == 'l3.meter':
-                break
+        l3_meter_events = [n for n in fake_notifier.NOTIFICATIONS
+                           if n['event_type'] == 'l3.meter']
+        self.assertEqual(len(l3_meter_events), 1)
 
-        self.assertEqual('l3.meter', n['event_type'])
-
-        payload = n['payload']
-        self.assertEqual(TENANT_ID, payload['tenant_id'])
+        payload = l3_meter_events[0]['payload']
+        self.assertEqual(PROJECT_ID, payload['project_id'])
         self.assertEqual(LABEL_ID, payload['label_id'])
         self.assertEqual(88, payload['pkts'])
         self.assertEqual(444, payload['bytes'])
@@ -144,7 +143,9 @@ class TestMeteringOperations(base.BaseTestCase):
 
         cfg.CONF.set_override('measure_interval', measure_interval)
         cfg.CONF.set_override('report_interval', report_interval)
+        cfg.CONF.set_override('granular_traffic_data', False)
 
+        l3_meter_event = None
         for i in range(report_interval):
             self.agent._metering_loop()
             count = 0
@@ -155,14 +156,15 @@ class TestMeteringOperations(base.BaseTestCase):
                         # skip the first notification because the time is 0
                         count += 1
                         if count > 1:
+                            l3_meter_event = n
                             break
 
             time_fixture.advance_time_seconds(measure_interval)
 
-        self.assertEqual('l3.meter', n['event_type'])
+        self.assertIsNotNone(l3_meter_event)
 
-        payload = n['payload']
-        self.assertEqual(TENANT_ID, payload['tenant_id'])
+        payload = l3_meter_event['payload']
+        self.assertEqual(PROJECT_ID, payload['project_id'])
         self.assertEqual(LABEL_ID, payload['label_id'])
         self.assertLess((payload['time'] - report_interval),
                         measure_interval, payload)
@@ -173,9 +175,11 @@ class TestMeteringOperations(base.BaseTestCase):
     def test_router_deleted(self):
         label_id = _uuid()
         self.driver.get_traffic_counters = mock.MagicMock()
-        self.driver.get_traffic_counters.return_value = {label_id:
-                                                         {'pkts': 44,
-                                                          'bytes': 222}}
+
+        expected_traffic_counters = {'pkts': 44, 'bytes': 222}
+        self.driver.get_traffic_counters.return_value = {
+            label_id: expected_traffic_counters}
+
         self.agent._add_metering_info = mock.MagicMock()
 
         self.agent.routers_updated(None, ROUTERS)
@@ -184,7 +188,8 @@ class TestMeteringOperations(base.BaseTestCase):
         self.assertEqual(1, self.agent._add_metering_info.call_count)
         self.assertEqual(1, self.driver.remove_router.call_count)
 
-        self.agent._add_metering_info.assert_called_with(label_id, 44, 222)
+        self.agent._add_metering_info.assert_called_with(
+            label_id, expected_traffic_counters)
 
     @mock.patch('time.time')
     def _test_purge_metering_info(self, current_timestamp, is_empty,
@@ -209,16 +214,18 @@ class TestMeteringOperations(base.BaseTestCase):
     def _test_add_metering_info(self, expected_info, current_timestamp,
                                 mock_time):
         mock_time.return_value = current_timestamp
-        actual_info = self.agent._add_metering_info('fake_label_id', 1, 1)
+        actual_info = self.agent._add_metering_info(
+            'fake_label_id', expected_info)
+
         self.assertEqual(1, len(self.agent.metering_infos))
         self.assertEqual(expected_info, actual_info)
         self.assertEqual(expected_info,
                          self.agent.metering_infos['fake_label_id'])
         self.assertEqual(1, mock_time.call_count)
 
-    def test_add_metering_info_create(self):
+    def test_add_metering_info_create_no_granular_traffic_counters(self):
         expected_info = {'bytes': 1, 'pkts': 1, 'time': 0, 'first_update': 1,
-                         'last_update': 1}
+                         'last_update': 1, 'traffic-counter-granularity': None}
         self._test_add_metering_info(expected_info, 1)
 
     def test_add_metering_info_update(self):
@@ -236,7 +243,7 @@ class TestMeteringOperations(base.BaseTestCase):
 
 class TestMeteringDriver(base.BaseTestCase):
     def setUp(self):
-        super(TestMeteringDriver, self).setUp()
+        super().setUp()
         metering_agent_config.register_metering_agent_opts()
 
         cfg.CONF.set_override('driver', 'noop')

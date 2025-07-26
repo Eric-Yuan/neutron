@@ -14,14 +14,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import segment
 from neutron_lib.db import constants as db_const
 from neutron_lib.db import model_base
+from neutron_lib.db import standard_attr
 import sqlalchemy as sa
 from sqlalchemy import orm
 
 from neutron.db import models_v2
-from neutron.db import standard_attr
-from neutron.extensions import segment
 
 
 # Some standalone plugins need a DB table to store provider
@@ -49,9 +49,20 @@ class NetworkSegment(standard_attr.HasStandardAttributes,
                      nullable=True)
     network = orm.relationship(models_v2.Network,
                                backref=orm.backref("segments",
-                                                   lazy='subquery',
+                                                   lazy='selectin',
                                                    cascade='delete'))
-    api_collections = [segment.SEGMENTS]
+    api_collections = [segment.COLLECTION_NAME]
+
+    __table_args__ = (
+        sa.UniqueConstraint(
+            network_id,
+            network_type,
+            physical_network,
+            segment_index,
+            name='uniq_networksegment0network_id0'
+                 'network_type0physnet0sidx'),
+        model_base.BASEV2.__table_args__
+    )
 
 
 class SegmentHostMapping(model_base.BASEV2):
@@ -60,11 +71,9 @@ class SegmentHostMapping(model_base.BASEV2):
                            sa.ForeignKey('networksegments.id',
                                          ondelete="CASCADE"),
                            primary_key=True,
-                           index=True,
                            nullable=False)
     host = sa.Column(sa.String(255),
                      primary_key=True,
-                     index=True,
                      nullable=False)
 
     # Add a relationship to the NetworkSegment model in order to instruct
@@ -72,6 +81,6 @@ class SegmentHostMapping(model_base.BASEV2):
     network_segment = orm.relationship(
         NetworkSegment, load_on_pending=True,
         backref=orm.backref("segment_host_mapping",
-                            lazy='subquery',
+                            lazy='selectin',
                             cascade='delete'))
     revises_on_change = ('network_segment', )

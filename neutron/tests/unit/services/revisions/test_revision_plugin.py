@@ -13,6 +13,7 @@
 #    under the License.
 #
 
+from neutron_lib import constants as n_const
 from neutron_lib import context as nctx
 from neutron_lib.db import api as db_api
 from neutron_lib.plugins import constants
@@ -24,7 +25,6 @@ from sqlalchemy.orm import session as se
 from webob import exc
 
 from neutron.db import models_v2
-from neutron.objects import ports as port_obj
 from neutron.tests.unit.plugins.ml2 import test_plugin
 
 
@@ -36,7 +36,7 @@ class TestRevisionPlugin(test_plugin.Ml2PluginV2TestCase):
     _extension_drivers = ['qos']
 
     def get_additional_service_plugins(self):
-        p = super(TestRevisionPlugin, self).get_additional_service_plugins()
+        p = super().get_additional_service_plugins()
         p.update({'revision_plugin_name': 'revisions',
                   'qos_plugin_name': 'qos',
                   'tag_name': 'tag'})
@@ -46,7 +46,7 @@ class TestRevisionPlugin(test_plugin.Ml2PluginV2TestCase):
         cfg.CONF.set_override('extension_drivers',
                               self._extension_drivers,
                               group='ml2')
-        super(TestRevisionPlugin, self).setUp()
+        super().setUp()
         self.cp = directory.get_plugin()
         self.l3p = directory.get_plugin(constants.L3)
         self._ctx = nctx.get_admin_context()
@@ -59,7 +59,7 @@ class TestRevisionPlugin(test_plugin.Ml2PluginV2TestCase):
         # the new engine facade is resulting in changes being spread over
         # other sessions so we can end up getting stale reads in the parent
         # session if objects remain in the identity map.
-        if not self._ctx.session.is_active:
+        if not db_api.is_session_active(self._ctx.session):
             self._ctx.session.expire_all()
         return self._ctx
 
@@ -67,10 +67,7 @@ class TestRevisionPlugin(test_plugin.Ml2PluginV2TestCase):
         rp = directory.get_plugin('revision_plugin')
         with self.port():
             with db_api.CONTEXT_WRITER.using(self.ctx):
-                ipal_objs = port_obj.IPAllocation.get_objects(self.ctx)
-                if not ipal_objs:
-                    raise Exception("No IP allocations available.")
-                ipal_obj = ipal_objs[0]
+                ipal = self.ctx.session.query(models_v2.IPAllocation).first()
                 # load port into our session
                 port = self.ctx.session.query(models_v2.Port).one()
                 # simulate concurrent delete in another session
@@ -86,7 +83,7 @@ class TestRevisionPlugin(test_plugin.Ml2PluginV2TestCase):
                 self.ctx.session.expire(port)
 
                 collected = rp._collect_related_tobump(
-                    self.ctx.session, [ipal_obj], set())
+                    self.ctx.session, [ipal], set())
                 rp._bump_obj_revisions(
                     self.ctx.session, collected, version_check=False)
 
@@ -97,7 +94,7 @@ class TestRevisionPlugin(test_plugin.Ml2PluginV2TestCase):
         # with the flush process that occurs with these two connected objects,
         # creating two copies of the Network object in the Session and putting
         # it into an invalid state.
-        with self.network(shared=True):
+        with self.network(shared=True, as_admin=True):
             pass
 
     def test_port_name_update_revises(self):
@@ -143,20 +140,35 @@ class TestRevisionPlugin(test_plugin.Ml2PluginV2TestCase):
         # update
         with self.port() as port:
             rev = port['port']['revision_number']
-            new = {'port': {'name': 'nigiri'}}
 
             def concurrent_increment(s):
                 db_api.sqla_remove(se.Session, 'before_commit',
                                    concurrent_increment)
                 # slip in a concurrent update that will bump the revision
                 plugin = directory.get_plugin()
+                new = {'port': {'name': 'nigiri'}}
                 plugin.update_port(nctx.get_admin_context(),
                                    port['port']['id'], new)
                 raise db_exc.DBDeadlock()
             db_api.sqla_listen(se.Session, 'before_commit',
                                concurrent_increment)
+
+            # Despite the revision number is bumped twice during the session
+            # transaction, the revision number is tested only once the first
+            # time the revision number service is executed for this session and
+            # object.
+            new = {'port': {'name': 'sushi'}}
             self._update('ports', port['port']['id'], new,
                          headers={'If-Match': 'revision_number=%s' % rev},
+                         expected_code=exc.HTTPOk.code)
+            new = {'port': {'name': 'salmon'}}
+            self._update('ports', port['port']['id'], new,
+                         headers={'If-Match': 'revision_number=%s' %
+                                              str(int(rev) + 2)},
+                         expected_code=exc.HTTPOk.code)
+            new = {'port': {'name': 'tea'}}
+            self._update('ports', port['port']['id'], new,
+                         headers={'If-Match': 'revision_number=1'},
                          expected_code=exc.HTTPPreconditionFailed.code)
 
     def test_port_ip_update_revises(self):
@@ -178,6 +190,22 @@ class TestRevisionPlugin(test_plugin.Ml2PluginV2TestCase):
             new_rev = response['port']['revision_number']
             self.assertGreater(new_rev, rev)
 
+    def test_network_description_bumps_revision(self):
+        with self.network() as net:
+            rev = net['network']['revision_number']
+            data = {'network': {'description': 'Test Description'}}
+            response = self._update('networks', net['network']['id'], data)
+            new_rev = response['network']['revision_number']
+            self.assertEqual(rev + 1, new_rev)
+
+    def test_subnet_description_bumps_revision(self):
+        with self.subnet() as subnet:
+            rev = subnet['subnet']['revision_number']
+            data = {'subnet': {'description': 'Test Description'}}
+            response = self._update('subnets', subnet['subnet']['id'], data)
+            new_rev = response['subnet']['revision_number']
+            self.assertEqual(rev + 1, new_rev)
+
     def test_security_group_rule_ops_bump_security_group(self):
         s = {'security_group': {'tenant_id': 'some_tenant', 'name': '',
                                 'description': 's'}}
@@ -189,9 +217,10 @@ class TestRevisionPlugin(test_plugin.Ml2PluginV2TestCase):
         r = {'security_group_rule': {'tenant_id': 'some_tenant',
                                      'port_range_min': 80, 'protocol': 6,
                                      'port_range_max': 90,
-                                     'remote_ip_prefix': '0.0.0.0/0',
+                                     'remote_ip_prefix': n_const.IPv4_ANY,
                                      'ethertype': 'IPv4',
                                      'remote_group_id': None,
+                                     'remote_address_group_id': None,
                                      'direction': 'ingress',
                                      'security_group_id': sg['id']}}
         rule = self.cp.create_security_group_rule(self.ctx, r)
@@ -250,7 +279,8 @@ class TestRevisionPlugin(test_plugin.Ml2PluginV2TestCase):
                                      'project_id': uuidutils.generate_uuid()}}
             qos_obj = qos_plugin.create_policy(self.ctx, qos_policy)
             data = {'port': {'qos_policy_id': qos_obj['id']}}
-            response = self._update('ports', port['port']['id'], data)
+            response = self._update('ports', port['port']['id'], data,
+                                    as_admin=True)
             new_rev = response['port']['revision_number']
             self.assertGreater(new_rev, rev)
 
@@ -263,7 +293,8 @@ class TestRevisionPlugin(test_plugin.Ml2PluginV2TestCase):
                                      'project_id': uuidutils.generate_uuid()}}
             qos_obj = qos_plugin.create_policy(self.ctx, qos_policy)
             data = {'network': {'qos_policy_id': qos_obj['id']}}
-            response = self._update('networks', network['network']['id'], data)
+            response = self._update('networks', network['network']['id'], data,
+                                    as_admin=True)
             new_rev = response['network']['revision_number']
             self.assertGreater(new_rev, rev)
 

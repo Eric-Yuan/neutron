@@ -16,7 +16,6 @@
 import functools
 
 import netaddr
-import six
 
 from neutron_lib.api.definitions import network as net_def
 from neutron_lib.api.definitions import port as port_def
@@ -35,6 +34,7 @@ from oslo_log import log as logging
 from sqlalchemy.orm import exc
 
 from neutron.db import models_v2
+from neutron.db import rbac_db_models
 from neutron.objects import base as base_obj
 from neutron.objects import ports as port_obj
 from neutron.objects import subnet as subnet_obj
@@ -50,10 +50,9 @@ def convert_result_to_dict(f):
 
         if result is None:
             return None
-        elif isinstance(result, list):
+        if isinstance(result, list):
             return [r.to_dict() for r in result]
-        else:
-            return result.to_dict()
+        return result.to_dict()
     return inner
 
 
@@ -69,11 +68,12 @@ def filter_fields(f):
             except (IndexError, ValueError):
                 return result
 
-        do_filter = lambda d: {k: v for k, v in d.items() if k in fields}
+        def _do_filter(d):
+            return {k: v for k, v in d.items() if k in fields}
+
         if isinstance(result, list):
-            return [do_filter(obj) for obj in result]
-        else:
-            return do_filter(result)
+            return [_do_filter(obj) for obj in result]
+        return _do_filter(result)
     return inner_filter
 
 
@@ -84,15 +84,14 @@ def make_result_with_fields(f):
         result = f(*args, **kwargs)
         if fields is None:
             return result
-        elif isinstance(result, list):
+        if isinstance(result, list):
             return [db_utils.resource_fields(r, fields) for r in result]
-        else:
-            return db_utils.resource_fields(result, fields)
+        return db_utils.resource_fields(result, fields)
 
     return inner
 
 
-class DbBasePluginCommon(object):
+class DbBasePluginCommon:
     """Stores getters and helper methods for db_base_plugin_v2
 
     All private getters and simple helpers like _make_*_dict were moved from
@@ -105,7 +104,7 @@ class DbBasePluginCommon(object):
     @staticmethod
     def _generate_macs(mac_count=1):
         mac_maker = net.random_mac_generator(cfg.CONF.base_mac.split(':'))
-        return [six.next(mac_maker) for x in range(mac_count)]
+        return [next(mac_maker) for x in range(mac_count)]
 
     @db_api.CONTEXT_READER
     def _is_mac_in_use(self, context, network_id, mac_address):
@@ -144,6 +143,11 @@ class DbBasePluginCommon(object):
         allocated.create()
 
     def _make_subnet_dict(self, subnet, fields=None, context=None):
+        if isinstance(subnet, subnet_obj.Subnet):
+            standard_attr_id = subnet.db_obj.standard_attr_id
+        else:
+            standard_attr_id = subnet.standard_attr_id
+
         res = {'id': subnet['id'],
                'name': subnet['name'],
                'tenant_id': subnet['tenant_id'],
@@ -153,9 +157,10 @@ class DbBasePluginCommon(object):
                'enable_dhcp': subnet['enable_dhcp'],
                'ipv6_ra_mode': subnet['ipv6_ra_mode'],
                'ipv6_address_mode': subnet['ipv6_address_mode'],
+               'standard_attr_id': standard_attr_id,
                }
         res['gateway_ip'] = str(
-                subnet['gateway_ip']) if subnet['gateway_ip'] else None
+            subnet['gateway_ip']) if subnet['gateway_ip'] is not None else None
         # TODO(korzen) this method can get subnet as DB object or Subnet OVO,
         # so temporary workaround will be to fill in the fields in separate
         # ways. After converting all code pieces to use Subnet OVO, the latter
@@ -163,7 +168,7 @@ class DbBasePluginCommon(object):
         if isinstance(subnet, subnet_obj.Subnet):
             res['cidr'] = str(subnet.cidr)
             res['allocation_pools'] = [{'start': str(pool.start),
-                                       'end': str(pool.end)}
+                                        'end': str(pool.end)}
                                        for pool in subnet.allocation_pools]
             res['host_routes'] = [{'destination': str(route.destination),
                                    'nexthop': str(route.nexthop)}
@@ -177,7 +182,7 @@ class DbBasePluginCommon(object):
         else:
             res['cidr'] = subnet['cidr']
             res['allocation_pools'] = [{'start': pool['first_ip'],
-                                       'end': pool['last_ip']}
+                                        'end': pool['last_ip']}
                                        for pool in subnet['allocation_pools']]
             res['host_routes'] = [{'destination': route['destination'],
                                    'nexthop': route['nexthop']}
@@ -218,7 +223,15 @@ class DbBasePluginCommon(object):
 
     def _make_port_dict(self, port, fields=None,
                         process_extensions=True,
-                        with_fixed_ips=True):
+                        with_fixed_ips=True,
+                        bulk=False):
+        if isinstance(port, port_obj.Port):
+            port_data = port.db_obj
+            standard_attr_id = port.db_obj.standard_attr_id
+        else:
+            port_data = port
+            standard_attr_id = port.standard_attr_id
+
         mac = port["mac_address"]
         if isinstance(mac, netaddr.EUI):
             mac.dialect = netaddr.mac_unix_expanded
@@ -230,7 +243,9 @@ class DbBasePluginCommon(object):
                "admin_state_up": port["admin_state_up"],
                "status": port["status"],
                "device_id": port["device_id"],
-               "device_owner": port["device_owner"]}
+               "device_owner": port["device_owner"],
+               'standard_attr_id': standard_attr_id,
+               }
         if with_fixed_ips:
             res["fixed_ips"] = [
                 {'subnet_id': ip["subnet_id"],
@@ -238,13 +253,13 @@ class DbBasePluginCommon(object):
                      ip["ip_address"])} for ip in port["fixed_ips"]]
         # Call auxiliary extend functions, if any
         if process_extensions:
-            port_data = port
-            if isinstance(port, port_obj.Port):
-                port_data = port.db_obj
+            res['bulk'] = bulk
             resource_extend.apply_funcs(
                 port_def.COLLECTION_NAME, res, port_data)
+            res.pop('bulk')
         return db_utils.resource_fields(res, fields)
 
+    @db_api.CONTEXT_READER
     def _get_network(self, context, id):
         try:
             network = model_query.get_by_id(context, models_v2.Network, id)
@@ -252,14 +267,11 @@ class DbBasePluginCommon(object):
             raise exceptions.NetworkNotFound(net_id=id)
         return network
 
-    def _get_subnet(self, context, id):
-        # TODO(slaweq): remove this method when all will be switched to use OVO
-        # objects only
-        try:
-            subnet = model_query.get_by_id(context, models_v2.Subnet, id)
-        except exc.NoResultFound:
-            raise exceptions.SubnetNotFound(subnet_id=id)
-        return subnet
+    @db_api.CONTEXT_READER
+    def _network_exists(self, context, network_id):
+        query = model_query.query_with_hooks(
+            context, models_v2.Network, field='id')
+        return query.filter(models_v2.Network.id == network_id).first()
 
     def _get_subnet_object(self, context, id):
         subnet = subnet_obj.Subnet.get_object(context, id=id)
@@ -274,9 +286,11 @@ class DbBasePluginCommon(object):
             raise exceptions.SubnetPoolNotFound(subnetpool_id=id)
         return subnetpool
 
-    def _get_port(self, context, id):
+    @db_api.CONTEXT_READER
+    def _get_port(self, context, id, lazy_fields=None):
         try:
-            port = model_query.get_by_id(context, models_v2.Port, id)
+            port = model_query.get_by_id(context, models_v2.Port, id,
+                                         lazy_fields=lazy_fields)
         except exc.NoResultFound:
             raise exceptions.PortNotFound(port_id=id)
         return port
@@ -284,11 +298,6 @@ class DbBasePluginCommon(object):
     def _get_route_by_subnet(self, context, subnet_id):
         return subnet_obj.Route.get_objects(context,
                                             subnet_id=subnet_id)
-
-    def _get_router_gw_ports_by_network(self, context, network_id):
-        return port_obj.Port.get_objects(
-            context, network_id=network_id,
-            device_owner=constants.DEVICE_OWNER_ROUTER_GW)
 
     @db_api.CONTEXT_READER
     def _get_subnets_by_network(self, context, network_id):
@@ -320,7 +329,8 @@ class DbBasePluginCommon(object):
                'mtu': network.get('mtu', constants.DEFAULT_NETWORK_MTU),
                'status': network['status'],
                'subnets': [subnet['id']
-                           for subnet in network['subnets']]}
+                           for subnet in network['subnets']],
+               'standard_attr_id': network.standard_attr_id}
         res['shared'] = self._is_network_shared(context, network.rbac_entries)
         # Call auxiliary extend functions, if any
         if process_extensions:
@@ -332,8 +342,8 @@ class DbBasePluginCommon(object):
         # is shared to the calling tenant via an RBAC entry.
         matches = ('*',) + ((context.tenant_id,) if context else ())
         for entry in rbac_entries:
-            if (entry.action == 'access_as_shared' and
-                    entry.target_tenant in matches):
+            if (entry.action == rbac_db_models.ACCESS_SHARED and
+                    entry.target_project in matches):
                 return True
         return False
 

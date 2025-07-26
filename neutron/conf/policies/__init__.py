@@ -10,28 +10,34 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import importlib
 import inspect
 import itertools
 
-import six
-
+from neutron.conf.policies import address_group
 from neutron.conf.policies import address_scope
 from neutron.conf.policies import agent
 from neutron.conf.policies import auto_allocated_topology
 from neutron.conf.policies import availability_zone
 from neutron.conf.policies import base
+from neutron.conf.policies import default_security_group_rules
 from neutron.conf.policies import flavor
 from neutron.conf.policies import floatingip
 from neutron.conf.policies import floatingip_pools
 from neutron.conf.policies import floatingip_port_forwarding
 from neutron.conf.policies import l3_conntrack_helper
+from neutron.conf.policies import local_ip
+from neutron.conf.policies import local_ip_association
 from neutron.conf.policies import logging
 from neutron.conf.policies import metering
+from neutron.conf.policies import ndp_proxy
 from neutron.conf.policies import network
 from neutron.conf.policies import network_ip_availability
 from neutron.conf.policies import network_segment_range
 from neutron.conf.policies import port
+from neutron.conf.policies import port_bindings
 from neutron.conf.policies import qos
+from neutron.conf.policies import quotas
 from neutron.conf.policies import rbac
 from neutron.conf.policies import router
 from neutron.conf.policies import security_group
@@ -45,22 +51,29 @@ from neutron.conf.policies import trunk
 def list_rules():
     return itertools.chain(
         base.list_rules(),
+        address_group.list_rules(),
         address_scope.list_rules(),
         agent.list_rules(),
         auto_allocated_topology.list_rules(),
         availability_zone.list_rules(),
+        default_security_group_rules.list_rules(),
         flavor.list_rules(),
         floatingip.list_rules(),
         floatingip_pools.list_rules(),
         floatingip_port_forwarding.list_rules(),
         l3_conntrack_helper.list_rules(),
+        local_ip.list_rules(),
+        local_ip_association.list_rules(),
         logging.list_rules(),
         metering.list_rules(),
+        ndp_proxy.list_rules(),
         network.list_rules(),
         network_ip_availability.list_rules(),
         network_segment_range.list_rules(),
+        port_bindings.list_rules(),
         port.list_rules(),
         qos.list_rules(),
+        quotas.list_rules(),
         rbac.list_rules(),
         router.list_rules(),
         security_group.list_rules(),
@@ -78,4 +91,4 @@ def reload_default_policies():
                 module.__name__.startswith(__package__)):
             # NOTE: pylint checks function args wrongly.
             # pylint: disable=too-many-function-args
-            six.moves.reload_module(module)
+            importlib.reload(module)

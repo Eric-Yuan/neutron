@@ -23,7 +23,7 @@ from neutron.services import provider_configuration as pconf
 LOG = logging.getLogger(__name__)
 
 
-class ServiceTypeManager(object):
+class ServiceTypeManager:
     """Manage service type objects in Neutron."""
 
     _instance = None
@@ -47,8 +47,7 @@ class ServiceTypeManager(object):
             return list(chain.from_iterable(
                 self.config[svc_type].get_service_providers(filters, fields)
                 for svc_type in filters['service_type']
-                if svc_type in self.config)
-            )
+                if svc_type in self.config))
         return list(
             chain.from_iterable(
                 self.config[p].get_service_providers(filters, fields)

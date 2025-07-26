@@ -23,6 +23,8 @@ from oslo_config import cfg
 from neutron._i18n import _
 from neutron.api import extensions
 from neutron.api.v2 import resource
+from neutron.db.quota import driver
+from neutron.db.quota import driver_nolock
 from neutron.extensions import quotasv2
 from neutron.quota import resource_registry
 
@@ -32,7 +34,11 @@ RESOURCE_NAME = 'quota'
 ALIAS = RESOURCE_NAME + '_' + DETAIL_QUOTAS_ACTION
 QUOTA_DRIVER = cfg.CONF.QUOTAS.quota_driver
 RESOURCE_COLLECTION = RESOURCE_NAME + "s"
-DB_QUOTA_DRIVER = 'neutron.db.quota.driver.DbQuotaDriver'
+DB_QUOTA_DRIVERS = tuple('.'.join([klass.__module__, klass.__name__])
+                         for klass in (driver.DbQuotaDriver,
+                                       driver_nolock.DbQuotaNoLockDriver,
+                                       )
+                         )
 EXTENDED_ATTRIBUTES_2_0 = {
     RESOURCE_COLLECTION: {}
 }
@@ -40,17 +46,17 @@ EXTENDED_ATTRIBUTES_2_0 = {
 
 class DetailQuotaSetsController(quotasv2.QuotaSetsController):
 
-    def _get_detailed_quotas(self, request, tenant_id):
-        return self._driver.get_detailed_tenant_quotas(
+    def _get_detailed_quotas(self, request, project_id):
+        return self._driver.get_detailed_project_quotas(
             request.context,
-            resource_registry.get_all_resources(), tenant_id)
+            resource_registry.get_all_resources(), project_id)
 
     def details(self, request, id):
         if id != request.context.project_id:
             # Check if admin
             if not request.context.is_admin:
-                reason = _("Only admin is authorized to access quotas for"
-                           " another tenant")
+                reason = _("Only admin is authorized to access quotas for "
+                           "another project")
                 raise n_exc.AdminRequired(reason=reason)
         return {self._resource_name:
                 self._get_detailed_quotas(request, id)}
@@ -61,8 +67,7 @@ class Quotasv2_detail(api_extensions.ExtensionDescriptor):
 
     # Ensure new extension is not loaded with old conf driver.
     extensions.register_custom_supported_check(
-        ALIAS, lambda: QUOTA_DRIVER == DB_QUOTA_DRIVER,
-        plugin_agnostic=True)
+        ALIAS, lambda: QUOTA_DRIVER in DB_QUOTA_DRIVERS, plugin_agnostic=True)
 
     @classmethod
     def get_name(cls):
@@ -90,7 +95,8 @@ class Quotasv2_detail(api_extensions.ExtensionDescriptor):
             RESOURCE_COLLECTION,
             controller,
             member_actions={'details': 'GET'},
-            collection_actions={'tenant': 'GET'})]
+            collection_actions={'tenant': 'GET',
+                                'project': 'GET'})]
 
     def get_extended_resources(self, version):
         return EXTENDED_ATTRIBUTES_2_0 if version == "2.0" else {}

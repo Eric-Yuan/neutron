@@ -42,7 +42,7 @@ class ConntrackHelperExtensionBaseTestCase(
         test_agent.BasicRouterOperationsFramework):
 
     def setUp(self):
-        super(ConntrackHelperExtensionBaseTestCase, self).setUp()
+        super().setUp()
 
         self.cth_ext = cth.ConntrackHelperAgentExtension()
 
@@ -99,7 +99,7 @@ class ConntrackHelperExtensionInitializeTestCase(
 class ConntrackHelperExtensionTestCase(ConntrackHelperExtensionBaseTestCase):
 
     def setUp(self):
-        super(ConntrackHelperExtensionTestCase, self).setUp()
+        super().setUp()
         self.cth_ext.initialize(
             self.connection, constants.L3_AGENT_MODE)
         self._set_bulk_pull_mock()
@@ -158,7 +158,7 @@ class ConntrackHelperExtensionTestCase(ConntrackHelperExtensionBaseTestCase):
 
     @mock.patch.object(iptables_manager.IptablesTable, 'add_rule')
     @mock.patch.object(iptables_manager.IptablesTable, 'add_chain')
-    def test_update_roter(self, mock_add_chain, mock_add_rule):
+    def test_update_router(self, mock_add_chain, mock_add_rule):
         self.cth_ext.add_router(self.context, self.router)
         mock_add_chain.reset_mock()
         mock_add_rule.reset_mock()
@@ -228,7 +228,7 @@ class ConntrackHelperExtensionTestCase(ConntrackHelperExtensionBaseTestCase):
 
 class ConntrackHelperMappingTestCase(base.BaseTestCase):
     def setUp(self):
-        super(ConntrackHelperMappingTestCase, self).setUp()
+        super().setUp()
         self.mapping = cth.ConntrackHelperMapping()
         self.router1 = uuidutils.generate_uuid()
         self.router2 = uuidutils.generate_uuid()

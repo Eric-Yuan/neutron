@@ -14,14 +14,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.plugins.ml2 import ovs_constants as ovs_consts
+from os_ken.lib.packet import arp
+from os_ken.lib.packet import ether_types
 from oslo_log import log as logging
 from oslo_utils import excutils
 
 from neutron._i18n import _
 from neutron.agent.common import ovs_lib
 from neutron.common import ipv6_utils
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants \
-        as ovs_consts
 from neutron.plugins.ml2.drivers.openvswitch.agent.openflow \
     import br_cookie
 from neutron.plugins.ml2.drivers.openvswitch.agent.openflow.native \
@@ -71,14 +72,8 @@ class OVSAgentBridge(ofswitch.OpenFlowSwitchMixin,
                     self._cached_dpid = new_dpid
 
     def setup_controllers(self, conf):
-        url = ipv6_utils.valid_ipv6_url(conf.OVS.of_listen_address,
-                                        conf.OVS.of_listen_port)
-        controllers = ["tcp:" + url]
-        self.add_protocols(ovs_consts.OPENFLOW13)
-        self.set_controller(controllers)
-
-        # NOTE(ivc): Force "out-of-band" controller connection mode (see
-        # "In-Band Control" [1]).
+        # NOTE(slaweq): Disable remote in-band management for all controllers
+        # in the bridge
         #
         # By default openvswitch uses "in-band" controller connection mode
         # which adds hidden OpenFlow rules (only visible by issuing ovs-appctl
@@ -90,9 +85,63 @@ class OVSAgentBridge(ofswitch.OpenFlowSwitchMixin,
         # br-int and br-tun must be configured with the "out-of-band"
         # controller connection mode.
         #
+        # Setting connection_mode for controllers should be done in single
+        # transaction together with controllers setup but it will be easier to
+        # disable in-band remote management for bridge which
+        # effectively means that this configurations will applied to all
+        # controllers in the bridge
+        #
         # [1] https://github.com/openvswitch/ovs/blob/master/DESIGN.md
-        self.set_controllers_connection_mode("out-of-band")
+        # [2] https://bugzilla.redhat.com/show_bug.cgi?id=2134772
+        self.disable_in_band()
+
+        url = ipv6_utils.valid_ipv6_url(conf.OVS.of_listen_address,
+                                        conf.OVS.of_listen_port)
+        controller = "tcp:" + url
+        existing_controllers = self.get_controller()
+        if controller not in existing_controllers:
+            LOG.debug("Setting controller %s for bridge %s.",
+                      controller, self.br_name)
+            self.set_controller([controller])
+
+        self.add_protocols(ovs_consts.OPENFLOW10, ovs_consts.OPENFLOW13)
         self.set_controllers_inactivity_probe(conf.OVS.of_inactivity_probe)
 
     def drop_port(self, in_port):
         self.install_drop(priority=2, in_port=in_port)
+
+    @staticmethod
+    def _arp_responder_match(ofp, ofpp, vlan, ip):
+        return ofpp.OFPMatch(eth_type=ether_types.ETH_TYPE_ARP,
+                             arp_tpa=ip)
+
+    def install_arp_responder(self, vlan, ip, mac,
+                              table_id=ovs_consts.ARP_RESPONDER):
+        (dp, ofp, ofpp) = self._get_dp()
+        match = self._arp_responder_match(ofp, ofpp, vlan, ip)
+        actions = [ofpp.OFPActionSetField(arp_op=arp.ARP_REPLY),
+                   ofpp.NXActionRegMove(src_field='arp_sha',
+                                        dst_field='arp_tha',
+                                        n_bits=48),
+                   ofpp.NXActionRegMove(src_field='arp_spa',
+                                        dst_field='arp_tpa',
+                                        n_bits=32),
+                   ofpp.OFPActionSetField(arp_sha=mac),
+                   ofpp.OFPActionSetField(arp_spa=ip),
+                   ofpp.NXActionRegMove(src_field='eth_src',
+                                        dst_field='eth_dst',
+                                        n_bits=48),
+                   ofpp.OFPActionSetField(eth_src=mac),
+                   ofpp.OFPActionOutput(ofp.OFPP_IN_PORT, 0)]
+        self.install_apply_actions(table_id=table_id,
+                                   priority=1,
+                                   match=match,
+                                   actions=actions)
+
+    def delete_arp_responder(self, vlan, ip,
+                             table_id=ovs_consts.ARP_RESPONDER):
+        (_dp, ofp, ofpp) = self._get_dp()
+        match = self._arp_responder_match(ofp, ofpp, vlan, ip)
+        self.uninstall_flows(table_id=table_id,
+                             priority=1,
+                             match=match)

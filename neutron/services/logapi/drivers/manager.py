@@ -44,11 +44,11 @@ def _get_param(args, kwargs, name, index):
             raise log_exc.LogapiDriverException(exception_msg=msg)
 
 
-class ResourceCallBackBase(object):
+class ResourceCallBackBase:
 
     def __new__(cls, *args, **kwargs):
         if not hasattr(cls, '_instance'):
-            cls._instance = super(ResourceCallBackBase, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self, resource, push_api):
@@ -57,12 +57,12 @@ class ResourceCallBackBase(object):
                       events.AFTER_DELETE):
             registry.subscribe(self.handle_event, resource, event)
 
-    def handle_event(self, resource, event, trigger, **kwargs):
+    def handle_event(self, resource, event, trigger, payload):
         """Handle resource callback event"""
         pass
 
 
-class LoggingServiceDriverManager(object):
+class LoggingServiceDriverManager:
 
     def __init__(self):
         self._drivers = set()
@@ -70,7 +70,6 @@ class LoggingServiceDriverManager(object):
         registry.publish(log_const.LOGGING_PLUGIN, events.AFTER_INIT, self)
 
         if self.rpc_required:
-            self._start_rpc_listeners()
             self.logging_rpc = server_rpc.LoggingApiNotification()
 
     @property
@@ -92,6 +91,9 @@ class LoggingServiceDriverManager(object):
         self._setup_resources_cb_handle()
 
     def _start_rpc_listeners(self):
+        if not self.rpc_required:
+            return []
+
         self._skeleton = server_rpc.LoggingApiSkeleton()
         return self._skeleton.conn.consume_in_threads()
 

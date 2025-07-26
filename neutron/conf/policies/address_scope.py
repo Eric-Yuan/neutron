@@ -10,6 +10,8 @@
 #  License for the specific language governing permissions and limitations
 #  under the License.
 
+from neutron_lib import policy as neutron_policy
+from oslo_log import versionutils
 from oslo_policy import policy
 
 from neutron.conf.policies import base
@@ -17,6 +19,9 @@ from neutron.conf.policies import base
 
 COLLECTION_PATH = '/address-scopes'
 RESOURCE_PATH = '/address-scopes/{id}'
+
+DEPRECATION_REASON = (
+    "The Address scope API now supports system scope and default roles.")
 
 
 rules = [
@@ -26,33 +31,47 @@ rules = [
         'Definition of a shared address scope'
     ),
     policy.DocumentedRuleDefault(
-        'create_address_scope',
-        base.RULE_ANY,
-        'Create an address scope',
-        [
+        name='create_address_scope',
+        check_str=base.ADMIN_OR_PROJECT_MEMBER,
+        description='Create an address scope',
+        operations=[
             {
                 'method': 'POST',
                 'path': COLLECTION_PATH,
             },
-        ]
+        ],
+        scope_types=['project'],
+        deprecated_rule=policy.DeprecatedRule(
+            name='create_address_scope',
+            check_str=neutron_policy.RULE_ANY,
+            deprecated_reason=DEPRECATION_REASON,
+            deprecated_since=versionutils.deprecated.WALLABY)
     ),
     policy.DocumentedRuleDefault(
-        'create_address_scope:shared',
-        base.RULE_ADMIN_ONLY,
-        'Create a shared address scope',
-        [
+        name='create_address_scope:shared',
+        check_str=base.ADMIN,
+        description='Create a shared address scope',
+        operations=[
             {
                 'method': 'POST',
                 'path': COLLECTION_PATH,
             },
-        ]
+        ],
+        scope_types=['project'],
+        deprecated_rule=policy.DeprecatedRule(
+            name='create_address_scope:shared',
+            check_str=neutron_policy.RULE_ADMIN_ONLY,
+            deprecated_reason=DEPRECATION_REASON,
+            deprecated_since=versionutils.deprecated.WALLABY)
     ),
     policy.DocumentedRuleDefault(
-        'get_address_scope',
-        base.policy_or(base.RULE_ADMIN_OR_OWNER,
-                       'rule:shared_address_scopes'),
-        'Get an address scope',
-        [
+        name='get_address_scope',
+        check_str=neutron_policy.policy_or(
+            base.ADMIN,
+            base.PROJECT_READER,
+            'rule:shared_address_scopes'),
+        description='Get an address scope',
+        operations=[
             {
                 'method': 'GET',
                 'path': COLLECTION_PATH,
@@ -61,40 +80,66 @@ rules = [
                 'method': 'GET',
                 'path': RESOURCE_PATH,
             },
-        ]
+        ],
+        scope_types=['project'],
+        deprecated_rule=policy.DeprecatedRule(
+            name='get_address_scope',
+            check_str=neutron_policy.policy_or(
+                neutron_policy.RULE_ADMIN_OR_OWNER,
+                'rule:shared_address_scopes'),
+            deprecated_reason=DEPRECATION_REASON,
+            deprecated_since=versionutils.deprecated.WALLABY)
     ),
     policy.DocumentedRuleDefault(
-        'update_address_scope',
-        base.RULE_ADMIN_OR_OWNER,
-        'Update an address scope',
-        [
+        name='update_address_scope',
+        check_str=base.ADMIN_OR_PROJECT_MEMBER,
+        description='Update an address scope',
+        operations=[
             {
                 'method': 'PUT',
                 'path': RESOURCE_PATH,
             },
-        ]
+        ],
+        scope_types=['project'],
+        deprecated_rule=policy.DeprecatedRule(
+            name='update_address_scope',
+            check_str=neutron_policy.RULE_ADMIN_OR_OWNER,
+            deprecated_reason=DEPRECATION_REASON,
+            deprecated_since=versionutils.deprecated.WALLABY)
     ),
     policy.DocumentedRuleDefault(
-        'update_address_scope:shared',
-        base.RULE_ADMIN_ONLY,
-        'Update ``shared`` attribute of an address scope',
-        [
+        name='update_address_scope:shared',
+        check_str=base.ADMIN,
+        description='Update ``shared`` attribute of an address scope',
+        operations=[
             {
                 'method': 'PUT',
                 'path': RESOURCE_PATH,
             },
-        ]
+        ],
+        scope_types=['project'],
+        deprecated_rule=policy.DeprecatedRule(
+            name='update_address_scope:shared',
+            check_str=neutron_policy.RULE_ADMIN_ONLY,
+            deprecated_reason=DEPRECATION_REASON,
+            deprecated_since=versionutils.deprecated.WALLABY)
     ),
     policy.DocumentedRuleDefault(
-        'delete_address_scope',
-        base.RULE_ADMIN_OR_OWNER,
-        'Delete an address scope',
-        [
+        name='delete_address_scope',
+        check_str=base.ADMIN_OR_PROJECT_MEMBER,
+        description='Delete an address scope',
+        operations=[
             {
                 'method': 'DELETE',
                 'path': RESOURCE_PATH,
             },
-        ]
+        ],
+        scope_types=['project'],
+        deprecated_rule=policy.DeprecatedRule(
+            name='delete_address_scope',
+            check_str=neutron_policy.RULE_ADMIN_OR_OWNER,
+            deprecated_reason=DEPRECATION_REASON,
+            deprecated_since=versionutils.deprecated.WALLABY)
     ),
 ]
 

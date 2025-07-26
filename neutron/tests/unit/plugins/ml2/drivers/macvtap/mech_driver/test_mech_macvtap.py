@@ -34,21 +34,29 @@ class MacvtapMechanismBaseTestCase(base.AgentMechanismBaseTestCase):
 
     AGENT = {'alive': True,
              'configurations': GOOD_CONFIGS,
-             'host': 'host'}
+             'host': 'host',
+             'agent_type': AGENT_TYPE,
+             }
     AGENTS = [AGENT]
 
     AGENTS_DEAD = [{'alive': False,
                     'configurations': GOOD_CONFIGS,
-                    'host': 'dead_host'}]
+                    'host': 'dead_host',
+                    'agent_type': AGENT_TYPE,
+                    }]
     AGENTS_BAD = [{'alive': False,
                    'configurations': GOOD_CONFIGS,
-                   'host': 'bad_host_1'},
+                   'host': 'bad_host_1',
+                   'agent_type': AGENT_TYPE,
+                   },
                   {'alive': True,
                    'configurations': BAD_CONFIGS,
-                   'host': 'bad_host_2'}]
+                   'host': 'bad_host_2',
+                   'agent_type': AGENT_TYPE,
+                   }]
 
     def setUp(self):
-        super(MacvtapMechanismBaseTestCase, self).setUp()
+        super().setUp()
         self.driver = mech_macvtap.MacvtapMechanismDriver()
         self.driver.initialize()
 
@@ -58,7 +66,7 @@ class MacvtapMechanismGenericTestCase(MacvtapMechanismBaseTestCase,
     pass
 
 
-class MacvtapMechanismMigrationTestCase(object):
+class MacvtapMechanismMigrationTestCase:
     # MIGRATION_SEGMENT must be overridden for the specific type being tested
     MIGRATION_SEGMENT = None
 
@@ -121,9 +129,9 @@ class MacvtapMechanismFlatTestCase(MacvtapMechanismBaseTestCase,
 
     def test_type_flat_vif_details(self):
         context = base.FakePortContext(self.AGENT_TYPE,
-                                  self.AGENTS,
-                                  self.FLAT_SEGMENTS,
-                                  vnic_type=self.VNIC_TYPE)
+                                       self.AGENTS,
+                                       self.FLAT_SEGMENTS,
+                                       vnic_type=self.VNIC_TYPE)
         self.driver.bind_port(context)
         vif_details = context._bound_vif_details
 
@@ -146,9 +154,9 @@ class MacvtapMechanismVlanTestCase(MacvtapMechanismBaseTestCase,
 
     def test_type_vlan_vif_details(self):
         context = base.FakePortContext(self.AGENT_TYPE,
-                                  self.AGENTS,
-                                  self.VLAN_SEGMENTS,
-                                  vnic_type=self.VNIC_TYPE)
+                                       self.AGENTS,
+                                       self.VLAN_SEGMENTS,
+                                       vnic_type=self.VNIC_TYPE)
         self.driver.bind_port(context)
         vif_details = context._bound_vif_details
 

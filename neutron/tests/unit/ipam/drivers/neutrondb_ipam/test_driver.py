@@ -26,7 +26,7 @@ from neutron.ipam.drivers.neutrondb_ipam import driver
 from neutron.ipam import exceptions as ipam_exc
 from neutron.ipam import requests as ipam_req
 from neutron.objects import ipam as ipam_obj
-from neutron.tests.unit.db import test_db_base_plugin_v2 as test_db_plugin
+from neutron.tests.common import test_db_base_plugin_v2 as test_db_plugin
 from neutron.tests.unit import testlib_api
 
 
@@ -34,7 +34,7 @@ def convert_firstip_to_ipaddress(range_item):
     return netaddr.IPAddress(range_item['first_ip'])
 
 
-class TestNeutronDbIpamMixin(object):
+class TestNeutronDbIpamMixin:
 
     def _create_network(self, plugin, ctx, shared=False):
         network = {'network': {'name': 'net',
@@ -68,7 +68,7 @@ class TestNeutronDbIpamPool(testlib_api.SqlTestCase,
     """Test case for the Neutron's DB IPAM driver subnet pool interface."""
 
     def setUp(self):
-        super(TestNeutronDbIpamPool, self).setUp()
+        super().setUp()
         self._tenant_id = 'test-tenant'
 
         # Configure plugin for tests
@@ -261,7 +261,7 @@ class TestNeutronDbIpamSubnet(testlib_api.SqlTestCase,
         return ipam_subnet, subnet
 
     def setUp(self):
-        super(TestNeutronDbIpamSubnet, self).setUp()
+        super().setUp()
         self._tenant_id = 'test-tenant'
 
         # Configure plugin for tests
@@ -422,12 +422,6 @@ class TestNeutronDbIpamSubnet(testlib_api.SqlTestCase,
         # test_deallocate_v4_address. It is provided for completeness and for
         # future proofing in case v6-specific logic will be added.
         self._test_deallocate_address('fde3:abcd:4321:1::/64', 6)
-
-    def test_allocate_unallocated_address_fails(self):
-        ipam_subnet = self._create_and_allocate_ipam_subnet(
-            '10.0.0.0/24', ip_version=constants.IP_VERSION_4)[0]
-        self.assertRaises(ipam_exc.IpAddressAllocationNotFound,
-                          ipam_subnet.deallocate, '10.0.0.2')
 
     def test_allocate_all_pool_addresses_triggers_range_recalculation(self):
         # This test instead might be made to pass, but for the wrong reasons!

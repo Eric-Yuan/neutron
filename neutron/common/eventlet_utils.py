@@ -14,32 +14,41 @@
 # under the License.
 
 import os
+import threading
 
 import eventlet
-from oslo_utils import importutils
+from eventlet.green import threading as threading_eventlet
+from oslo_log import log as logging
+from oslo_utils import eventletutils
+
+
+LOG = logging.getLogger(__name__)
+
+IS_MONKEY_PATCHED = False
 
 
 def monkey_patch():
-    # NOTE(slaweq): to workaround issue with import cycles in
-    # eventlet < 0.22.0;
-    # This issue is fixed in eventlet with patch
-    # https://github.com/eventlet/eventlet/commit/b756447bab51046dfc6f1e0e299cc997ab343701
-    # For details please check https://bugs.launchpad.net/neutron/+bug/1745013
-    hub = eventlet.hubs.get_hub()
-    hub.is_available = lambda: True
-    if os.name != 'nt':
-        eventlet.monkey_patch()
+    global IS_MONKEY_PATCHED
+    if not IS_MONKEY_PATCHED:
+        # This environment variable will be used in eventlet 0.39.0
+        # https://github.com/eventlet/eventlet/commit/
+        # b754135b045306022a537b5797f2cb2cf47ba49b
+        if os.getenv('EVENTLET_MONKEYPATCH') == '1':
+            IS_MONKEY_PATCHED = True
+            return
 
+        eventlet.monkey_patch()
+        LOG.warning('This program is using eventlet and has been '
+                    'monkey_patched')
+
+        # pylint: disable=import-outside-toplevel
+        from oslo_utils import importutils
         p_c_e = importutils.import_module('pyroute2.config.asyncio')
         p_c_e.asyncio_config()
-    else:
-        # eventlet monkey patching the os module causes subprocess.Popen to
-        # fail on Windows when using pipes due to missing non-blocking IO
-        # support.
-        eventlet.monkey_patch(os=False)
-    # Monkey patch the original current_thread to use the up-to-date _active
-    # global variable. See https://bugs.launchpad.net/bugs/1863021 and
-    # https://github.com/eventlet/eventlet/issues/592
-    import __original_module_threading as orig_threading
-    import threading  # noqa
-    orig_threading.current_thread.__globals__['_active'] = threading._active
+        IS_MONKEY_PATCHED = True
+
+
+def get_threading_local():
+    if eventletutils.is_monkey_patched('thread'):
+        return threading_eventlet.local()
+    return threading.local()

@@ -13,7 +13,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import collections
+from collections import abc
+import copy
 import itertools
 import re
 import sys
@@ -26,11 +27,9 @@ from neutron_lib import exceptions
 from neutron_lib.plugins import directory
 from neutron_lib.services import constants as service_const
 from oslo_config import cfg
-from oslo_db import exception as db_exc
 from oslo_log import log as logging
 from oslo_policy import policy
 from oslo_utils import excutils
-import six
 import stevedore
 
 from neutron._i18n import _
@@ -69,12 +68,21 @@ def register_rules(enforcer):
     enforcer.register_defaults(itertools.chain(*policies))
 
 
-def init(conf=cfg.CONF, policy_file=None):
+def init(conf=cfg.CONF, policy_file=None, suppress_deprecation_warnings=False):
     """Init an instance of the Enforcer class."""
 
     global _ENFORCER
     if not _ENFORCER:
         _ENFORCER = policy.Enforcer(conf, policy_file=policy_file)
+        # TODO(slaweq) Explictly disable the warnings for policies
+        # changing their default check_str. During policy-defaults-refresh
+        # work, all the policy defaults have been changed and warning for
+        # each policy started filling the logs limit for various tool.
+        # Once we move to new defaults only world then we can enable these
+        # warning again.
+        _ENFORCER.suppress_default_change_warnings = True
+        if suppress_deprecation_warnings:
+            _ENFORCER.suppress_deprecation_warnings = True
         register_rules(_ENFORCER)
         _ENFORCER.load_rules(True)
 
@@ -90,7 +98,10 @@ def get_resource_and_action(action, pluralized=None):
        resource and action extracted from api operation.
     """
     data = action.split(':', 1)[0].split('_', 1)
-    resource = pluralized or ("%ss" % data[-1])
+    if "tags" in data[-1]:
+        resource = data[-1].replace("_tags", "")
+    else:
+        resource = pluralized or ("%ss" % data[-1])
     enforce_attr_based_check = data[0] not in ('get', 'delete')
     return (resource, enforce_attr_based_check)
 
@@ -126,9 +137,10 @@ def _is_attribute_explicitly_set(attribute_name, resource, target, action):
 def _should_validate_sub_attributes(attribute, sub_attr):
     """Verify that sub-attributes are iterable and should be validated."""
     validate = attribute.get('validate')
-    return (validate and isinstance(sub_attr, collections.Iterable) and
-            any([k.startswith('type:dict') and
-                 v for (k, v) in validate.items()]))
+    return (validate and isinstance(sub_attr, abc.Iterable) and
+            any((k.startswith('type:dict') or
+                 k.startswith('type:list_of_dict')) and
+                v for (k, v) in validate.items()))
 
 
 def _build_subattr_match_rule(attr_name, attr, action, target):
@@ -137,7 +149,8 @@ def _build_subattr_match_rule(attr_name, attr, action, target):
     # typing for API attributes
     # Expect a dict as type descriptor
     validate = attr['validate']
-    key = [k for k in validate.keys() if k.startswith('type:dict')]
+    key = [k for k in validate.keys() if (k.startswith('type:dict') or
+                                          k.startswith('type:list_of_dict'))]
     if not key:
         LOG.warning("Unable to find data type descriptor for attribute %s",
                     attr_name)
@@ -148,11 +161,18 @@ def _build_subattr_match_rule(attr_name, attr, action, target):
                   "generate any sub-attr policy rule for %s.",
                   attr_name)
         return
+
+    if key[0].startswith('type:list_of_dict'):
+        target_attributes = set()
+        for _attrs in target[attr_name]:
+            target_attributes = target_attributes.union(set(_attrs.keys()))
+    else:
+        target_attributes = target[attr_name]
     sub_attr_rules = [policy.RuleCheck('rule', '%s:%s:%s' %
                                        (action, attr_name,
                                         sub_attr_name)) for
                       sub_attr_name in data if sub_attr_name in
-                      target[attr_name]]
+                      target_attributes]
     return policy.AndCheck(sub_attr_rules)
 
 
@@ -162,7 +182,7 @@ def _build_list_of_subattrs_rule(attr_name, attribute_value, action):
         if isinstance(sub_attr, dict):
             for k in sub_attr:
                 rules.append(policy.RuleCheck(
-                    'rule', '%s:%s:%s' % (action, attr_name, k)))
+                    'rule', f'{action}:{attr_name}:{k}'))
     if rules:
         return policy.AndCheck(rules)
 
@@ -190,6 +210,10 @@ def _build_match_rule(action, target, pluralized):
        (e.g.: create_router:external_gateway_info:network_id)
     """
     match_rule = policy.RuleCheck('rule', action)
+    registered_rule = _ENFORCER.registered_rules.get(action)
+    if registered_rule and registered_rule.scope_types:
+        match_rule.scope_types = registered_rule.scope_types
+
     resource, enforce_attr_based_check = get_resource_and_action(
         action, pluralized)
     if enforce_attr_based_check:
@@ -203,7 +227,7 @@ def _build_match_rule(action, target, pluralized):
                     attribute = res_map[resource][attribute_name]
                     if 'enforce_policy' in attribute:
                         attr_rule = policy.RuleCheck(
-                            'rule', '%s:%s' % (action, attribute_name))
+                            'rule', f'{action}:{attribute_name}')
                         # Build match entries for sub-attributes
                         if _should_validate_sub_attributes(
                                 attribute, target[attribute_name]):
@@ -227,7 +251,7 @@ def _build_match_rule(action, target, pluralized):
 # This check is registered as 'tenant_id' so that it can override
 # GenericCheck which was used for validating parent resource ownership.
 # This will prevent us from having to handling backward compatibility
-# for policy.json
+# for policy.yaml
 # TODO(salv-orlando): Reinstate GenericCheck for simple tenant_id checks
 @policy.register('tenant_id')
 class OwnerCheck(policy.Check):
@@ -240,6 +264,9 @@ class OwnerCheck(policy.Check):
     resource and perform the check.
     """
     def __init__(self, kind, match):
+        self._orig_kind = kind
+        self._orig_match = match
+
         # Process the match
         try:
             self.target_field = re.findall(r'^\%\((.*)\)s$',
@@ -250,13 +277,22 @@ class OwnerCheck(policy.Check):
                           match)
             LOG.exception(err_reason)
             raise exceptions.PolicyInitError(
-                policy="%s:%s" % (kind, match),
+                policy=f"{kind}:{match}",
                 reason=err_reason)
         self._cache = cache._get_memory_cache_region(expiration_time=5)
-        super(OwnerCheck, self).__init__(kind, match)
+        super().__init__(kind, match)
+
+    # NOTE(slaweq): It seems we need to have it like that, otherwise we hit
+    # TypeError: cannot pickle '_thread.RLock' object
+    # during initialization of the policy rules when Neutron is run with
+    # mod_uwsgi, see bug https://bugs.launchpad.net/neutron/+bug/1915494 for
+    # details
+    def __deepcopy__(self, memo):
+        return OwnerCheck(self._orig_kind, self._orig_match)
 
     @cache.cache_method_results
-    def _extract(self, resource_type, resource_id, field):
+    def _extract(self, resource_type, resource_id, field,
+                 retry_if_not_found=True):
         # NOTE(salv-orlando): This check currently assumes the parent
         # resource is handled by the core plugin. It might be worth
         # having a way to map resources to plugins so to make this
@@ -273,18 +309,22 @@ class OwnerCheck(policy.Check):
                      resource_id,
                      fields=[field])
         except exceptions.NotFound as e:
-            # NOTE(kevinbenton): a NotFound exception can occur if a
+            # NOTE(kevinbenton, slaweq): a NotFound exception can occur if a
             # list operation is happening at the same time as one of
             # the parents and its children being deleted. So we issue
-            # a RetryRequest so the API will redo the lookup and the
+            # retry to get it once again if we didn't yet.
             # problem items will be gone.
-            raise db_exc.RetryRequest(e)
+            if retry_if_not_found:
+                return self._extract(resource_type, resource_id, field,
+                                     retry_if_not_found=False)
+            raise e
         except Exception:
             with excutils.save_and_reraise_exception():
                 LOG.exception('Policy check error while calling %s!', f)
         return data[field]
 
     def __call__(self, target, creds, enforcer):
+        target_copy = copy.copy(target)
         if self.target_field not in target:
             # policy needs a plugin check
             # target field is in the form resource:field
@@ -309,13 +349,14 @@ class OwnerCheck(policy.Check):
                               self.target_field)
                 LOG.error(err_reason)
                 raise exceptions.PolicyCheckError(
-                    policy="%s:%s" % (self.kind, self.match),
+                    policy=f"{self.kind}:{self.match}",
                     reason=err_reason)
             parent_foreign_key = _RESOURCE_FOREIGN_KEYS.get(
                 "%ss" % parent_res, None)
             if parent_res == constants.EXT_PARENT_PREFIX:
                 for resource in service_const.EXT_PARENT_RESOURCE_MAPPING:
-                    key = "%s_%s_id" % (constants.EXT_PARENT_PREFIX, resource)
+                    key = "{}_{}_id".format(
+                        constants.EXT_PARENT_PREFIX, resource)
                     if key in target:
                         parent_foreign_key = key
                         parent_res = resource
@@ -326,39 +367,51 @@ class OwnerCheck(policy.Check):
                               {'match': self.match, 'res': parent_res})
                 LOG.error(err_reason)
                 raise exceptions.PolicyCheckError(
-                    policy="%s:%s" % (self.kind, self.match),
+                    policy=f"{self.kind}:{self.match}",
                     reason=err_reason)
 
-            target[self.target_field] = self._extract(
+            target_copy[self.target_field] = self._extract(
                 parent_res, target[parent_foreign_key], parent_field)
 
-        match = self.match % target
+        match = self.match % target_copy
         if self.kind in creds:
-            return match == six.text_type(creds[self.kind])
+            return match == str(creds[self.kind])
         return False
 
 
 @policy.register('field')
 class FieldCheck(policy.Check):
     def __init__(self, kind, match):
+        self._orig_kind = kind
+        self._orig_match = match
+
         # Process the match
         resource, field_value = match.split(':', 1)
         field, value = field_value.split('=', 1)
 
-        super(FieldCheck, self).__init__(kind, '%s:%s:%s' %
-                                         (resource, field, value))
+        super().__init__(kind, '%s:%s:%s' %
+                         (resource, field, value))
 
         # Value might need conversion - we need help from the attribute map
+
+        def _no_conv(x):
+            return x
+
         try:
             attr = attributes.RESOURCES[resource][field]
             conv_func = attr['convert_to']
         except KeyError:
-            conv_func = lambda x: x
+            conv_func = _no_conv
 
         self.field = field
         self.resource = resource
         self.value = conv_func(value)
         self.regex = re.compile(value[1:]) if value.startswith('~') else None
+
+    # TODO(stephenfin): Remove this when we drop support for Python 3.6, since
+    # that supports copying regex objects natively
+    def __deepcopy__(self, memo):
+        return FieldCheck(self._orig_kind, self._orig_match)
 
     def __call__(self, target_dict, cred_dict, enforcer):
         target_value = self._get_target_value(target_dict)
@@ -384,7 +437,7 @@ class FieldCheck(policy.Check):
                           {'field': self.field, 'target_dict': target_dict})
                 return
             project_id = target_dict.get('project_id')
-            ctx = (context.Context(tenant_id=project_id) if project_id
+            ctx = (context.Context(project_id=project_id) if project_id
                    else context.get_admin_context())
             plugin = directory.get_plugin()
             network = plugin.get_network(ctx, target_network_id)
@@ -397,13 +450,12 @@ class FieldCheck(policy.Check):
 
 
 def _prepare_check(context, action, target, pluralized):
-    """Prepare rule, target, and credentials for the policy engine."""
+    """Prepare rule, target, and context for the policy engine."""
     # Compare with None to distinguish case in which target is {}
     if target is None:
         target = {}
     match_rule = _build_match_rule(action, target, pluralized)
-    credentials = context.to_policy_values()
-    return match_rule, target, credentials
+    return match_rule, target, context
 
 
 def log_rule_list(match_rule):
@@ -412,8 +464,7 @@ def log_rule_list(match_rule):
         LOG.debug("Enforcing rules: %s", rules)
 
 
-def check(context, action, target, plugin=None, might_not_exist=False,
-          pluralized=None):
+def check(context, action, target, might_not_exist=False, pluralized=None):
     """Verifies that the action is valid on the target in this context.
 
     :param context: neutron context
@@ -422,8 +473,6 @@ def check(context, action, target, plugin=None, might_not_exist=False,
     :param target: dictionary representing the object of the action
         for object creation this should be a dictionary representing the
         location of the object e.g. ``{'project_id': context.project_id}``
-    :param plugin: currently unused and deprecated.
-        Kept for backward compatibility.
     :param might_not_exist: If True the policy check is skipped (and the
         function returns True) if the specified policy does not exist.
         Defaults to false.
@@ -434,22 +483,25 @@ def check(context, action, target, plugin=None, might_not_exist=False,
     """
     # If we already know the context has admin rights do not perform an
     # additional check and authorize the operation
-    if context.is_admin:
+    # TODO(slaweq): Remove that is_admin check and always perform rules checks
+    # when old, deprecated rules will be removed and only rules with new
+    # personas will be supported
+    if not cfg.CONF.oslo_policy.enforce_new_defaults and context.is_admin:
         return True
+    init()
     if might_not_exist and not (_ENFORCER.rules and action in _ENFORCER.rules):
         return True
     match_rule, target, credentials = _prepare_check(context,
                                                      action,
                                                      target,
                                                      pluralized)
-    result = _ENFORCER.enforce(match_rule,
-                               target,
-                               credentials,
-                               pluralized=pluralized)
-    return result
+    return _ENFORCER.enforce(match_rule,
+                             target,
+                             credentials,
+                             pluralized=pluralized)
 
 
-def enforce(context, action, target, plugin=None, pluralized=None):
+def enforce(context, action, target, pluralized=None):
     """Verifies that the action is valid on the target in this context.
 
     :param context: neutron context
@@ -458,8 +510,6 @@ def enforce(context, action, target, plugin=None, pluralized=None):
     :param target: dictionary representing the object of the action
         for object creation this should be a dictionary representing the
         location of the object e.g. ``{'project_id': context.project_id}``
-    :param plugin: currently unused and deprecated.
-        Kept for backward compatibility.
     :param pluralized: pluralized case of resource
         e.g. firewall_policy -> pluralized = "firewall_policies"
 
@@ -468,19 +518,20 @@ def enforce(context, action, target, plugin=None, pluralized=None):
     """
     # If we already know the context has admin rights do not perform an
     # additional check and authorize the operation
-    if context.is_admin:
+    # TODO(slaweq): Remove that is_admin check and always perform rules checks
+    # when old, deprecated rules will be removed and only rules with new
+    # personas will be supported
+    if not cfg.CONF.oslo_policy.enforce_new_defaults and context.is_admin:
         return True
-    rule, target, credentials = _prepare_check(context,
-                                               action,
-                                               target,
-                                               pluralized)
+    init()
+    rule, target, context = _prepare_check(context, action, target, pluralized)
     try:
-        result = _ENFORCER.enforce(rule, target, credentials, action=action,
+        result = _ENFORCER.enforce(rule, target, context, action=action,
                                    do_raise=True)
-    except policy.PolicyNotAuthorized:
+    except (policy.PolicyNotAuthorized, policy.InvalidScope):
         with excutils.save_and_reraise_exception():
             log_rule_list(rule)
-            LOG.debug("Failed policy check for '%s'", action)
+            LOG.debug("Failed policy enforce for '%s'", action)
     return result
 
 

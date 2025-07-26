@@ -13,8 +13,9 @@
 #    under the License.
 
 
-from distutils import spawn
 import os
+import shutil
+import signal
 
 import fixtures
 import psutil
@@ -23,13 +24,19 @@ import tenacity
 from neutron.agent.linux import utils
 
 
+def _kill_process_if_exists(command: str) -> None:
+    _pid = utils.pgrep(command)
+    if _pid:
+        utils.kill_process(_pid, signal.SIGKILL)
+
+
 class DaemonProcessFixture(fixtures.Fixture):
     def __init__(self, temp_dir):
-        super(DaemonProcessFixture, self).__init__()
+        super().__init__()
         self.temp_dir = temp_dir
 
     def _get_pid_from_pidfile(self, pidfile):
-        with open(os.path.join(self.temp_dir, pidfile), 'r') as pidfile_f:
+        with open(os.path.join(self.temp_dir, pidfile)) as pidfile_f:
             pid = pidfile_f.read().strip()
             try:
                 return int(pid)
@@ -44,7 +51,7 @@ class OvnNorthd(DaemonProcessFixture):
 
     def __init__(self, temp_dir, ovn_nb_db, ovn_sb_db, protocol='unix',
                  debug=True):
-        super(OvnNorthd, self).__init__(temp_dir)
+        super().__init__(temp_dir)
         self.ovn_nb_db = ovn_nb_db
         self.ovn_sb_db = ovn_sb_db
         self.protocol = protocol
@@ -64,7 +71,7 @@ class OvnNorthd(DaemonProcessFixture):
     def start(self):
         # start the ovn-northd
         ovn_northd_cmd = [
-            spawn.find_executable('ovn-northd'), '-vconsole:off',
+            shutil.which('ovn-northd'), '-vconsole:off',
             '--detach',
             '--ovnnb-db=%s' % self.ovn_nb_db,
             '--ovnsb-db=%s' % self.ovn_sb_db,
@@ -82,17 +89,18 @@ class OvnNorthd(DaemonProcessFixture):
 
     def stop(self):
         try:
-            stop_cmd = ['ovs-appctl', '-t', self.unixctl_path, 'exit']
-            utils.execute(stop_cmd)
+            if os.path.exists(self.unixctl_path):
+                stop_cmd = ['ovs-appctl', '-t', self.unixctl_path, 'exit']
+                utils.execute(stop_cmd)
         except Exception:
-            pass
+            _kill_process_if_exists(self.unixctl_path)
 
 
 class OvsdbServer(DaemonProcessFixture):
 
     def __init__(self, temp_dir, ovs_dir, ovn_nb_db=True, ovn_sb_db=False,
                  protocol='unix', debug=True):
-        super(OvsdbServer, self).__init__(temp_dir)
+        super().__init__(temp_dir)
         self.ovs_dir = ovs_dir
         self.ovn_nb_db = ovn_nb_db
         self.ovn_sb_db = ovn_sb_db
@@ -140,11 +148,11 @@ class OvsdbServer(DaemonProcessFixture):
 
     def _init_ovsdb_pki(self):
         os.chdir(self.temp_dir)
-        pki_init_cmd = [spawn.find_executable('ovs-pki'), 'init',
+        pki_init_cmd = [shutil.which('ovs-pki'), 'init',
                         '-d', self.temp_dir, '-l',
                         os.path.join(self.temp_dir, 'pki.log'), '--force']
         utils.execute(pki_init_cmd)
-        pki_req_sign = [spawn.find_executable('ovs-pki'), 'req+sign', 'ovn',
+        pki_req_sign = [shutil.which('ovs-pki'), 'req+sign', 'ovn',
                         'controller', '-d', self.temp_dir, '-l',
                         os.path.join(self.temp_dir, 'pki.log'), '--force']
         utils.execute(pki_req_sign)
@@ -159,15 +167,18 @@ class OvsdbServer(DaemonProcessFixture):
     def start(self):
         pki_done = False
         for ovsdb_process in self.ovsdb_server_processes:
-            # create the db from the schema using ovsdb-tool
-            ovsdb_tool_cmd = [spawn.find_executable('ovsdb-tool'),
-                              'create', ovsdb_process['db_path'],
-                              ovsdb_process['schema_path']]
-            utils.execute(ovsdb_tool_cmd)
+            # Create the db from the schema using ovsdb-tool only if the file
+            # is not present. It could be possible to restart the ovsdb-server
+            # using an existing database file.
+            if not os.path.exists(ovsdb_process['db_path']):
+                ovsdb_tool_cmd = [shutil.which('ovsdb-tool'),
+                                  'create', ovsdb_process['db_path'],
+                                  ovsdb_process['schema_path']]
+                utils.execute(ovsdb_tool_cmd)
 
             # start the ovsdb-server
             ovsdb_server_cmd = [
-                spawn.find_executable('ovsdb-server'), '-vconsole:off',
+                shutil.which('ovsdb-server'), '-vconsole:off',
                 '--detach',
                 '--pidfile=%s' % os.path.join(
                     self.temp_dir, ovsdb_process['pidfile']),
@@ -189,12 +200,12 @@ class OvsdbServer(DaemonProcessFixture):
             obj, _ = utils.create_process(ovsdb_server_cmd)
             obj.communicate()
 
-            conn_cmd = [spawn.find_executable(ovsdb_process['ctl_cmd']),
+            conn_cmd = [shutil.which(ovsdb_process['ctl_cmd']),
                         '--db=unix:%s' % ovsdb_process['remote_path'],
                         'set-connection',
-                        'p%s:%s:%s' % (ovsdb_process['protocol'],
-                                       ovsdb_process['remote_port'],
-                                       ovsdb_process['remote_ip']),
+                        'p{}:{}:{}'.format(ovsdb_process['protocol'],
+                                           ovsdb_process['remote_port'],
+                                           ovsdb_process['remote_ip']),
                         '--', 'set', 'connection', '.',
                         'inactivity_probe=60000']
 
@@ -209,10 +220,10 @@ class OvsdbServer(DaemonProcessFixture):
                 reraise=True)
             def get_ovsdb_remote_port_retry(pid):
                 process = psutil.Process(pid)
-                for connect in process.connections():
+                for connect in process.net_connections():
                     if connect.status == 'LISTEN':
                         return connect.laddr[1]
-                raise Exception(_("Could not find LISTEN port."))
+                raise Exception("Could not find LISTEN port.")
 
             if ovsdb_process['protocol'] != 'unix':
                 _set_connection()
@@ -227,14 +238,13 @@ class OvsdbServer(DaemonProcessFixture):
                             'exit']
                 utils.execute(stop_cmd)
             except Exception:
-                pass
+                _kill_process_if_exists(ovsdb_process['unixctl_path'])
 
     def get_ovsdb_connection_path(self, db_type='nb'):
         for ovsdb_process in self.ovsdb_server_processes:
             if ovsdb_process['db_type'] == db_type:
                 if ovsdb_process['protocol'] == 'unix':
                     return 'unix:' + ovsdb_process['remote_path']
-                else:
-                    return '%s:%s:%s' % (ovsdb_process['protocol'],
+                return '{}:{}:{}'.format(ovsdb_process['protocol'],
                                          ovsdb_process['remote_ip'],
                                          ovsdb_process['remote_port'])

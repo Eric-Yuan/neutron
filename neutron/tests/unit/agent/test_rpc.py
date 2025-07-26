@@ -22,11 +22,16 @@ from neutron_lib.callbacks import events
 from neutron_lib.callbacks import resources
 from neutron_lib import constants
 from neutron_lib import rpc as n_rpc
+from oslo_config import cfg
 from oslo_context import context as oslo_context
+from oslo_serialization import jsonutils
+from oslo_utils import timeutils
 from oslo_utils import uuidutils
 
 from neutron.agent import rpc
+from neutron.conf.agent import common as conf_common
 from neutron.objects import network
+from neutron.objects.port.extensions import port_hints
 from neutron.objects import ports
 from neutron.tests import base
 
@@ -73,6 +78,12 @@ class AgentRPCPluginApi(base.BaseTestCase):
 
 
 class AgentPluginReportState(base.BaseTestCase):
+    def test_plugin_report_state_timeout_report_interval(self):
+        conf_common.register_agent_state_opts_helper(cfg.CONF)
+        cfg.CONF.set_override('report_interval', 15, 'AGENT')
+        reportStateAPI = rpc.PluginReportStateAPI('test')
+        self.assertEqual(reportStateAPI.timeout, 15)
+
     def test_plugin_report_state_use_call(self):
         topic = 'test'
         reportStateAPI = rpc.PluginReportStateAPI(topic)
@@ -116,9 +127,9 @@ class AgentPluginReportState(base.BaseTestCase):
         expected_time = datetime.datetime(2015, 7, 27, 15, 33, 30, 0)
         expected_time_str = '2015-07-27T15:33:30.000000'
         expected_agent_state = {'agent': 'test'}
-        with mock.patch('neutron.agent.rpc.datetime') as mock_datetime:
+        with mock.patch.object(timeutils, 'utcnow',
+                               return_value=expected_time):
             reportStateAPI = rpc.PluginReportStateAPI(topic)
-            mock_datetime.utcnow.return_value = expected_time
             with mock.patch.object(reportStateAPI.client, 'call'), \
                     mock.patch.object(reportStateAPI.client, 'cast'
                                       ) as mock_cast, \
@@ -185,7 +196,7 @@ class AgentRPCMethods(base.BaseTestCase):
 class TestCacheBackedPluginApi(base.BaseTestCase):
 
     def setUp(self):
-        super(TestCacheBackedPluginApi, self).setUp()
+        super().setUp()
         self._api = rpc.CacheBackedPluginApi(lib_topics.PLUGIN)
         self._api._legacy_interface = mock.Mock()
         self._api.remote_resource_cache = mock.Mock()
@@ -201,7 +212,7 @@ class TestCacheBackedPluginApi(base.BaseTestCase):
             id=self._port_id, network_id=self._network_id,
             device_id='vm_uuid',
             mac_address=netaddr.EUI('fa:16:3e:ec:c7:d9'), admin_state_up=True,
-            security_group_ids=set([uuidutils.generate_uuid()]),
+            security_group_ids={uuidutils.generate_uuid()},
             fixed_ips=[], allowed_address_pairs=[],
             device_owner=constants.DEVICE_OWNER_COMPUTE_PREFIX,
             bindings=[ports.PortBinding(port_id=self._port_id,
@@ -213,12 +224,18 @@ class TestCacheBackedPluginApi(base.BaseTestCase):
             binding_levels=[ports.PortBindingLevel(port_id=self._port_id,
                                                    host='host1',
                                                    level=0,
-                                                   segment=self._segment)])
+                                                   segment=self._segment)],
+            status='ACTIVE',
+            hints=port_hints.PortHints(hints={
+                "openvswitch": {"other_config": {"tx-steering": "hash"}}}),
+        )
 
     def test__legacy_notifier_resource_delete(self):
         self._api._legacy_notifier(resources.PORT, events.AFTER_DELETE, self,
-                                   mock.ANY, resource_id=self._port_id,
-                                   existing=self._port)
+                                   payload=events.DBEventPayload(
+                                       mock.ANY,
+                                       resource_id=self._port_id,
+                                       states=(self._port,)))
         self._api._legacy_interface.port_update.assert_not_called()
         self._api._legacy_interface.port_delete.assert_called_once_with(
             mock.ANY, port={'id': self._port_id}, port_id=self._port_id)
@@ -227,9 +244,14 @@ class TestCacheBackedPluginApi(base.BaseTestCase):
     def test__legacy_notifier_resource_update(self):
         updated_port = ports.Port(id=self._port_id, name='updated_port')
         self._api._legacy_notifier(resources.PORT, events.AFTER_UPDATE, self,
-                                   mock.ANY, changed_fields=set(['name']),
-                                   resource_id=self._port_id,
-                                   existing=self._port, updated=updated_port)
+                                   payload=events.DBEventPayload(
+                                       mock.ANY,
+                                       metadata={
+                                           'changed_fields': {'name'}
+                                       },
+                                       resource_id=self._port_id,
+                                       states=(self._port, updated_port)))
+
         self._api._legacy_interface.port_delete.assert_not_called()
         self._api._legacy_interface.port_update.assert_called_once_with(
             mock.ANY, port={'id': self._port_id}, port_id=self._port_id)
@@ -244,11 +266,16 @@ class TestCacheBackedPluginApi(base.BaseTestCase):
                       ports.PortBinding(port_id=self._port_id,
                                         host='host1',
                                         status=constants.INACTIVE)])
-        self._api._legacy_notifier(resources.PORT, events.AFTER_UPDATE, self,
-                                   mock.ANY,
-                                   changed_fields=set(['name', 'bindings']),
-                                   resource_id=self._port_id,
-                                   existing=self._port, updated=updated_port)
+        self._api._legacy_notifier(
+            resources.PORT, events.AFTER_UPDATE, self,
+            payload=events.DBEventPayload(
+                mock.ANY,
+                metadata={
+                    'changed_fields': {'name', 'bindings'}
+                },
+                resource_id=self._port_id,
+                states=(self._port, updated_port)))
+
         self._api._legacy_interface.port_update.assert_not_called()
         self._api._legacy_interface.port_delete.assert_not_called()
 
@@ -265,27 +292,40 @@ class TestCacheBackedPluginApi(base.BaseTestCase):
             bindings=[ports.PortBinding(port_id=self._port_id,
                                         host='host2',
                                         status=constants.ACTIVE)])
-        self._api._legacy_notifier(resources.PORT, events.AFTER_UPDATE, self,
-                                   mock.ANY,
-                                   changed_fields=set(['name', 'bindings']),
-                                   resource_id=self._port_id,
-                                   existing=self._port, updated=updated_port)
+        self._api._legacy_notifier(
+            resources.PORT, events.AFTER_UPDATE, self,
+            payload=events.DBEventPayload(
+                mock.ANY,
+                metadata={
+                    'changed_fields': {'name', 'bindings'}
+                },
+                resource_id=self._port_id,
+                states=(self._port, updated_port)))
+
         self._api._legacy_interface.port_update.assert_called_once_with(
             mock.ANY, port={'id': self._port_id}, port_id=self._port_id)
         self._api._legacy_interface.port_delete.assert_not_called()
         self._api._legacy_interface.binding_deactivate.assert_not_called()
 
     def test__legacy_notifier_existing_or_updated_is_none(self):
-        self._api._legacy_notifier(resources.PORT, events.AFTER_UPDATE,
-                                   self, mock.ANY,
-                                   changed_fields=set(['name', 'bindings']),
-                                   resource_id=self._port_id,
-                                   existing=None, updated=None)
-        self._api._legacy_notifier(resources.PORT, events.AFTER_UPDATE, self,
-                                   mock.ANY,
-                                   changed_fields=set(['name', 'bindings']),
-                                   resource_id=self._port_id,
-                                   existing=self._port, updated=None)
+        self._api._legacy_notifier(
+            resources.PORT, events.AFTER_UPDATE, self,
+            payload=events.DBEventPayload(
+                mock.ANY,
+                metadata={
+                    'changed_fields': {'name', 'bindings'}
+                },
+                resource_id=self._port_id,
+                states=(None, None)))
+        self._api._legacy_notifier(
+            resources.PORT, events.AFTER_UPDATE, self,
+            payload=events.DBEventPayload(
+                mock.ANY,
+                metadata={
+                    'changed_fields': {'name', 'bindings'}
+                },
+                resource_id=self._port_id,
+                states=(self._port, None)))
         call = mock.call(mock.ANY, port={'id': self._port_id},
                          port_id=self._port_id)
         self._api._legacy_interface.port_update.assert_has_calls([call, call])
@@ -305,6 +345,7 @@ class TestCacheBackedPluginApi(base.BaseTestCase):
         self.assertEqual(self._port_id, entry['port_id'])
         self.assertEqual(self._network_id, entry['network_id'])
         self.assertNotIn(constants.NO_ACTIVE_BINDING, entry)
+        self.assertIsNone(entry['migrating_to'])
 
     def test_get_device_details_binding_not_in_host(self):
         self._api.remote_resource_cache.get_resource_by_id.side_effect = [
@@ -314,7 +355,26 @@ class TestCacheBackedPluginApi(base.BaseTestCase):
         self.assertEqual(self._port_id, entry['device'])
         self.assertNotIn('port_id', entry)
         self.assertNotIn('network_id', entry)
+        self.assertNotIn('migrating_to', entry)
         self.assertIn(constants.NO_ACTIVE_BINDING, entry)
+
+    def test_get_device_details_migrating_to_host(self):
+        profile = jsonutils.dumps({'migrating_to': 'host2'})
+        self._port.bindings[0].profile = profile
+        self._api.remote_resource_cache.get_resource_by_id.side_effect = [
+            self._port, self._network]
+        entry = self._api.get_device_details(mock.ANY, self._port_id,
+                                             mock.ANY, 'host2')
+        self.assertEqual('host2', entry['migrating_to'])
+
+    def test_get_device_details_hints(self):
+        self._api.remote_resource_cache.get_resource_by_id.side_effect = [
+            self._port, self._network]
+        entry = self._api.get_device_details(
+            mock.ANY, self._port_id, mock.ANY, mock.ANY)
+        self.assertEqual(
+            {"openvswitch": {"other_config": {"tx-steering": "hash"}}},
+            entry['hints'])
 
     @mock.patch('neutron.agent.resource_cache.RemoteResourceCache')
     def test_initialization_with_default_resources(self, rcache_class):

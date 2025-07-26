@@ -18,9 +18,12 @@ import uuid
 
 from neutron_lib.api.definitions import portbindings
 from neutron_lib.api.definitions import provider_net
+from neutron_lib.api.definitions import qinq as qinq_apidef
+from neutron_lib.api.definitions import vlantransparent as vlan_apidef
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib import constants
+from neutron_lib.plugins.ml2 import ovs_constants as ovs_const
 from oslo_config import cfg
 from oslo_log import log
 
@@ -28,8 +31,6 @@ from neutron._i18n import _
 from neutron.agent import securitygroups_rpc
 from neutron.conf.plugins.ml2.drivers.openvswitch import mech_ovs_conf
 from neutron.plugins.ml2.drivers import mech_agent
-from neutron.plugins.ml2.drivers.openvswitch.agent.common \
-    import constants as a_const
 from neutron.services.logapi.drivers.openvswitch import driver as log_driver
 from neutron.services.qos.drivers.openvswitch import driver as ovs_qos_driver
 
@@ -54,41 +55,40 @@ class OpenvswitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
     resource_provider_uuid5_namespace = uuid.UUID(
         '87ee7d5c-73bb-11e8-9008-c4d987b2a692')
 
+    _explicitly_not_supported_extensions = set([
+        vlan_apidef.ALIAS,
+        qinq_apidef.ALIAS
+    ])
+
     def __init__(self):
         sg_enabled = securitygroups_rpc.is_firewall_enabled()
-        hybrid_plug_required = (
-            not cfg.CONF.SECURITYGROUP.firewall_driver or
-            cfg.CONF.SECURITYGROUP.firewall_driver in (
-                IPTABLES_FW_DRIVER_FULL, 'iptables_hybrid')
-        ) and sg_enabled
         vif_details = {portbindings.CAP_PORT_FILTER: sg_enabled,
-                       portbindings.OVS_HYBRID_PLUG: hybrid_plug_required,
                        portbindings.VIF_DETAILS_CONNECTIVITY:
-                           portbindings.CONNECTIVITY_L2}
+                           self.connectivity}
         # NOTE(moshele): Bind DIRECT (SR-IOV) port allows
         # to offload the OVS flows using tc to the SR-IOV NIC.
         # We are using OVS mechanism driver because the openvswitch (>=2.8.0)
         # support hardware offload via tc and that allow us to manage the VF by
         # OpenFlow control plane using representor net-device.
-        super(OpenvswitchMechanismDriver, self).__init__(
+        supported_vnic_types = [portbindings.VNIC_NORMAL,
+                                portbindings.VNIC_DIRECT,
+                                portbindings.VNIC_SMARTNIC,
+                                portbindings.VNIC_VHOST_VDPA,
+                                ]
+        prohibit_list = cfg.CONF.OVS_DRIVER.vnic_type_prohibit_list
+        super().__init__(
             constants.AGENT_TYPE_OVS,
             portbindings.VIF_TYPE_OVS,
-            vif_details)
-
-        # TODO(lajoskatona): move this blacklisting to
-        # SimpleAgentMechanismDriverBase. By that e blacklisting and validation
-        # of the vnic_types would be available for all mechanism drivers.
-        self.supported_vnic_types = self.blacklist_supported_vnic_types(
-            vnic_types=[portbindings.VNIC_NORMAL,
-                        portbindings.VNIC_DIRECT,
-                        portbindings.VNIC_SMARTNIC],
-            blacklist=cfg.CONF.OVS_DRIVER.vnic_type_blacklist
-        )
-        LOG.info("%s's supported_vnic_types: %s",
-                 self.agent_type, self.supported_vnic_types)
+            vif_details,
+            supported_vnic_types=supported_vnic_types,
+            vnic_type_prohibit_list=prohibit_list)
 
         ovs_qos_driver.register()
         log_driver.register()
+
+    @property
+    def connectivity(self):
+        return portbindings.CONNECTIVITY_L2
 
     def get_allowed_network_types(self, agent):
         return (agent['configurations'].get('tunnel_types', []) +
@@ -112,13 +112,9 @@ class OpenvswitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         if 'bridge_mappings' in agent['configurations']:
             return {k: [v] for k, v in
                     agent['configurations']['bridge_mappings'].items()}
-        else:
-            raise ValueError(_('Cannot standardize bridge mappings of agent '
-                               'type: %s'), agent['agent_type'])
-
-    def check_vlan_transparency(self, context):
-        """Currently Openvswitch driver doesn't support vlan transparency."""
-        return False
+        raise ValueError(
+            _('Cannot standardize bridge mappings of agent type: %s'),
+            agent['agent_type'])
 
     def bind_port(self, context):
         vnic_type = context.current.get(portbindings.VNIC_TYPE,
@@ -127,20 +123,25 @@ class OpenvswitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         capabilities = []
         if profile:
             capabilities = profile.get('capabilities', [])
+        # TODO(sean-k-mooney): in the case of the Mellanox connectx6 dx and lx
+        # nics vhost-vdpa is only supported in switchdev mode but that is not
+        # strictly required by other vendors so we should ideally add a config
+        # value to control checking of switchdev support per host via the
+        # agent['configurations']
         if (vnic_type == portbindings.VNIC_DIRECT and
                 'switchdev' not in capabilities):
             LOG.debug("Refusing to bind due to unsupported vnic_type: %s with "
                       "no switchdev capability", portbindings.VNIC_DIRECT)
             return
-        super(OpenvswitchMechanismDriver, self).bind_port(context)
+        super().bind_port(context)
 
     def get_supported_vif_type(self, agent):
         caps = agent['configurations'].get('ovs_capabilities', {})
         if (any(x in caps.get('iface_types', []) for x
-                in [a_const.OVS_DPDK_VHOST_USER,
-                    a_const.OVS_DPDK_VHOST_USER_CLIENT]) and
+                in [ovs_const.OVS_DPDK_VHOST_USER,
+                    ovs_const.OVS_DPDK_VHOST_USER_CLIENT]) and
                 agent['configurations'].get('datapath_type') ==
-                a_const.OVS_DATAPATH_NETDEV):
+                ovs_const.OVS_DATAPATH_NETDEV):
             return portbindings.VIF_TYPE_VHOST_USER
         return self.vif_type
 
@@ -154,7 +155,7 @@ class OpenvswitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         # NOTE(sean-k-mooney): this function converts the ovs vhost user
         # driver mode into the qemu vhost user mode. If OVS is the server,
         # qemu is the client and vice-versa.
-        if (a_const.OVS_DPDK_VHOST_USER_CLIENT in iface_types):
+        if (ovs_const.OVS_DPDK_VHOST_USER_CLIENT in iface_types):
             return portbindings.VHOST_USER_MODE_SERVER
         return portbindings.VHOST_USER_MODE_CLIENT
 
@@ -177,7 +178,7 @@ class OpenvswitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
             vif_details[portbindings.VIF_DETAILS_BRIDGE_NAME] = bridge_name
 
         registry.publish(
-            a_const.OVS_BRIDGE_NAME, events.BEFORE_READ,
+            ovs_const.OVS_BRIDGE_NAME, events.BEFORE_READ,
             set_bridge_name_inner,
             payload=events.EventPayload(None, metadata={'port': port}))
 
@@ -185,12 +186,10 @@ class OpenvswitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         a_config = agent['configurations']
         vif_type = self.get_vif_type(context, agent, segment=None)
         if vif_type != portbindings.VIF_TYPE_VHOST_USER:
-            details = dict(self.vif_details)
-            hybrid = portbindings.OVS_HYBRID_PLUG
-            if hybrid in a_config:
-                # we only override the vif_details for hybrid plugging set
-                # in the constructor if the agent specifically requests it
-                details[hybrid] = a_config[hybrid]
+            details = {
+                **self.vif_details,
+                portbindings.OVS_HYBRID_PLUG: a_config.get(
+                    portbindings.OVS_HYBRID_PLUG)}
         else:
             sock_path = self.agent_vhu_sockpath(agent, context.current['id'])
             caps = a_config.get('ovs_capabilities', {})
@@ -201,14 +200,14 @@ class OpenvswitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
                        portbindings.VHOST_USER_OVS_PLUG: True,
                        portbindings.VHOST_USER_SOCKET: sock_path}
         details[portbindings.OVS_DATAPATH_TYPE] = a_config.get(
-            'datapath_type', a_const.OVS_DATAPATH_SYSTEM)
+            'datapath_type', ovs_const.OVS_DATAPATH_SYSTEM)
         return details
 
     @staticmethod
     def agent_vhu_sockpath(agent, port_id):
         """Return the agent's vhost-user socket path for a given port"""
         sockdir = agent['configurations'].get('vhostuser_socket_dir',
-                                              a_const.VHOST_USER_SOCKET_DIR)
+                                              ovs_const.VHOST_USER_SOCKET_DIR)
         sock_name = (constants.VHOST_USER_DEVICE_PREFIX + port_id)[:14]
         return os.path.join(sockdir, sock_name)
 

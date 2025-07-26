@@ -1,5 +1,5 @@
 - hosts: all
   roles:
-    - fetch_journal_log
+    - prepare_functional_tests_logs
     - fetch-tox-output
     - fetch-subunit-output

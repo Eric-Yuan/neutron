@@ -14,20 +14,19 @@
 from unittest import mock
 
 from neutron_lib.callbacks import events
+from neutron_lib.callbacks import priority_group
 from neutron_lib.callbacks import resources
 from neutron_lib import fixture
 
 from neutron.api.rpc.callbacks import resource_manager
-from neutron.services.trunk import callbacks
 from neutron.services.trunk.rpc import backend
 from neutron.tests import base
-from neutron.tests import tools
 
 
 class ServerSideRpcBackendTest(base.BaseTestCase):
     # TODO(fitoduarte): add more test to improve coverage of module
     def setUp(self):
-        super(ServerSideRpcBackendTest, self).setUp()
+        super().setUp()
         self._mgr = mock.Mock()
         self.useFixture(fixture.CallbackRegistryFixture(
             callback_manager=self._mgr))
@@ -38,25 +37,29 @@ class ServerSideRpcBackendTest(base.BaseTestCase):
         test_obj = backend.ServerSideRpcBackend()
 
         calls = [mock.call(
-                    *tools.get_subscribe_args(
-                        test_obj.process_event,
-                        resources.TRUNK,
-                        events.AFTER_CREATE)),
+                    test_obj.process_event,
+                    resources.TRUNK,
+                    events.AFTER_CREATE,
+                    priority_group.PRIORITY_DEFAULT,
+                    False),
                  mock.call(
-                    *tools.get_subscribe_args(
-                        test_obj.process_event,
-                        resources.TRUNK,
-                        events.AFTER_DELETE)),
+                    test_obj.process_event,
+                    resources.TRUNK,
+                    events.AFTER_DELETE,
+                    priority_group.PRIORITY_DEFAULT,
+                    False),
                  mock.call(
-                    *tools.get_subscribe_args(
-                        test_obj.process_event,
-                        resources.SUBPORTS,
-                        events.AFTER_CREATE)),
+                    test_obj.process_event,
+                    resources.SUBPORTS,
+                    events.AFTER_CREATE,
+                    priority_group.PRIORITY_DEFAULT,
+                    False),
                  mock.call(
-                    *tools.get_subscribe_args(
-                        test_obj.process_event,
-                        resources.SUBPORTS,
-                        events.AFTER_DELETE))
+                    test_obj.process_event,
+                    resources.SUBPORTS,
+                    events.AFTER_DELETE,
+                    priority_group.PRIORITY_DEFAULT,
+                    False),
                  ]
         self._mgr.subscribe.assert_has_calls(calls, any_order=True)
 
@@ -67,17 +70,18 @@ class ServerSideRpcBackendTest(base.BaseTestCase):
 
         test_obj.process_event(
             resources.TRUNK, events.AFTER_CREATE, trunk_plugin,
-            callbacks.TrunkPayload("context",
-                                   "id",
-                                   current_trunk="current_trunk"))
+            events.DBEventPayload("context",
+                                  resource_id="id",
+                                  states=("current_trunk",)))
+
         test_obj.process_event(
             resources.TRUNK, events.AFTER_DELETE, trunk_plugin,
-            callbacks.TrunkPayload("context",
-                                   "id",
-                                   original_trunk="original_trunk"))
+            events.DBEventPayload("context",
+                                  resource_id="id",
+                                  states=("original_trunk",)))
 
         calls = [mock.call.trunk_created("context",
-                           "current_trunk"),
+                                         "current_trunk"),
                  mock.call.trunk_deleted("context",
-                           "original_trunk")]
+                                         "original_trunk")]
         mock_stub.assert_has_calls(calls, any_order=False)

@@ -13,7 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import os
 import shlex
 
 from oslo_config import cfg
@@ -30,31 +29,7 @@ EXTERNAL_PROCESS_OPTS = [
 ]
 
 
-PD_OPTS = [
-    cfg.StrOpt('pd_dhcp_driver',
-               default='dibbler',
-               help=_('Service to handle DHCPv6 Prefix delegation.')),
-]
-
-
-PD_DRIVER_OPTS = [
-    cfg.StrOpt('pd_confs',
-               default='$state_path/pd',
-               help=_('Location to store IPv6 PD files.')),
-    cfg.StrOpt('vendor_pen',
-               default='8888',
-               help=_("A decimal value as Vendor's Registered Private "
-                      "Enterprise Number as required by RFC3315 DUID-EN.")),
-]
-
-
 INTERFACE_OPTS = [
-    cfg.StrOpt('ovs_integration_bridge',
-               default='br-int',
-               deprecated_for_removal=True,
-               deprecated_reason='This variable is a duplicate of '
-                                 'OVS.integration_bridge. To be removed in W.',
-               help=_('Name of Open vSwitch bridge to use')),
     cfg.BoolOpt('ovs_use_veth',
                 default=False,
                 help=_("Uses veth for an OVS interface or not. "
@@ -68,7 +43,8 @@ INTERFACE_OPTS = [
 RA_OPTS = [
     cfg.StrOpt('ra_confs',
                default='$state_path/ra',
-               help=_('Location to store IPv6 RA config files')),
+               help=_('Location to store IPv6 Router Advertisement config '
+                      'files')),
     cfg.IntOpt('min_rtr_adv_interval',
                default=30,
                help=_('MinRtrAdvInterval setting for radvd.conf')),
@@ -105,10 +81,6 @@ in "daemon mode" which has been reported to improve performance at scale. For
 more information on running rootwrap in "daemon mode", see:
 
 https://docs.openstack.org/oslo.rootwrap/latest/user/usage.html#daemon-mode
-
-For the agent which needs to execute commands in Dom0 in the hypervisor of
-XenServer, this option should be set to 'xenapi_root_helper', so that it will
-keep a XenAPI session to pass commands to Dom0.
 """)),
 ]
 
@@ -123,7 +95,8 @@ AGENT_STATE_OPTS = [
 
 INTERFACE_DRIVER_OPTS = [
     cfg.StrOpt('interface_driver',
-               help=_("The driver used to manage the virtual interface.")),
+               default='openvswitch',
+               help=_("The driver used to manage virtual interfaces.")),
 ]
 
 IPTABLES_OPTS = [
@@ -139,6 +112,9 @@ IPTABLES_OPTS = [
                        "of iptables-save. This option should not be turned "
                        "on for production systems because it imposes a "
                        "performance penalty.")),
+    cfg.BoolOpt('use_random_fully',
+                default=True,
+                help=_("Use random-fully in SNAT masquerade rules.")),
 ]
 
 PROCESS_MONITOR_OPTS = [
@@ -146,8 +122,8 @@ PROCESS_MONITOR_OPTS = [
                choices=['respawn', 'exit'],
                help=_('Action to be executed when a child process dies')),
     cfg.IntOpt('check_child_processes_interval', default=60,
-               help=_('Interval between checks of child process liveness '
-                      '(seconds), use 0 to disable')),
+               help=_('Interval between checks of child process liveness, '
+                      'in seconds, use 0 to disable')),
     cfg.StrOpt('kill_scripts_path', default='/etc/neutron/kill_scripts/',
                help=_('Location of scripts used to kill external processes. '
                       'Names of scripts here must follow the pattern: '
@@ -167,49 +143,26 @@ AVAILABILITY_ZONE_OPTS = [
 ]
 
 
-def get_log_args(conf, log_file_name, **kwargs):
-    cmd_args = []
-    if conf.debug:
-        cmd_args.append('--debug')
-    if (conf.log_dir or conf.log_file):
-        cmd_args.append('--log-file=%s' % log_file_name)
-        log_dir = None
-        if conf.log_dir and conf.log_file:
-            log_dir = os.path.dirname(
-                os.path.join(conf.log_dir, conf.log_file))
-        elif conf.log_dir:
-            log_dir = conf.log_dir
-        elif conf.log_file:
-            log_dir = os.path.dirname(conf.log_file)
-        if log_dir:
-            cmd_args.append('--log-dir=%s' % log_dir)
-    else:
-        if conf.use_syslog:
-            cmd_args.append('--use-syslog')
-            if conf.syslog_log_facility:
-                cmd_args.append(
-                    '--syslog-log-facility=%s' % conf.syslog_log_facility)
-    return cmd_args
+DHCP_PROTOCOL_OPTS = [
+    cfg.IntOpt('dhcp_renewal_time', default=0,
+               help=_("DHCP renewal time T1 (in seconds). If set to 0, it "
+                      "will default to half of the lease time.")),
+    cfg.IntOpt('dhcp_rebinding_time', default=0,
+               help=_("DHCP rebinding time T2 (in seconds). If set to 0, it "
+                      "will default to 7/8 of the lease time.")),
+]
 
 
-def register_external_process_opts(cfg=cfg.CONF):
-    cfg.register_opts(EXTERNAL_PROCESS_OPTS)
+def register_external_process_opts(conf=cfg.CONF):
+    conf.register_opts(EXTERNAL_PROCESS_OPTS)
 
 
-def register_pd_opts(cfg=cfg.CONF):
-    cfg.register_opts(PD_OPTS)
+def register_interface_opts(conf=cfg.CONF):
+    conf.register_opts(INTERFACE_OPTS)
 
 
-def register_pddriver_opts(cfg=cfg.CONF):
-    cfg.register_opts(PD_DRIVER_OPTS)
-
-
-def register_interface_opts(cfg=cfg.CONF):
-    cfg.register_opts(INTERFACE_OPTS)
-
-
-def register_ra_opts(cfg=cfg.CONF):
-    cfg.register_opts(RA_OPTS)
+def register_ra_opts(conf=cfg.CONF):
+    conf.register_opts(RA_OPTS)
 
 
 def register_root_helper(conf=cfg.CONF):

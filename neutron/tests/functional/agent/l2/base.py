@@ -15,11 +15,12 @@
 #    under the License.
 
 import random
+import threading
 from unittest import mock
 
-import eventlet
 import fixtures
 from neutron_lib import constants as n_const
+from neutron_lib.plugins.ml2 import ovs_constants
 from neutron_lib.utils import net
 from oslo_config import cfg
 from oslo_utils import uuidutils
@@ -32,9 +33,9 @@ from neutron.common import utils
 from neutron.conf.agent import common as agent_config
 from neutron.conf.agent import ovs_conf as ovs_agent_config
 from neutron.conf import common as common_config
+from neutron.conf.plugins.ml2 import config as ml2_config
 from neutron.conf.plugins.ml2.drivers import agent
 from neutron.conf.plugins.ml2.drivers import ovs_conf
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants
 from neutron.plugins.ml2.drivers.openvswitch.agent.extension_drivers \
     import qos_driver as ovs_qos_driver
 from neutron.plugins.ml2.drivers.openvswitch.agent.openflow.native \
@@ -45,7 +46,7 @@ from neutron.tests.common import net_helpers
 from neutron.tests.functional.agent.linux import base
 
 
-class OVSOFControllerHelper(object):
+class OVSOFControllerHelper:
     """Helper class that runs os-ken openflow controller."""
 
     def start_of_controller(self, conf):
@@ -53,8 +54,8 @@ class OVSOFControllerHelper(object):
         self.br_tun_cls = None
         self.br_phys_cls = None
         self.init_done = False
-        self.init_done_ev = eventlet.event.Event()
-        self.main_ev = eventlet.event.Event()
+        self.init_done_ev = threading.Event()
+        self.main_ev = threading.Event()
         self.addCleanup(self._kill_main)
         retry_count = 3
         while True:
@@ -68,7 +69,8 @@ class OVSOFControllerHelper(object):
                                   conf.OVS.of_listen_port,
                                   group='OVS')
             main_mod.init_config()
-            self._main_thread = eventlet.spawn(self._kick_main)
+            self._main_thread = threading.Thread(target=self._kick_main)
+            self._main_thread.start()
 
             # Wait for _kick_main -> openflow main -> _agent_main
             # NOTE(yamamoto): This complexity came from how we run openflow
@@ -92,17 +94,17 @@ class OVSOFControllerHelper(object):
             main_mod.main()
 
     def _kill_main(self):
-        self.main_ev.send()
-        self._main_thread.wait()
+        self.main_ev.set()
+        self._main_thread.join()
 
-    def _agent_main(self, bridge_classes):
+    def _agent_main(self, bridge_classes, register_signal=None):
         self.br_int_cls = bridge_classes['br_int']
         self.br_phys_cls = bridge_classes['br_phys']
         self.br_tun_cls = bridge_classes['br_tun']
 
         # signal to setUp()
         self.init_done = True
-        self.init_done_ev.send()
+        self.init_done_ev.set()
 
         self.main_ev.wait()
 
@@ -110,7 +112,7 @@ class OVSOFControllerHelper(object):
 class OVSAgentTestFramework(base.BaseOVSLinuxTestCase, OVSOFControllerHelper):
 
     def setUp(self):
-        super(OVSAgentTestFramework, self).setUp()
+        super().setUp()
         agent_rpc = ('neutron.plugins.ml2.drivers.openvswitch.agent.'
                      'ovs_neutron_agent.OVSPluginApi')
         mock.patch(agent_rpc).start()
@@ -140,13 +142,11 @@ class OVSAgentTestFramework(base.BaseOVSLinuxTestCase, OVSOFControllerHelper):
         agent_config.register_agent_state_opts_helper(config)
         ovs_agent_config.register_ovs_agent_opts(config)
         ext_manager.register_opts(config)
+        ml2_config.register_ml2_plugin_opts(cfg=config)
         return config
 
     def _configure_agent(self):
         config = self._get_config_opts()
-        config.set_override(
-            'interface_driver',
-            'neutron.agent.linux.interface.OVSInterfaceDriver')
         config.set_override('integration_bridge', self.br_int, "OVS")
         config.set_override('tunnel_bridge', self.br_tun, "OVS")
         config.set_override('int_peer_patch_port', self.patch_tun, "OVS")
@@ -176,7 +176,7 @@ class OVSAgentTestFramework(base.BaseOVSLinuxTestCase, OVSOFControllerHelper):
         self._bridge_classes()['br_phys'](self.br_phys).create()
         ext_mgr = ext_manager.L2AgentExtensionsManager(self.config)
         with mock.patch.object(ovs_qos_driver.QosOVSAgentDriver,
-                               '_minimum_bandwidth_initialize'):
+                               '_qos_bandwidth_initialize'):
             agent = ovs_agent.OVSNeutronAgent(self._bridge_classes(),
                                               ext_mgr, self.config)
         self.addCleanup(self.ovs.delete_bridge, self.br_int)
@@ -213,7 +213,7 @@ class OVSAgentTestFramework(base.BaseOVSLinuxTestCase, OVSOFControllerHelper):
 
     def stop_agent(self, agent, rpc_loop_thread):
         agent.run_daemon_loop = False
-        rpc_loop_thread.wait()
+        rpc_loop_thread.join()
 
     def start_agent(self, agent, ports=None, unplug_ports=None):
         if unplug_ports is None:
@@ -228,9 +228,10 @@ class OVSAgentTestFramework(base.BaseOVSLinuxTestCase, OVSOFControllerHelper):
         utils.wait_until_true(
             polling_manager._monitor.is_active)
         agent.check_ovs_status = mock.Mock(
-            return_value=constants.OVS_NORMAL)
-        self.agent_thread = eventlet.spawn(agent.rpc_loop,
-                                           polling_manager)
+            return_value=ovs_constants.OVS_NORMAL)
+        self.agent_thread = threading.Thread(
+            target=agent.rpc_loop, args=(polling_manager,))
+        self.agent_thread.start()
 
         self.addCleanup(self.stop_agent, agent, self.agent_thread)
         return polling_manager
@@ -465,13 +466,16 @@ class OVSAgentTestFramework(base.BaseOVSLinuxTestCase, OVSOFControllerHelper):
         self._plug_ports(network, ports, self.agent, bridge=phys_br,
                          namespace=namespace)
 
-        if network_type == 'flat':
-            # NOTE(slaweq): for OVS implementations remove the DEAD VLAN tag
-            # on ports that belongs to flat network. DEAD VLAN tag is added
-            # to each newly created port. This is related to lp#1767422
-            for port in ports:
+        for port in ports:
+            if network_type == 'flat':
+                # NOTE(slaweq): for OVS implementations remove the DEAD VLAN
+                # tag on ports that belongs to flat network. DEAD VLAN tag is
+                # added to each newly created port.
+                # This is related to lp#1767422
                 phys_br.clear_db_attribute("Port", port['vif_name'], "tag")
-        elif phys_segmentation_id and network_type == 'vlan':
-            for port in ports:
+            elif phys_segmentation_id and network_type == 'vlan':
                 phys_br.set_db_attribute(
                     "Port", port['vif_name'], "tag", phys_segmentation_id)
+            # Clear vlan_mode that is added for each new port. lp#1930414
+            phys_br.clear_db_attribute("Port", port['vif_name'], "vlan_mode")
+            phys_br.clear_db_attribute("Port", port['vif_name'], "trunks")

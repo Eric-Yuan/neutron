@@ -27,7 +27,10 @@ A routed provider network enables a single provider network to represent
 multiple layer-2 networks (broadcast domains) or segments and enables the
 operator to present one network to users. However, the particular IP
 addresses available to an instance depend on the segment of the network
-available on the particular compute node.
+available on the particular compute node. Neutron port could be associated
+with only one network segment, but there is an exception for OVN distributed
+services like OVN Metadata.
+
 
 Similar to conventional networking, layer-2 (switching) handles transit of
 traffic between ports on the same segment and layer-3 (routing) handles
@@ -180,6 +183,14 @@ Controller node
       region_name = RegionOne
 
 #. Restart the ``neutron-server`` service.
+
+#. (Optional) Configure the Nova scheduler to filter based upon routed network
+   host aggregates. Without this option set, once ports are attached to
+   instances and have IP addresses assigned, Nova may schedule instances to
+   hosts which do not have access to the required segment. See the `Nova
+   configuration reference
+   <https://docs.openstack.org/nova/latest/configuration/config.html#scheduler.query_placement_for_routed_network_aggregates>`_
+   for more information.
 
 Network or compute nodes
 ------------------------
@@ -521,3 +532,152 @@ one segment to a routed one.
       +------------+--------------------------------------+
       | segment_id | 81e5453d-4c9f-43a5-8ddf-feaf3937e8c7 |
       +------------+--------------------------------------+
+
+
+Routed provider networks as external networks for tenant routed networks
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. note::
+
+   This section applies only to legacy routers, not DVR nor HA routers. A
+   legacy router has a single instance that is hosted in one single host.
+
+One of the consequences of this feature is the externalization of any routing
+operation. The communication (routing) between segments is done using the
+underlying network infrastructure, not managed by Neutron.
+
+Could be the case that the user needs to split the communication between
+several hosts. It is possible to create tenant networks and connect them using
+a router. To access to the routed provider network, it should be connected
+as router gateway.
+
+.. code-block:: bash
+
+   Tenant net1  ┌─────────────────────┐
+   ─────────────┤                     │
+                │                     │ Routed provided network
+                │             GW port ├────────────────────────
+   Tenant net2  │                     │
+   ─────────────┤                     │
+                └─────────────────────┘
+
+The routed provider network, acting as router gateway, contains all subnets
+associated to the segments. In a deployment without routed provided networks,
+the gateway port has L2 connectivity to all subnet CIDRs. In this case, the
+gateway port has only connectivity to the attached segment subnets and its
+L2 broadcast domains.
+
+The L3 agent will create, inside the router namespace, a default route in the
+gateway port fixed IP CIDR. For each other subnet not belonging to the port's
+fixed IP address, an onlink route is created. These routes use the gateway port
+as routing device and allow to route any packet with destination on these
+CIDRs through this port.
+
+The problem in the case of connecting the gatewat port to a routed provider
+network is that it will have broadcast connectivity only to those subnets
+that belong to the host segment:
+
+* One of those subnets will provide the port IP address. The gateway IP address
+  of this subnet will be the default route, through the gateway port.
+* Any other subnet belonging to this segment will create a onlink route, using
+  the gateway port as route device.
+
+For example, let's consider the following configuration:
+
+* Two tenant networks with CIDRs 10.1.0.0/24 and 10.2.0.0/24.
+* A RPN with two segments; each segment with two subnets: segment 1 with
+  10.51.0.0/24 and 10.52.0.0/24, segment 2 with 10.53.0.0/24 and 10.54.0.0/24.
+* The router is connected to the first segment and the gateway port has an IP
+  address in the range of 10.51.0.0/24. This is why the default route uses
+  an IP address in this range.
+
+Without considering that the gateway network is a router provided network, this
+is the routing table set in the router namespace:
+
+.. code-block:: bash
+
+   $ ip netns exec $r ip r
+   default via 10.51.0.1 dev qg-gwport proto static
+   10.1.0.0/24 dev qr-tenant1 proto kernel scope link src 10.1.0.1
+   10.2.0.0/24 dev qr-tenant2 proto kernel scope link src 10.2.0.1
+   10.51.0.0/24 dev qg-gwport proto kernel scope link src 10.100.0.15
+   10.52.0.0/24 dev qg-gwport proto static scope link
+   10.53.0.0/24 dev qg-gwport proto static scope link  <-- should be removed, belongs to segment 2
+   10.54.0.0/24 dev qg-gwport proto static scope link  <-- should be removed, belongs to segment 2
+
+Those packets sent to 10.53.0.0/24 and 10.54.0.0/24 (the second RPN subnet
+CIDRs), don't have L2 connectivity and the ARP packets won't be replied. In the
+case of having a RPN as gateway network, all packets exiting the router through
+the gateway, must be sent to the gateway IP address, in this case 10.51.0.1.
+This is why the L3 plugin does not send the information of other segments
+subnets L3 agent when:
+
+* The network is the router gateway.
+* The "segments" plugin is enabled; this plugin is needed for routed provided
+  networks.
+* The network is connected to a segment.
+
+
+Multiple routed provider segments per host
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Starting with 2023.1 (Antelope), the support of routed provider networks has
+been enhanced to handle multiple segments per host. The main
+consequence will be for an operator to extend the IP pool without
+creating multiple networks and/or increasing broadcast domain.
+
+.. note::
+
+   The present support is only available for OVS agent at this point.
+
+#. On a given provider network, create a second segment. In this
+   example, the second segment uses the ``provider1`` physical network
+   with VLAN ID 2020.
+
+   .. code-block:: console
+
+      $ openstack network segment create --physical-network provider1 \
+        --network-type vlan --segment 2020 --network multisegment1 segment1-2
+      +------------------+--------------------------------------+
+      | Field            | Value                                |
+      +------------------+--------------------------------------+
+      | description      | None                                 |
+      | headers          |                                      |
+      | id               | 333b7925-9a89-4489-9992-e164c8cc8764 |
+      | name             | segment1-2                           |
+      | network_id       | 6ab19caa-dda9-4b3d-abc4-5b8f435b98d9 |
+      | network_type     | vlan                                 |
+      | physical_network | provider1                            |
+      | revision_number  | 1                                    |
+      | segmentation_id  | 2020                                 |
+      | tags             | []                                   |
+      +------------------+--------------------------------------+
+
+#. Create subnets on the ``segment1-2`` segment. In this example, the IPv4
+   subnet uses 203.0.114.0/24.
+
+   .. code-block:: console
+
+       $ openstack subnet create \
+        --network multisegment1 --network-segment segment1-2 \
+        --ip-version 4 --subnet-range 203.0.114.0/24 \
+        multisegment1-segment1-2
+      +-------------------+--------------------------------------+
+      | Field             | Value                                |
+      +-------------------+--------------------------------------+
+      | allocation_pools  | 203.0.114.2-203.0.114.254            |
+      | cidr              | 203.0.114.0/24                       |
+      | enable_dhcp       | True                                 |
+      | gateway_ip        | 203.0.114.1                          |
+      | id                | c428797a-6f8e-4cb1-b394-c404318a2762 |
+      | ip_version        | 4                                    |
+      | name              | multisegment1-segment1-2             |
+      | network_id        | 6ab19caa-dda9-4b3d-abc4-5b8f435b98d9 |
+      | revision_number   | 1                                    |
+      | segment_id        | 333b7925-9a89-4489-9992-e164c8cc8764 |
+      | tags              | []                                   |
+      +-------------------+--------------------------------------+
+
+Considering that, for a subnet of the given provider network
+``provider1`` running out of available IP, Neutron will automatically
+switch to the subnet ``multisegment1-segment1-2``.

@@ -61,7 +61,6 @@ Controller node
 
         [DEFAULT]
         service_plugins = router
-        allow_overlapping_ips = True
 
 #. In the ``ml2_conf.ini`` file:
 
@@ -144,13 +143,6 @@ Network node
    Replace ``OVERLAY_INTERFACE_IP_ADDRESS`` with the IP address of the
    interface that handles VXLAN overlays for self-service networks.
 
-#. In the ``l3_agent.ini`` file, configure the layer-3 agent.
-
-   .. code-block:: ini
-
-      [DEFAULT]
-      interface_driver = openvswitch
-
 #. Start the following services:
 
    * Open vSwitch agent
@@ -208,7 +200,7 @@ Create initial networks
 Verify network operation
 ------------------------
 
-.. include:: shared/deploy-selfservice-verifynetworkoperation.txt
+.. include:: deploy-selfservice-verifynetworkoperation.txt
 
 .. _deploy-ovs-selfservice-networktrafficflow:
 

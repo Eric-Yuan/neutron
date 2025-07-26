@@ -28,6 +28,7 @@ from oslo_service import service
 from neutron.agent.linux import ip_lib
 from neutron.api.rpc.handlers import securitygroups_rpc as sg_rpc
 from neutron.common import config as common_config
+from neutron.conf.agent import common as agent_config
 from neutron.conf.plugins.ml2.drivers import macvtap as config
 from neutron.plugins.ml2.drivers.agent import _agent_manager_base as amb
 from neutron.plugins.ml2.drivers.agent import _common_agent as ca
@@ -35,7 +36,6 @@ from neutron.plugins.ml2.drivers.macvtap import macvtap_common
 
 LOG = logging.getLogger(__name__)
 
-MACVTAP_AGENT_BINARY = "neutron-macvtap-agent"
 MACVTAP_FS = "/sys/class/net/"
 EXTENSION_DRIVER_TYPE = 'macvtap'
 
@@ -206,9 +206,12 @@ def validate_firewall_driver():
 
 
 def main():
+    common_config.register_common_config_options()
     common_config.init(sys.argv[1:])
 
     common_config.setup_logging()
+    common_config.setup_gmr()
+    agent_config.setup_privsep()
 
     validate_firewall_driver()
     interface_mappings = parse_interface_mappings()
@@ -220,7 +223,7 @@ def main():
     agent = ca.CommonAgentLoop(manager, polling_interval,
                                quitting_rpc_timeout,
                                constants.AGENT_TYPE_MACVTAP,
-                               MACVTAP_AGENT_BINARY)
+                               constants.AGENT_PROCESS_MACVTAP)
     LOG.info("Agent initialized successfully, now running... ")
     launcher = service.launch(cfg.CONF, agent, restart_method='mutate')
     launcher.wait()

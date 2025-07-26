@@ -19,6 +19,7 @@ import copy
 import netaddr
 from neutron_lib.api.definitions import expose_port_forwarding_in_fip
 from neutron_lib.api.definitions import fip_pf_description
+from neutron_lib.api.definitions import fip_pf_port_range
 from neutron_lib.api.definitions import floating_ip_port_forwarding as apidef
 from neutron_lib.api.definitions import l3
 from neutron_lib.callbacks import events
@@ -33,6 +34,7 @@ from neutron_lib.objects import exceptions as obj_exc
 from neutron_lib.plugins import constants
 from neutron_lib.plugins import directory
 from oslo_config import cfg
+from oslo_db import exception as oslo_db_exc
 from oslo_log import log as logging
 
 from neutron._i18n import _
@@ -45,7 +47,6 @@ from neutron.extensions import floating_ip_port_forwarding as fip_pf
 from neutron.objects import base as base_obj
 from neutron.objects import port_forwarding as pf
 from neutron.objects import router as l3_obj
-from neutron.services.portforwarding import callbacks
 from neutron.services.portforwarding.common import exceptions as pf_exc
 from neutron.services.portforwarding import constants as pf_consts
 
@@ -56,15 +57,25 @@ PORT_FORWARDING_FLOATINGIP_KEY = '_pf_floatingips'
 
 
 def _required_service_plugins():
-    supported_svc_plugins = [l3.ROUTER, 'ovn-router']
+    SvcPlugin = collections.namedtuple('SvcPlugin', 'plugin uses_rpc')
+    l3_router = SvcPlugin(l3.ROUTER, True)
+    supported_svc_plugins = [
+        l3_router,
+        SvcPlugin('ovn-router', False),
+        SvcPlugin('neutron.services.ovn_l3.plugin.OVNL3RouterPlugin', False)]
+    plugins = []
+    rpc_required = False
     try:
-        plugins = [svc for svc in supported_svc_plugins if
-                   svc in cfg.CONF.service_plugins]
+        for svc in supported_svc_plugins:
+            if svc.plugin in cfg.CONF.service_plugins:
+                plugins.append(svc.plugin)
+                rpc_required |= svc.uses_rpc
     except cfg.NoSuchOptError:
-        plugins = None
         pass
-    # Use l3.ROUTER as required service plugin if no other was provided.
-    return plugins or [l3.ROUTER]
+    if plugins:
+        return plugins, rpc_required
+    # Use l3_router as required service plugin if no other was provided.
+    return [l3_router.plugin], l3_router.uses_rpc
 
 
 @resource_extend.has_resource_extenders
@@ -75,19 +86,22 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
     This class implements a Port Forwarding plugin.
     """
 
-    required_service_plugins = _required_service_plugins()
+    required_service_plugins, _rpc_notifications_required = \
+        _required_service_plugins()
 
     supported_extension_aliases = [apidef.ALIAS,
                                    expose_port_forwarding_in_fip.ALIAS,
-                                   fip_pf_description.ALIAS]
+                                   fip_pf_description.ALIAS,
+                                   fip_pf_port_range.ALIAS]
 
     __native_pagination_support = True
     __native_sorting_support = True
     __filter_validation_support = True
 
     def __init__(self):
-        super(PortForwardingPlugin, self).__init__()
-        self.push_api = resources_rpc.ResourcesPushRpcApi()
+        super().__init__()
+        self.push_api = resources_rpc.ResourcesPushRpcApi() \
+            if self._rpc_notifications_required else None
         self.l3_plugin = directory.get_plugin(constants.L3)
         self.core_plugin = directory.get_plugin()
         registry.publish(pf_consts.PORT_FORWARDING_PLUGIN, events.AFTER_INIT,
@@ -96,8 +110,9 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
     @staticmethod
     @resource_extend.extends([l3.FLOATINGIPS])
     def _extend_floatingip_dict(result_dict, db):
-        fields = [apidef.INTERNAL_IP_ADDRESS, apidef.PROTOCOL,
-                  apidef.INTERNAL_PORT, apidef.EXTERNAL_PORT]
+        fields = [apidef.ID, apidef.INTERNAL_IP_ADDRESS, apidef.PROTOCOL,
+                  apidef.INTERNAL_PORT, apidef.EXTERNAL_PORT,
+                  apidef.INTERNAL_PORT_ID]
         result_dict[apidef.COLLECTION_NAME] = []
         if db.port_forwardings:
             port_forwarding_result = []
@@ -136,19 +151,20 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
 
     @registry.receives(resources.FLOATING_IP, [events.PRECOMMIT_UPDATE,
                                                events.PRECOMMIT_DELETE])
-    def _check_floatingip_request(self, resource, event, trigger, context,
-                                  **kwargs):
+    def _check_floatingip_request(self, resource, event, trigger, payload):
         # We only support the "free" floatingip to be associated with
         # port forwarding resources. And in the PUT request of floatingip,
         # the request body must contain a "port_id" field which is not
         # allowed in port forwarding functionality.
+        context = payload.context
         floatingip_id = None
         if event == events.PRECOMMIT_UPDATE:
-            fip_db = kwargs.get('floatingip_db')
+            floatingip = payload.states[-1]
+            fip_db = payload.desired_state
             floatingip_id = fip_db.id
             # Here the key-value must contain a floatingip param, and the value
             # must a dict with key 'floatingip'.
-            if not kwargs['floatingip']['floatingip'].get('port_id'):
+            if not floatingip['floatingip'].get('port_id'):
                 # Only care about the associate floatingip cases.
                 # The port_id field is a must-option. But if a floatingip
                 # disassociate a internal port, the port_id should be null.
@@ -156,24 +172,29 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
                           'request does not contain port_id.', floatingip_id)
                 return
         elif event == events.PRECOMMIT_DELETE:
-            floatingip_id = kwargs.get('port').get('device_id')
+            port = payload.states[-1]
+            floatingip_id = port.get('device_id')
         if not floatingip_id:
             return
 
-        exist_pf_resources = pf.PortForwarding.get_objects(
-            context, floatingip_id=floatingip_id)
-        if exist_pf_resources:
+        if pf.PortForwarding.objects_exist(context,
+                                           floatingip_id=floatingip_id):
             raise pf_exc.FipInUseByPortForwarding(id=floatingip_id)
 
     @registry.receives(resources.PORT, [events.AFTER_UPDATE,
                                         events.PRECOMMIT_DELETE])
+    def _process_port_request_handler(self, resource, event, trigger,
+                                      payload):
+
+        return self._process_port_request(event, payload.context,
+                                          payload.latest_state)
+
     @db_api.retry_if_session_inactive()
-    def _process_port_request(self, resource, event, trigger, context,
-                              **kwargs):
+    def _process_port_request(self, event, context, port):
         # Deleting floatingip will receive port resource with precommit_delete
         # event, so just return, then check the request in
         # _check_floatingip_request callback.
-        if kwargs['port']['device_owner'].startswith(
+        if port['device_owner'].startswith(
                 lib_consts.DEVICE_OWNER_FLOATINGIP):
             return
 
@@ -183,8 +204,8 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
         # port forwarding resources need to be deleted for port's AFTER_UPDATE
         # event. Or get all affected ip addresses for port's PRECOMMIT_DELETE
         # event.
-        port_id = kwargs['port']['id']
-        update_fixed_ips = kwargs['port']['fixed_ips']
+        port_id = port['id']
+        update_fixed_ips = port['fixed_ips']
         update_ip_set = set()
         for update_fixed_ip in update_fixed_ips:
             if (netaddr.IPNetwork(update_fixed_ip.get('ip_address')).version ==
@@ -241,13 +262,15 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
                     pf_resource.delete()
                     remove_port_forwarding_list.append(pf_resource)
 
-        self.push_api.push(context, remove_port_forwarding_list,
-                           rpc_events.DELETED)
-        registry_notify_payload = [
-            callbacks.PortForwardingPayload(context, original_pf=pf_obj) for
-            pf_obj in remove_port_forwarding_list]
-        registry.notify(pf_consts.PORT_FORWARDING, events.AFTER_DELETE, self,
-                        payload=registry_notify_payload)
+        if self._rpc_notifications_required:
+            self.push_api.push(context, remove_port_forwarding_list,
+                               rpc_events.DELETED)
+        for pf_obj in remove_port_forwarding_list:
+            payload = events.DBEventPayload(context, states=(pf_obj,))
+            registry.publish(pf_consts.PORT_FORWARDING,
+                             events.AFTER_DELETE,
+                             self,
+                             payload=payload)
 
     def _get_internal_ip_subnet(self, request_ip, fixed_ips):
         request_ip = netaddr.IPNetwork(request_ip)
@@ -288,9 +311,9 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
                     "not suitable for internal neutron port "
                     "%(internal_port_id)s, as its fixed_ips are "
                     "%(fixed_ips)s") % {
-                    'internal_ip_address': internal_ip_address,
-                    'internal_port_id': internal_port['id'],
-                    'fixed_ips': v4_fixed_ips}
+                        'internal_ip_address': internal_ip_address,
+                        'internal_port_id': internal_port['id'],
+                        'fixed_ips': v4_fixed_ips}
                 raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
                                          msg=message)
 
@@ -306,10 +329,10 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
                 "subnet %(internal_subnet_id)s. Cannot set "
                 "Port forwarding for port %(internal_port_id)s with "
                 "Floating IP %(port_forwarding_id)s") % {
-                'external_net_id': external_network_id,
-                'internal_subnet_id': internal_subnet_id,
-                'internal_port_id': internal_port_id,
-                'port_forwarding_id': fip_obj.id}
+                    'external_net_id': external_network_id,
+                    'internal_subnet_id': internal_subnet_id,
+                    'internal_port_id': internal_port_id,
+                    'port_forwarding_id': fip_obj.id}
             raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
                                      msg=message)
 
@@ -332,6 +355,7 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
         port_forwarding = port_forwarding.get(apidef.RESOURCE_NAME)
         port_forwarding['floatingip_id'] = floatingip_id
 
+        self._check_port_collisions(context, floatingip_id, port_forwarding)
         self._check_port_has_binding_floating_ip(context, port_forwarding)
         with db_api.CONTEXT_WRITER.using(context):
             fip_obj = self._get_fip_obj(context, floatingip_id)
@@ -362,19 +386,22 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
             except obj_exc.NeutronDbObjectDuplicateEntry:
                 (__,
                  conflict_params) = self._find_existing_port_forwarding(
-                    context, floatingip_id, port_forwarding)
+                     context, floatingip_id, port_forwarding)
                 message = _("A duplicate port forwarding entry with same "
                             "attributes already exists, conflicting "
                             "values are %s") % conflict_params
                 raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
                                          msg=message)
 
+        registry.publish(pf_consts.PORT_FORWARDING, events.AFTER_CREATE,
+                         self,
+                         payload=events.DBEventPayload(context,
+                                                       states=(pf_obj,)))
+
+        if self._rpc_notifications_required:
             self.push_api.push(context, [pf_obj], rpc_events.CREATED)
-            registry.notify(pf_consts.PORT_FORWARDING, events.AFTER_CREATE,
-                            self,
-                            payload=[callbacks.PortForwardingPayload(context,
-                                current_pf=pf_obj)])
-            return pf_obj
+
+        return pf_obj
 
     @db_base_plugin_common.convert_result_to_dict
     def update_floatingip_port_forwarding(self, context, id, floatingip_id,
@@ -407,15 +434,28 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
                 internal_port = port_forwarding.get('internal_port')
                 if any([internal_ip_address, internal_port]):
                     port_forwarding.update({
-                        'internal_ip_address': internal_ip_address
-                        if internal_ip_address else
-                        str(pf_obj.internal_ip_address),
-                        'internal_port': internal_port if internal_port else
-                        pf_obj.internal_port
+                        'internal_ip_address':
+                            internal_ip_address if internal_ip_address else
+                            str(pf_obj.internal_ip_address),
+                        'internal_port':
+                            internal_port if internal_port else
+                            pf_obj.internal_port
                     })
                 pf_obj.update_fields(port_forwarding, reset_changes=True)
+                self._check_port_forwarding_update(context, pf_obj)
+
+                port_changed_keys = ['internal_port', 'internal_port_range',
+                                     'external_port', 'external_port_range']
+
+                if [k for k in port_changed_keys if k in port_forwarding]:
+                    self._check_port_collisions(
+                        context, floatingip_id, port_forwarding,
+                        id, pf_obj.get('internal_port_id'),
+                        pf_obj.get('protocol'),
+                        pf_obj.get('internal_ip_address'))
+
                 pf_obj.update()
-        except obj_exc.NeutronDbObjectDuplicateEntry:
+        except oslo_db_exc.DBDuplicateEntry:
             (__, conflict_params) = self._find_existing_port_forwarding(
                 context, floatingip_id, pf_obj.to_dict())
             message = _("A duplicate port forwarding entry with same "
@@ -423,11 +463,111 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
                         "are %s") % conflict_params
             raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
                                      msg=message)
-        self.push_api.push(context, [pf_obj], rpc_events.UPDATED)
-        registry.notify(pf_consts.PORT_FORWARDING, events.AFTER_UPDATE, self,
-                        payload=[callbacks.PortForwardingPayload(context,
-                            current_pf=pf_obj, original_pf=original_pf_obj)])
+        if self._rpc_notifications_required:
+            self.push_api.push(context, [pf_obj], rpc_events.UPDATED)
+        registry.publish(pf_consts.PORT_FORWARDING, events.AFTER_UPDATE,
+                         self,
+                         payload=events.DBEventPayload(
+                             context,
+                             states=(original_pf_obj, pf_obj)))
         return pf_obj
+
+    def _check_collision(self, pf_objs, port, port_key, id):
+        for port_forwarding_registry in pf_objs:
+            if id == port_forwarding_registry['id']:
+                continue
+
+            existing_port = port_forwarding_registry.get(port_key)
+            err_msg = _("There is a port collision with the %s. The "
+                        "following ranges collides: %s and %s")
+
+            if self._range_collides(existing_port, port):
+                raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
+                                         msg=err_msg % (
+                                             port_key,
+                                             existing_port,
+                                             port))
+
+    def _check_port_collisions(self, context, floatingip_id, pf_dict,
+                               id=None, internal_port_id=None,
+                               protocol=None, internal_ip_address=None):
+        external_range_pf_dict = pf_dict.get('external_port_range')
+        if not external_range_pf_dict and 'external_port' in pf_dict:
+            external_range_pf_dict = '{port}:{port}'.format(
+                port=pf_dict.get('external_port'))
+
+        internal_range_pf_dict = pf_dict.get('internal_port_range')
+        if not internal_range_pf_dict and 'internal_port' in pf_dict:
+            internal_range_pf_dict = '{port}:{port}'.format(
+                port=pf_dict.get('internal_port'))
+
+        internal_port_id = pf_dict.get('internal_port_id') or internal_port_id
+        protocol = pf_dict.get('protocol') or protocol
+        internal_ip_address = pf_dict.get(
+            'internal_ip_address') or internal_ip_address
+        self._validate_ranges(
+            internal_port_range=internal_range_pf_dict,
+            external_port_range=external_range_pf_dict)
+
+        if internal_range_pf_dict:
+            pf_same_internal_port = pf.PortForwarding.get_objects(
+                context, internal_port_id=internal_port_id,
+                protocol=protocol, internal_ip_address=internal_ip_address)
+            self._check_collision(pf_same_internal_port,
+                                  internal_range_pf_dict,
+                                  'internal_port_range',
+                                  id)
+
+        if external_range_pf_dict:
+            pf_same_fips = pf.PortForwarding.get_objects(
+                context, floatingip_id=floatingip_id,
+                protocol=protocol)
+            self._check_collision(pf_same_fips,
+                                  external_range_pf_dict,
+                                  'external_port_range',
+                                  id)
+
+    def _validate_ranges(self, internal_port_range=None,
+                         external_port_range=None):
+        err_invalid_relation = _(
+            "Invalid ranges of internal and/or external ports. "
+            "The relation between internal and external ports "
+            "must be N-N or 1-N")
+
+        internal_dif = self._get_port_range(internal_port_range)
+        external_dif = self._get_port_range(external_port_range)
+
+        if internal_dif > 0 and internal_dif != external_dif:
+            raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
+                                     msg=err_invalid_relation)
+
+    def _get_port_range(self, port_range=None):
+        if not port_range:
+            return 0
+
+        if ':' in port_range:
+            initial_port, final_port = list(map(int,
+                                                str(port_range).split(':')))
+            return final_port - initial_port
+
+        return 0
+
+    def _range_collides(self, range_a, range_b):
+        range_a = list(map(int, str(range_a).split(':')))
+        range_b = list(map(int, str(range_b).split(':')))
+
+        invalid_port = next((port for port in (range_a + range_b)
+                             if port > 65535 or port < 1), None)
+
+        if invalid_port:
+            raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
+                                     msg="Invalid port value, the "
+                                         "port value must be "
+                                         "a value between 1 and 65535.")
+
+        initial_intersection = max(range_a[0], range_b[0])
+        final_intersection = min(range_a[-1], range_b[-1])
+        return initial_intersection <= final_intersection
 
     def _check_router_match(self, context, fip_obj, router_id, pf_dict):
         internal_port_id = pf_dict['internal_port_id']
@@ -441,18 +581,61 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
                             "internal_ip_address: %(internal_ip_address)s, "
                             "internal_port: %(internal_port)s "
                             "already exists") % {
-                    'floatingip_id': fip_obj.id,
-                    'internal_ip_address': pf_dict['internal_ip_address'],
-                    'internal_port': pf_dict['internal_port']}
+                                'floatingip_id': fip_obj.id,
+                                'internal_ip_address':
+                                    pf_dict['internal_ip_address'],
+                                'internal_port': pf_dict['internal_port']}
             else:
                 message = _("The Floating IP %(floatingip_id)s had been set "
                             "on router %(router_id)s, the internal Neutron "
                             "port %(internal_port_id)s can not reach it") % {
-                    'floatingip_id': fip_obj.id,
-                    'router_id': fip_obj.router_id,
-                    'internal_port_id': internal_port_id}
+                                'floatingip_id': fip_obj.id,
+                                'router_id': fip_obj.router_id,
+                                'internal_port_id': internal_port_id}
             raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
                                      msg=message)
+
+    def _check_port_forwarding_update(self, context, pf_obj):
+        def _raise_port_forwarding_update_failed(conflict):
+            message = _("Another port forwarding entry with the same "
+                        "attributes already exists, conflicting "
+                        "values are %s") % conflict
+            raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
+                                     msg=message)
+
+        db_port = self.core_plugin.get_port(context, pf_obj.internal_port_id)
+        for fixed_ip in db_port['fixed_ips']:
+            if str(pf_obj.internal_ip_address) == fixed_ip['ip_address']:
+                break
+        else:
+            # Reached end of internal_port iteration w/out finding fixed_ip
+            message = _("The internal IP does not correspond to an "
+                        "address on the internal port, which has "
+                        "fixed_ips %s") % db_port['fixed_ips']
+            raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
+                                     msg=message)
+        objs = pf.PortForwarding.get_objects(
+            context,
+            floatingip_id=pf_obj.floatingip_id,
+            protocol=pf_obj.protocol)
+        for obj in objs:
+            if obj.id == pf_obj.id:
+                continue
+            # Ensure there are no conflicts on the outside
+            if (obj.floating_ip_address == pf_obj.floating_ip_address and
+                    obj.external_port == pf_obj.external_port):
+                _raise_port_forwarding_update_failed(
+                    {'floating_ip_address': str(obj.floating_ip_address),
+                     'external_port': obj.external_port})
+            # Ensure there are no conflicts in the inside
+            # socket: internal_ip_address + internal_port
+            if (obj.internal_port_id == pf_obj.internal_port_id and
+                    obj.internal_ip_address == pf_obj.internal_ip_address and
+                    obj.internal_port == pf_obj.internal_port):
+                _raise_port_forwarding_update_failed(
+                    {'internal_port_id': obj.internal_port_id,
+                     'internal_ip_address': str(obj.internal_ip_address),
+                     'internal_port': obj.internal_port})
 
     def _find_existing_port_forwarding(self, context, floatingip_id,
                                        port_forwarding, specify_params=None):
@@ -524,10 +707,12 @@ class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
                 fip_obj.update_fields({'router_id': None})
                 fip_obj.update()
             pf_obj.delete()
-        self.push_api.push(context, [pf_obj], rpc_events.DELETED)
-        registry.notify(pf_consts.PORT_FORWARDING, events.AFTER_DELETE, self,
-                        payload=[callbacks.PortForwardingPayload(
-                            context, original_pf=pf_obj)])
+        if self._rpc_notifications_required:
+            self.push_api.push(context, [pf_obj], rpc_events.DELETED)
+        registry.publish(pf_consts.PORT_FORWARDING, events.AFTER_DELETE,
+                         self,
+                         payload=events.DBEventPayload(context,
+                                                       states=(pf_obj,)))
 
     def sync_port_forwarding_fip(self, context, routers):
         if not routers:

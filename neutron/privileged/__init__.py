@@ -28,3 +28,46 @@ default = priv_context.PrivContext(
                   caps.CAP_DAC_READ_SEARCH,
                   caps.CAP_SYS_PTRACE],
 )
+
+
+dhcp_release_cmd = priv_context.PrivContext(
+    __name__,
+    cfg_section='privsep_dhcp_release',
+    pypath=__name__ + '.dhcp_release_cmd',
+    capabilities=[caps.CAP_SYS_ADMIN,
+                  caps.CAP_NET_ADMIN]
+)
+
+
+ovs_vsctl_cmd = priv_context.PrivContext(
+    __name__,
+    cfg_section='privsep_ovs_vsctl',
+    pypath=__name__ + '.ovs_vsctl_cmd',
+    capabilities=[caps.CAP_SYS_ADMIN,
+                  caps.CAP_NET_ADMIN]
+)
+
+
+namespace_cmd = priv_context.PrivContext(
+    __name__,
+    cfg_section='privsep_namespace',
+    pypath=__name__ + '.namespace_cmd',
+    capabilities=[caps.CAP_SYS_ADMIN]
+)
+
+
+conntrack_cmd = priv_context.PrivContext(
+    __name__,
+    cfg_section='privsep_conntrack',
+    pypath=__name__ + '.conntrack_cmd',
+    capabilities=[caps.CAP_NET_ADMIN]
+)
+
+
+link_cmd = priv_context.PrivContext(
+    __name__,
+    cfg_section='privsep_link',
+    pypath=__name__ + '.link_cmd',
+    capabilities=[caps.CAP_NET_ADMIN,
+                  caps.CAP_SYS_ADMIN]
+)

@@ -40,7 +40,7 @@ config.register_interface_driver_opts_helper(cfg.CONF)
 config.register_interface_opts()
 
 
-class IptablesManagerTransaction(object):
+class IptablesManagerTransaction:
     __transactions = {}
 
     def __init__(self, im):
@@ -63,7 +63,7 @@ class IptablesManagerTransaction(object):
             self.__transactions[self.im] = transaction
 
 
-class RouterWithMetering(object):
+class RouterWithMetering:
 
     def __init__(self, conf, router):
         self.conf = conf
@@ -122,10 +122,9 @@ class RouterWithMetering(object):
 class IptablesMeteringDriver(abstract_driver.MeteringAbstractDriver):
 
     def __init__(self, plugin, conf):
-        self.plugin = plugin
-        self.conf = conf or cfg.CONF
-        self.routers = {}
+        super().__init__(plugin, conf)
 
+        self.routers = {}
         self.driver = common_utils.load_interface_driver(self.conf)
 
     def _update_router(self, router):
@@ -142,7 +141,7 @@ class IptablesMeteringDriver(abstract_driver.MeteringAbstractDriver):
     @log_helpers.log_method_call
     def update_routers(self, context, routers):
         # disassociate removed routers
-        router_ids = set(router['id'] for router in routers)
+        router_ids = {router['id'] for router in routers}
         for router_id, rm in self.routers.items():
             if router_id not in router_ids:
                 self._process_disassociate_metering_label(rm.router)
@@ -214,6 +213,10 @@ class IptablesMeteringDriver(abstract_driver.MeteringAbstractDriver):
     def _add_rule_to_chain(self, ext_dev, rule, im,
                            label_chain, rules_chain):
         ipt_rule = self._prepare_rule(ext_dev, rule, label_chain)
+
+        LOG.debug("Adding IPtables rule [%s] for configurations [%s].",
+                  ipt_rule, rule)
+
         if rule['excluded']:
             im.ipv4['filter'].add_rule(rules_chain, ipt_rule,
                                        wrap=False, top=True)
@@ -224,6 +227,10 @@ class IptablesMeteringDriver(abstract_driver.MeteringAbstractDriver):
     def _remove_rule_from_chain(self, ext_dev, rule, im,
                                 label_chain, rules_chain):
         ipt_rule = self._prepare_rule(ext_dev, rule, label_chain)
+
+        LOG.debug("Removing IPtables rule [%s] for configurations [%s].",
+                  ipt_rule, rule)
+
         if rule['excluded']:
             im.ipv4['filter'].remove_rule(rules_chain, ipt_rule,
                                           wrap=False, top=True)
@@ -232,16 +239,44 @@ class IptablesMeteringDriver(abstract_driver.MeteringAbstractDriver):
                                           wrap=False, top=False)
 
     def _prepare_rule(self, ext_dev, rule, label_chain):
-        remote_ip = rule['remote_ip_prefix']
-        if rule['direction'] == 'egress':
-            dir_opt = '-s %s -o %s' % (remote_ip, ext_dev)
+        if rule.get('remote_ip_prefix'):
+            ipt_rule = IptablesMeteringDriver.\
+                prepare_source_and_destination_rule_legacy(ext_dev, rule)
         else:
-            dir_opt = '-d %s -i %s' % (remote_ip, ext_dev)
+            ipt_rule = IptablesMeteringDriver.\
+                prepare_source_and_destination_rule(ext_dev, rule)
 
         if rule['excluded']:
-            ipt_rule = '%s -j RETURN' % dir_opt
+            ipt_rule = '%s -j RETURN' % ipt_rule
         else:
-            ipt_rule = '%s -j %s' % (dir_opt, label_chain)
+            ipt_rule = f'{ipt_rule} -j {label_chain}'
+        return ipt_rule
+
+    @staticmethod
+    def prepare_source_and_destination_rule(ext_dev, rule):
+        if rule['direction'] == 'egress':
+            iptables_rule = '-o %s' % ext_dev
+        else:
+            iptables_rule = '-i %s' % ext_dev
+
+        source_ip_prefix = rule.get('source_ip_prefix')
+        if source_ip_prefix:
+            iptables_rule = f"-s {source_ip_prefix} {iptables_rule}"
+
+        destination_ip_prefix = rule.get('destination_ip_prefix')
+        if destination_ip_prefix:
+            iptables_rule = "-d {} {}".format(
+                destination_ip_prefix, iptables_rule)
+
+        return iptables_rule
+
+    @staticmethod
+    def prepare_source_and_destination_rule_legacy(ext_dev, rule):
+        remote_ip = rule['remote_ip_prefix']
+        if rule['direction'] == 'egress':
+            ipt_rule = f'-s {remote_ip} -o {ext_dev}'
+        else:
+            ipt_rule = f'-d {remote_ip} -i {ext_dev}'
         return ipt_rule
 
     def _process_ns_specific_metering_label(self, router, ext_dev, im):
@@ -310,7 +345,8 @@ class IptablesMeteringDriver(abstract_driver.MeteringAbstractDriver):
         labels = router.get(constants.METERING_LABEL_KEY, [])
         for label in labels:
             label_id = label['id']
-            del rm.metering_labels[label_id]
+            if rm.metering_labels.get(label_id):
+                del rm.metering_labels[label_id]
 
     @log_helpers.log_method_call
     def add_metering_label(self, context, routers):
@@ -424,42 +460,176 @@ class IptablesMeteringDriver(abstract_driver.MeteringAbstractDriver):
 
     @log_helpers.log_method_call
     def get_traffic_counters(self, context, routers):
-        accs = {}
+        traffic_counters = {}
         routers_to_reconfigure = set()
         for router in routers:
-            rm = self.routers.get(router['id'])
-            if not rm:
-                continue
-
-            for label_id in rm.metering_labels:
-                try:
-                    chain = iptables_manager.get_chain_name(WRAP_NAME +
-                                                            LABEL +
-                                                            label_id,
-                                                            wrap=False)
-
-                    chain_acc = rm.iptables_manager.get_traffic_counters(
-                        chain, wrap=False, zero=True)
-                except RuntimeError:
-                    LOG.exception('Failed to get traffic counters, '
-                                  'router: %s', router)
-                    routers_to_reconfigure.add(router['id'])
-                    continue
-
-                if not chain_acc:
-                    continue
-
-                acc = accs.get(label_id, {'pkts': 0, 'bytes': 0})
-
-                acc['pkts'] += chain_acc['pkts']
-                acc['bytes'] += chain_acc['bytes']
-
-                accs[label_id] = acc
+            if self.granular_traffic_data:
+                self.retrieve_and_account_granular_traffic_counters(
+                    router, routers_to_reconfigure, traffic_counters)
+            else:
+                self.retrieve_and_account_traffic_counters_legacy(
+                    router, routers_to_reconfigure, traffic_counters)
 
         for router_id in routers_to_reconfigure:
             del self.routers[router_id]
 
-        return accs
+        return traffic_counters
+
+    def retrieve_and_account_traffic_counters_legacy(self, router,
+                                                     routers_to_reconfigure,
+                                                     traffic_counters):
+        rm = self.routers.get(router['id'])
+        if not rm:
+            return
+
+        for label_id in rm.metering_labels:
+            chain_acc = self.retrieve_traffic_counters(label_id, rm, router,
+                                                       routers_to_reconfigure)
+
+            if not chain_acc:
+                continue
+
+            acc = traffic_counters.get(label_id, {'pkts': 0, 'bytes': 0})
+
+            acc['pkts'] += chain_acc['pkts']
+            acc['bytes'] += chain_acc['bytes']
+
+            traffic_counters[label_id] = acc
+
+    @staticmethod
+    def retrieve_traffic_counters(label_id, rm, router,
+                                  routers_to_reconfigure):
+        try:
+            chain = iptables_manager.get_chain_name(WRAP_NAME +
+                                                    LABEL +
+                                                    label_id,
+                                                    wrap=False)
+
+            chain_acc = rm.iptables_manager.get_traffic_counters(
+                chain, wrap=False, zero=True)
+        except RuntimeError as e:
+            LOG.warning('Failed to get traffic counters for router [%s] due '
+                        'to [%s]. This error message can happen when routers '
+                        'are migrated; therefore, most of the times they can '
+                        'be ignored.', router, e)
+
+            routers_to_reconfigure.add(router['id'])
+            return {}
+        return chain_acc
+
+    def retrieve_and_account_granular_traffic_counters(self, router,
+                                                       routers_to_reconfigure,
+                                                       traffic_counters):
+        """Retrieve and account traffic counters for routers.
+
+        This method will retrieve the traffic counters for all labels that
+        are assigned to a router. Then, it will account the traffic counter
+        data in the following granularities.
+                * label -- all of the traffic counter for a given label.
+                One must bear in mind that a label can be assigned to multiple
+                routers.
+                * router -- all of the traffic counter for all labels that
+                are assigned to the router.
+                * project -- all of the traffic counters for all labels of
+                all routers that a project has.
+                * router-label -- all of the traffic counters for a router
+                and the given label.
+                * project-label -- all of the traffic counters for all
+                routers of a project that have a given label.
+
+
+        All of the keys have the following standard in the
+        `traffic_counters` dictionary.
+                * labels -- label-<label_id>
+                * routers -- router-<router_id>
+                * project -- project-<project_id>
+                * router-label -- router-<router_id>-label-<label_id>
+                * project-label -- project-<project_id>-label-<label_id>
+
+        And last, but not least, if we are not able to retrieve the traffic
+        counters from `iptables` for a given router, we will add it to
+        `routers_to_reconfigure` set.
+
+        :param router:
+        :param routers_to_reconfigure:
+        :param traffic_counters:
+        """
+        router_id = router['id']
+        rm = self.routers.get(router_id)
+        if not rm:
+            return
+
+        default_traffic_counters = {'pkts': 0, 'bytes': 0}
+        project_traffic_counter_key = self.get_project_traffic_counter_key(
+            router['project_id'])
+        router_traffic_counter_key = self.get_router_traffic_counter_key(
+            router_id)
+
+        project_counters = traffic_counters.get(
+            project_traffic_counter_key, default_traffic_counters.copy())
+        project_counters['traffic-counter-granularity'] = "project"
+
+        router_counters = traffic_counters.get(
+            router_traffic_counter_key, default_traffic_counters.copy())
+        router_counters['traffic-counter-granularity'] = "router"
+
+        for label_id in rm.metering_labels:
+            label_traffic_counter_key = self.get_label_traffic_counter_key(
+                label_id)
+
+            project_label_traffic_counter_key = "{}-{}".format(
+                project_traffic_counter_key, label_traffic_counter_key)
+            router_label_traffic_counter_key = "{}-{}".format(
+                router_traffic_counter_key, label_traffic_counter_key)
+
+            chain_acc = self.retrieve_traffic_counters(label_id, rm, router,
+                                                       routers_to_reconfigure)
+
+            if not chain_acc:
+                continue
+
+            label_traffic_counters = traffic_counters.get(
+                label_traffic_counter_key, default_traffic_counters.copy())
+            label_traffic_counters['traffic-counter-granularity'] = "label"
+
+            project_label_traffic_counters = traffic_counters.get(
+                project_label_traffic_counter_key,
+                default_traffic_counters.copy())
+            project_label_traffic_counters[
+                'traffic-counter-granularity'] = "label_project"
+
+            router_label_traffic_counters = traffic_counters.get(
+                router_label_traffic_counter_key,
+                default_traffic_counters.copy())
+            router_label_traffic_counters[
+                'traffic-counter-granularity'] = "label_router"
+
+            project_label_traffic_counters['pkts'] += chain_acc['pkts']
+            project_label_traffic_counters['bytes'] += chain_acc['bytes']
+
+            router_label_traffic_counters['pkts'] += chain_acc['pkts']
+            router_label_traffic_counters['bytes'] += chain_acc['bytes']
+
+            label_traffic_counters['pkts'] += chain_acc['pkts']
+            label_traffic_counters['bytes'] += chain_acc['bytes']
+
+            traffic_counters[project_label_traffic_counter_key] = \
+                project_label_traffic_counters
+
+            traffic_counters[router_label_traffic_counter_key] = \
+                router_label_traffic_counters
+
+            traffic_counters[label_traffic_counter_key] = \
+                label_traffic_counters
+
+            router_counters['pkts'] += chain_acc['pkts']
+            router_counters['bytes'] += chain_acc['bytes']
+
+            project_counters['pkts'] += chain_acc['pkts']
+            project_counters['bytes'] += chain_acc['bytes']
+
+        traffic_counters[router_traffic_counter_key] = router_counters
+        traffic_counters[project_traffic_counter_key] = project_counters
 
     @log_helpers.log_method_call
     def sync_router_namespaces(self, context, routers):
@@ -470,7 +640,7 @@ class IptablesMeteringDriver(abstract_driver.MeteringAbstractDriver):
 
             # NOTE(bno1): Sometimes a router is added before its namespaces are
             # created. The metering agent has to periodically check if the
-            # namespaces for the missing iptables managers have appearead and
+            # namespaces for the missing iptables managers have appeared and
             # create the managers for them. When a new manager is created, the
             # metering rules have to be added to it.
             if rm.create_iptables_managers():

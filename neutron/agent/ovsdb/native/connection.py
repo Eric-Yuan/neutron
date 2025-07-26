@@ -51,7 +51,7 @@ def configure_ssl_conn():
     for ssl_opt, ssl_file in req_ssl_opts.items():
         if not ssl_file:
             raise ovsdb_exc.OvsdbSslRequiredOptError(ssl_opt=ssl_opt)
-        elif not os.path.exists(ssl_file):
+        if not os.path.exists(ssl_file):
             raise ovsdb_exc.OvsdbSslConfigNotFound(ssl_file=ssl_file)
     # TODO(ihrachys): move to ovsdbapp
     Stream.ssl_set_private_key_file(req_ssl_opts['ssl_key_file'])
@@ -64,8 +64,8 @@ class BridgeCreateEvent(idl_event.RowEvent):
     def __init__(self, agent):
         self.agent = agent
         table = 'Bridge'
-        super(BridgeCreateEvent, self).__init__((self.ROW_CREATE, ),
-                                                table, None)
+        super().__init__((self.ROW_CREATE, ),
+                         table, None)
         self.event_name = 'BridgeCreateEvent'
 
     def run(self, event, row, old):
@@ -83,7 +83,7 @@ class OvsIdl(idl.Idl):
             configure_ssl_conn()
         helper = self._get_ovsdb_helper(self._ovsdb_connection)
         helper.register_all()
-        super(OvsIdl, self).__init__(self._ovsdb_connection, helper)
+        super().__init__(self._ovsdb_connection, helper)
         self.notify_handler = ovsdb_event.RowEventHandler()
 
     @tenacity.retry(wait=tenacity.wait_exponential(multiplier=0.02),
@@ -106,7 +106,7 @@ class OvsIdl(idl.Idl):
 class OvsIdlMonitor(OvsIdl):
 
     def __init__(self):
-        super(OvsIdlMonitor, self).__init__()
+        super().__init__()
         self._lock = threading.Lock()
         self._bridges_to_monitor = []
         self._bridges_added_list = []

@@ -21,8 +21,8 @@
       (Avoid deeper levels because they do not render well.)
 
 
-Authorization Policy Enforcement
-================================
+Policy Enforcement and Authorization
+====================================
 
 As most OpenStack projects, Neutron leverages oslo_policy [#]_. However, since
 Neutron loves to be special and complicate every developer's life, it also
@@ -86,7 +86,7 @@ The ``_build_match_rule`` routine returns a ``oslo_policy.RuleCheck`` instance
 built in the following way:
 
 * Always add a check for the action being performed. This will match
-  a policy like create_network in ``policy.json``;
+  a policy like create_network in ``policy.yaml``;
 * Return for ``GET`` operations; more detailed checks will be performed anyway
   when building the response;
 * For each attribute which has been explicitly specified in the request
@@ -130,10 +130,10 @@ before returning it to the API client.
 The neutron.policy API
 ----------------------
 
-The ``neutron.policy`` module exposes a simple API whose main goal if to allow the
-REST API controllers to implement the authorization workflow discussed in this
-document. It is a bad practice to call the policy engine from within the plugin
-layer, as this would make request authorization dependent on configured
+The ``neutron.policy`` module exposes a simple API whose main goal if to allow
+the REST API controllers to implement the authorization workflow discussed inu
+this document. It is a bad practice to call the policy engine from within the
+plugin layer, as this would make request authorization dependent on configured
 plugins, and therefore make API behaviour dependent on the plugin itself, which
 defies Neutron tenet of being backend agnostic.
 
@@ -159,12 +159,6 @@ The neutron.policy API exposes the following routines:
 * ``enforce``
   Operates like the check routine but raises if the check in oslo_policy
   fails.
-* ``check_is_admin``
-  Enforce the predefined context_is_admin rule; used to determine the is_admin
-  property for a neutron context.
-* ``check_is_advsvc``
-  Enforce the predefined context_is_advsvc rule; used to determine the
-  is_advsvc property for a neutron context.
 
 Neutron specific policy rules
 -----------------------------
@@ -226,7 +220,7 @@ keyword, and provides a way to perform fine grained checks on resource
 attributes. For instance, using this class of rules it is possible to specify
 a rule for granting every project read access to shared resources.
 
-In policy.json, a FieldCheck rules is specified in the following way::
+In policy.yaml, a FieldCheck rules is specified in the following way::
 
 > field: <resource>:<field>=<value>
 
@@ -291,7 +285,7 @@ Notes
 * There is no way at the moment to specify an ``OR`` relationship between two
   attributes of a given resource (eg.: ``port.name == 'meh' or
   port.status == 'DOWN'``), unless the rule with the or condition is explicitly
-  added to the policy.json file.
+  added to the policy.yaml file.
 * ``OwnerCheck`` performs a plugin access; this will likely require a database
   access, but since the behaviour is implementation specific it might also
   imply a round-trip to the backend. This class of checks, when involving
@@ -360,7 +354,7 @@ projects. Each neutron related project should register the following two entry
 points ``oslo.policy.policies`` and ``neutron.policies`` in ``setup.cfg`` like
 below:
 
-.. code-block:: none
+.. code-block:: ini
 
    oslo.policy.policies =
        neutron = neutron.conf.policies:list_rules
@@ -381,7 +375,7 @@ projects, so the second entry point is required.
 The recommended entry point name is a repository name: For example,
 'neutron-fwaas' for FWaaS and 'networking-sfc' for SFC:
 
-.. code-block:: none
+.. code-block:: ini
 
    oslo.policy.policies =
        neutron-fwaas = neutron_fwaas.policies:list_rules
@@ -399,19 +393,19 @@ References
 .. [#] `Oslo policy developer <https://docs.openstack.org/oslo.policy/latest/>`_
 .. [#] API controller item_ method
 
-.. _item: http://opendev.org/openstack/neutron/tree/neutron/api/v2/base.py?id=2015.1.1#n282
+.. _item: http://opendev.org/openstack/neutron/src/tag/2015.1.1/neutron/api/v2/base.py#L282
 
 .. [#] Policy engine's build_match_rule_ method
 
-.. _build_match_rule: http://opendev.org/openstack/neutron/tree/neutron/policy.py?id=2015.1.1#n187
+.. _build_match_rule: http://opendev.org/openstack/neutron/src/tag/2015.1.1/neutron/policy.py#L187
 
 .. [#] exclude_attributes_by_policy_ method
 
-.. _exclude_attributes_by_policy: http://opendev.org/openstack/neutron/tree/neutron/api/v2/base.py?id=2015.1.1#n132
+.. _exclude_attributes_by_policy: http://opendev.org/openstack/neutron/src/tag/2015.1.1/neutron/api/v2/base.py#L132
 
 .. [#] Policy reset_ in neutron.api.v2.router
 
-.. _reset: http://opendev.org/openstack/neutron/tree/neutron/api/v2/router.py?id=2015.1.1#n122
+.. _reset: http://opendev.org/openstack/neutron/src/tag/2015.1.1/neutron/api/v2/router.py#L122
 
 .. [#] https://github.com/openstack/neutron/blob/051b6b40f3921b9db4f152a54f402c402cbf138c/neutron/pecan_wsgi/hooks/policy_enforcement.py#L173
 .. [#] https://github.com/openstack/neutron/blob/051b6b40f3921b9db4f152a54f402c402cbf138c/neutron/pecan_wsgi/hooks/policy_enforcement.py#L143

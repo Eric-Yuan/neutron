@@ -13,14 +13,18 @@
 # limitations under the License.
 
 from neutron_lib import constants as nlib_const
-from neutron_lib.placement import constants as place_const
 from neutron_lib.placement import utils as place_utils
+import os_resource_classes as orc
+from oslo_config import cfg
 from oslo_log import log as logging
+
+from neutron.common import _constants as n_const
+
 
 LOG = logging.getLogger(__name__)
 
 
-class DeferredCall(object):
+class DeferredCall:
     '''Store a callable for later calling.
 
     This is hardly more than a parameterless lambda, but this way it's much
@@ -33,17 +37,17 @@ class DeferredCall(object):
         self.kwargs = kwargs
 
     def __str__(self):
-        return '%s(%s)' % (
+        return '{}({})'.format(
             self.func.__name__,
             ', '.join([repr(x) for x in self.args] +
-                      ['%s=%s' % (k, repr(v))
+                      [f'{k}={repr(v)}'
                        for k, v in self.kwargs.items()]))
 
     def execute(self):
         return self.func(*self.args, **self.kwargs)
 
 
-class PlacementState(object):
+class PlacementState:
     '''Represents the desired state of the Placement DB.
 
     This represents the state of one Neutron agent
@@ -81,20 +85,28 @@ class PlacementState(object):
     def __init__(self,
                  rp_bandwidths,
                  rp_inventory_defaults,
+                 rp_pkt_processing,
+                 rp_pkt_processing_inventory_defaults,
                  driver_uuid_namespace,
                  agent_type,
                  hypervisor_rps,
                  device_mappings,
                  supported_vnic_types,
-                 client):
+                 client,
+                 rp_deleted=None,
+                 ):
         self._rp_bandwidths = rp_bandwidths
         self._rp_inventory_defaults = rp_inventory_defaults
+        self._rp_pp = rp_pkt_processing
+        self._rp_pp_inventory_defaults = rp_pkt_processing_inventory_defaults
+        self._rp_deleted = rp_deleted
         self._driver_uuid_namespace = driver_uuid_namespace
         self._agent_type = agent_type
         self._hypervisor_rps = hypervisor_rps
         self._device_mappings = device_mappings
         self._supported_vnic_types = supported_vnic_types
         self._client = client
+        self._rp_tun_name = cfg.CONF.ml2.tunnelled_network_rp_name
 
     def _deferred_update_physnet_traits(self):
         traits = []
@@ -106,6 +118,10 @@ class PlacementState(object):
                             self._client.update_trait,
                             name=place_utils.physnet_trait(physnet)))
         return traits
+
+    def _deferred_update_tunnelled_traits(self):
+        return [DeferredCall(self._client.update_trait,
+                             name=n_const.TRAIT_NETWORK_TUNNEL)]
 
     def _deferred_update_vnic_type_traits(self):
         traits = []
@@ -119,6 +135,7 @@ class PlacementState(object):
     def deferred_update_traits(self):
         traits = []
         traits += self._deferred_update_physnet_traits()
+        traits += self._deferred_update_tunnelled_traits()
         traits += self._deferred_update_vnic_type_traits()
         return traits
 
@@ -129,7 +146,8 @@ class PlacementState(object):
         # we must create an agent RP under each hypervisor RP.
         rps = []
         for hypervisor in self._hypervisor_rps.values():
-            agent_rp_name = '%s:%s' % (hypervisor['name'], self._agent_type)
+            agent_rp_name = '{}:{}'.format(
+                hypervisor['name'], self._agent_type)
             agent_rp_uuid = place_utils.agent_resource_provider_uuid(
                 self._driver_uuid_namespace, hypervisor['name'])
             rps.append(
@@ -145,37 +163,87 @@ class PlacementState(object):
         rps = []
         for device in self._rp_bandwidths:
             hypervisor = self._hypervisor_rps[device]
-            rp_name = '%s:%s:%s' % (
+            rp_name = '{}:{}:{}'.format(
                 hypervisor['name'], self._agent_type, device)
             rp_uuid = place_utils.device_resource_provider_uuid(
                 self._driver_uuid_namespace,
                 hypervisor['name'],
                 device)
+            agent_rp_uuid = place_utils.agent_resource_provider_uuid(
+                self._driver_uuid_namespace, hypervisor['name'])
             rps.append(
                 DeferredCall(
                     self._client.ensure_resource_provider,
                     {'name': rp_name,
                      'uuid': rp_uuid,
-                     'parent_provider_uuid': hypervisor['uuid']}))
+                     'parent_provider_uuid': agent_rp_uuid}))
+        return rps
+
+    def _deferred_delete_device_rps(self):
+        rps = []
+        if not self._rp_deleted:
+            return rps
+
+        for device in self._rp_deleted:
+            hypervisor = self._hypervisor_rps[device]
+            rp_uuid = place_utils.device_resource_provider_uuid(
+                self._driver_uuid_namespace,
+                hypervisor['name'],
+                device)
+            rps.append(
+                DeferredCall(self._client.delete_resource_provider, rp_uuid))
         return rps
 
     def deferred_create_resource_providers(self):
         agent_rps = self._deferred_create_agent_rps()
         device_rps = self._deferred_create_device_rps()
+        deleted_rps = self._deferred_delete_device_rps()
+        return agent_rps + device_rps + deleted_rps
 
-        rps = []
-        rps.extend(agent_rps)
-        rps.extend(device_rps)
-        return rps
+    def _deferred_update_agent_rp_traits(self, traits_):
+        agent_rp_traits = []
+
+        if not traits_:
+            return agent_rp_traits
+
+        # Remove hypervisor duplicates to avoid calling placement API multiple
+        # times for the same hypervisor.
+        hypervisors = {h['name'] for h in self._hypervisor_rps.values()}
+        for hypervisor in hypervisors:
+            agent_rp_uuid = place_utils.agent_resource_provider_uuid(
+                self._driver_uuid_namespace, hypervisor)
+            agent_rp_traits.append(
+                DeferredCall(
+                    self._client.update_resource_provider_traits,
+                    resource_provider_uuid=agent_rp_uuid,
+                    traits=traits_))
+
+        return agent_rp_traits
 
     def deferred_update_resource_provider_traits(self):
-        rp_traits = []
 
+        def _get_traits(device, physical_bridges, physnet_trait_mappings):
+            if device == self._rp_tun_name and device not in physical_bridges:
+                # That means the RP for tunnelled networks is not associated
+                # to a physical bridge interface.
+                return [n_const.TRAIT_NETWORK_TUNNEL]
+            if device == self._rp_tun_name and device in physical_bridges:
+                # The physical network and the tunnelled networks share the
+                # same physical interface.
+                return [n_const.TRAIT_NETWORK_TUNNEL,
+                        physnet_trait_mappings[device]]
+            # Just the physical interface.
+            return [physnet_trait_mappings.get(device)]
+
+        rp_traits = []
+        physical_bridges = {br for brs in self._device_mappings.values() for
+                            br in brs}
         physnet_trait_mappings = {}
         for physnet, devices in self._device_mappings.items():
             for device in devices:
                 physnet_trait_mappings[device] = place_utils.physnet_trait(
                     physnet)
+
         vnic_type_traits = [place_utils.vnic_type_trait(vnic_type)
                             for vnic_type
                             in self._supported_vnic_types]
@@ -184,8 +252,8 @@ class PlacementState(object):
                 self._driver_uuid_namespace,
                 self._hypervisor_rps[device]['name'],
                 device)
-            traits = []
-            traits.append(physnet_trait_mappings[device])
+            traits = _get_traits(device, physical_bridges,
+                                 physnet_trait_mappings)
             traits.extend(vnic_type_traits)
             rp_traits.append(
                 DeferredCall(
@@ -193,9 +261,40 @@ class PlacementState(object):
                     resource_provider_uuid=rp_uuid,
                     traits=traits))
 
+        rp_traits += self._deferred_update_agent_rp_traits(vnic_type_traits)
+
         return rp_traits
 
-    def deferred_update_resource_provider_inventories(self):
+    def _deferred_update_rp_pp_inventory(self):
+        agent_rp_inventories = []
+
+        for hypervisor, pp_values in self._rp_pp.items():
+            agent_rp_uuid = place_utils.agent_resource_provider_uuid(
+                self._driver_uuid_namespace, hypervisor)
+
+            inventories = {}
+            for direction, rp_class in (
+                    (nlib_const.EGRESS_DIRECTION,
+                     orc.NET_PACKET_RATE_EGR_KILOPACKET_PER_SEC),
+                    (nlib_const.INGRESS_DIRECTION,
+                     orc.NET_PACKET_RATE_IGR_KILOPACKET_PER_SEC),
+                    (nlib_const.ANY_DIRECTION,
+                     orc.NET_PACKET_RATE_KILOPACKET_PER_SEC)):
+                if pp_values.get(direction):
+                    inventory = dict(self._rp_pp_inventory_defaults)
+                    inventory['total'] = pp_values[direction]
+                    inventories[rp_class] = inventory
+
+            if inventories:
+                agent_rp_inventories.append(
+                    DeferredCall(
+                        self._client.update_resource_provider_inventories,
+                        resource_provider_uuid=agent_rp_uuid,
+                        inventories=inventories))
+
+        return agent_rp_inventories
+
+    def _deferred_update_rp_bw_inventory(self):
         rp_inventories = []
 
         for device, bw_values in self._rp_bandwidths.items():
@@ -207,10 +306,10 @@ class PlacementState(object):
             inventories = {}
             for direction, rp_class in (
                     (nlib_const.EGRESS_DIRECTION,
-                     place_const.CLASS_NET_BW_EGRESS_KBPS),
+                     orc.NET_BW_EGR_KILOBIT_PER_SEC),
                     (nlib_const.INGRESS_DIRECTION,
-                     place_const.CLASS_NET_BW_INGRESS_KBPS)):
-                if bw_values[direction] is not None:
+                     orc.NET_BW_IGR_KILOBIT_PER_SEC)):
+                if bw_values.get(direction):
                     inventory = dict(self._rp_inventory_defaults)
                     inventory['total'] = bw_values[direction]
                     inventories[rp_class] = inventory
@@ -223,6 +322,15 @@ class PlacementState(object):
                         inventories=inventories))
 
         return rp_inventories
+
+    def deferred_update_resource_provider_inventories(self):
+        bw_inventory = self._deferred_update_rp_bw_inventory()
+        pp_inventory = self._deferred_update_rp_pp_inventory()
+
+        inventories = []
+        inventories.extend(bw_inventory)
+        inventories.extend(pp_inventory)
+        return inventories
 
     def deferred_sync(self):
         state = []

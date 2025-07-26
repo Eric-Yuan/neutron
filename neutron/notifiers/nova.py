@@ -13,6 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import contextlib
+
+from keystoneauth1 import exceptions as ks_exceptions
 from keystoneauth1 import loading as ks_loading
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
@@ -29,7 +32,9 @@ from oslo_context import context as common_context
 from oslo_log import log as logging
 from oslo_utils import uuidutils
 from sqlalchemy.orm import attributes as sql_attr
+import tenacity
 
+from neutron.common import eventlet_utils
 from neutron.notifiers import batch_notifier
 
 
@@ -43,9 +48,16 @@ NEUTRON_NOVA_EVENT_STATUS_MAP = {constants.PORT_STATUS_ACTIVE: 'completed',
                                  constants.PORT_STATUS_DOWN: 'completed'}
 NOVA_API_VERSION = "2.1"
 
+NOTIFIER_ENABLE_DEFAULT = True
+# NOTE(ralonsoh): the Nova notifier can be called simultaneously by several RPC
+# callbacks from the agents (DHCP, L2), trying to update the provisioning
+# status of a port. In order to handle each context notifier enable flag, a
+# thread local variable is used.
+_notifier_store = eventlet_utils.get_threading_local()
+
 
 @registry.has_registry_receivers
-class Notifier(object):
+class Notifier:
 
     _instance = None
 
@@ -67,6 +79,14 @@ class Notifier(object):
         self.batch_notifier = batch_notifier.BatchNotifier(
             cfg.CONF.send_events_interval, self.send_events)
 
+    @contextlib.contextmanager
+    def context_enabled(self, enabled):
+        try:
+            _notifier_store.enable = enabled
+            yield
+        finally:
+            _notifier_store.enable = NOTIFIER_ENABLE_DEFAULT
+
     def _get_nova_client(self):
         global_id = common_context.generate_request_id()
         return nova_client.Client(
@@ -75,6 +95,7 @@ class Notifier(object):
             region_name=cfg.CONF.nova.region_name,
             endpoint_type=cfg.CONF.nova.endpoint_type,
             extensions=self.extensions,
+            connect_retries=cfg.CONF.http_retries,
             global_request_id=global_id)
 
     def _is_compute_port(self, port):
@@ -159,10 +180,16 @@ class Notifier(object):
         if port and self._is_compute_port(port):
             if action == 'delete_port':
                 return self._get_port_delete_event(port)
-            else:
-                return self._get_network_changed_event(port)
+            return self._get_network_changed_event(port)
 
     def _can_notify(self, port):
+        if getattr(_notifier_store, 'enable', None) is None:
+            _notifier_store.enable = NOTIFIER_ENABLE_DEFAULT
+
+        if not _notifier_store.enable:
+            LOG.debug("Nova notifier disabled")
+            return False
+
         if not port.id:
             LOG.warning("Port ID not set! Nova will not be notified of "
                         "port status change.")
@@ -241,15 +268,28 @@ class Notifier(object):
              'tag': port.id})
         self.send_port_status(None, None, port)
 
+    @tenacity.retry(
+        retry=tenacity.retry_if_exception_type(
+            ks_exceptions.RetriableConnectionFailure),
+        wait=tenacity.wait_exponential(multiplier=0.01, max=1),
+        stop=tenacity.stop_after_delay(1),
+        after=tenacity.after_log(LOG, logging.DEBUG))
     def send_events(self, batched_events):
         LOG.debug("Sending events: %s", batched_events)
         novaclient = self._get_nova_client()
         try:
             response = novaclient.server_external_events.create(
                 batched_events)
+        except ks_exceptions.EndpointNotFound:
+            LOG.exception("Nova endpoint not found, invalidating the session")
+            self.session.invalidate()
         except nova_exceptions.NotFound:
             LOG.debug("Nova returned NotFound for event: %s",
                       batched_events)
+        except ks_exceptions.RetriableConnectionFailure:
+            raise
+            # next clause handles all exceptions
+            # so reraise for retry decorator
         except Exception:
             LOG.exception("Failed to notify nova on events: %s",
                           batched_events)
@@ -265,11 +305,15 @@ class Notifier(object):
                 except KeyError:
                     response_error = True
                     continue
-                if code != 200:
-                    LOG.warning("Nova event: %s returned with failed "
-                                "status", event)
+                if hasattr(response, 'request_ids'):
+                    msg = f"Nova event matching {response.request_ids}"
                 else:
-                    LOG.info("Nova event response: %s", event)
+                    msg = "Nova event"
+                if code != 200:
+                    LOG.warning("%s: %s returned with failed "
+                                "status", msg, event)
+                else:
+                    LOG.info("%s response: %s", msg, event)
             if response_error:
                 LOG.error("Error response returned from nova: %s",
                           response)

@@ -22,6 +22,7 @@ def get_device_port_name(port_id):
 
 def get_iptables_driver_instance():
     """Load hybrid iptables firewall driver."""
+    # pylint: disable=import-outside-toplevel
     from neutron.agent.linux import iptables_firewall
 
     class HybridIptablesHelper(
@@ -39,7 +40,7 @@ def is_bridge_cleaned(bridge):
     return other_config.get(Helper.CLEANED_METADATA, '').lower() == 'true'
 
 
-class Helper(object):
+class Helper:
     """Helper to avoid loading firewall driver.
 
     The main purpose is to avoid loading iptables driver for cases where no

@@ -36,7 +36,7 @@ PORT_FORWARDING_PREFIX = 'fip_portforwarding-'
 PORT_FORWARDING_CHAIN_PREFIX = 'pf-'
 
 
-class RouterFipPortForwardingMapping(object):
+class RouterFipPortForwardingMapping:
     def __init__(self):
         self.managed_port_forwardings = {}
         """
@@ -72,11 +72,11 @@ class RouterFipPortForwardingMapping(object):
             if not self.managed_port_forwardings.get(port_forwarding.id):
                 continue
             self.managed_port_forwardings.pop(port_forwarding.id)
-            self.fip_port_forwarding[port_forwarding.floatingip_id].remove(
+            self.fip_port_forwarding[port_forwarding.floatingip_id].discard(
                 port_forwarding.id)
             if not self.fip_port_forwarding[port_forwarding.floatingip_id]:
                 self.fip_port_forwarding.pop(port_forwarding.floatingip_id)
-                self.router_fip_mapping[port_forwarding.router_id].remove(
+                self.router_fip_mapping[port_forwarding.router_id].discard(
                     port_forwarding.floatingip_id)
                 if not self.router_fip_mapping[port_forwarding.router_id]:
                     del self.router_fip_mapping[port_forwarding.router_id]
@@ -88,7 +88,7 @@ class RouterFipPortForwardingMapping(object):
 
     @lockutils.synchronized('port-forwarding-cache')
     def clear_by_fip(self, fip_id, router_id):
-        self.router_fip_mapping[router_id].remove(fip_id)
+        self.router_fip_mapping[router_id].discard(fip_id)
         if len(self.router_fip_mapping[router_id]) == 0:
             del self.router_fip_mapping[router_id]
         for pf_id in self.fip_port_forwarding[fip_id]:
@@ -99,6 +99,14 @@ class RouterFipPortForwardingMapping(object):
     def check_port_forwarding_changes(self, new_pf):
         old_pf = self.managed_port_forwardings.get(new_pf.id)
         return old_pf != new_pf
+
+    @lockutils.synchronized('port-forwarding-cache')
+    def clean_port_forwardings_by_router_id(self, router_id):
+        router_fips = self.router_fip_mapping.pop(router_id, [])
+        for fip_id in router_fips:
+            pf_ids = self.fip_port_forwarding.pop(fip_id, [])
+            for pf_id in pf_ids:
+                self.managed_port_forwardings.pop(pf_id, None)
 
 
 class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
@@ -146,8 +154,8 @@ class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
         floating_ip_address = str(port_forward.floating_ip_address)
         protocol = port_forward.protocol
         internal_ip_address = str(port_forward.internal_ip_address)
-        internal_port = port_forward.internal_port
-        external_port = port_forward.external_port
+        external_port, internal_port = self.extract_ports(port_forward)
+
         chain_rule = (pf_chain_name,
                       '-d %s/32 -p %s -m %s --dport %s '
                       '-j DNAT --to-destination %s:%s' % (
@@ -157,10 +165,45 @@ class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
         chain_rule_list.append(chain_rule)
         return chain_rule_list
 
+    @staticmethod
+    def extract_ports(port_forward):
+        # The IP table rules handles internal port ranges with "-"
+        # while the external ports ranges it handles using ":"
+        internal_port = port_forward.internal_port_range.replace(':', '-')
+        external_port = port_forward.external_port_range
+        internal_start, internal_end = internal_port.split('-')
+        external_start, external_end = external_port.split(':')
+        internal_port_one_to_one_mask = ''
+        is_single_external_port = external_start == external_end
+        is_single_internal_port = internal_start == internal_end
+        if is_single_external_port:
+            external_port = external_start
+        else:
+            # This mask will ensure that the rules will be applied in N-N
+            # like 40:50 -> 60:70, the port 40 will be mapped to 60,
+            # the 41 to 61, 42 to 62...50 to 70.
+            # In the case of 40:60 -> 70:80, the ports will be rounded
+            # so the port 41 and 51, will be mapped to 71.
+            internal_port_one_to_one_mask = '/' + external_start
+        if is_single_internal_port:
+            internal_port = internal_start
+        else:
+            internal_port = internal_port + internal_port_one_to_one_mask
+
+        are_ranges_different = (int(internal_end) - int(internal_start)) - (
+            int(external_end) - int(external_start))
+        if are_ranges_different and not (
+                is_single_internal_port or is_single_external_port):
+            LOG.warning("Port forwarding rule with different internal "
+                        "and external port ranges applied. Internal "
+                        "port range: [%s], external port range: [%s].",
+                        internal_port, external_port)
+        return external_port, internal_port
+
     def _rule_apply(self, iptables_manager, port_forwarding, rule_tag):
         iptables_manager.ipv4['nat'].clear_rules_by_tag(rule_tag)
         if DEFAULT_PORT_FORWARDING_CHAIN not in iptables_manager.ipv4[
-             'nat'].chains:
+                'nat'].chains:
             self._install_default_rules(iptables_manager)
 
         for chain, rule in self._get_fip_rules(
@@ -169,7 +212,7 @@ class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
                 iptables_manager.ipv4['nat'].add_chain(chain)
             iptables_manager.ipv4['nat'].add_rule(chain, rule, tag=rule_tag)
 
-    @coordination.synchronized('port-forwarding-{namespace}')
+    @coordination.synchronized('router-lock-ns-{namespace}')
     def _process_create(self, port_forwardings, ri, interface_name, namespace,
                         iptables_manager):
         if not port_forwardings:
@@ -301,7 +344,7 @@ class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
                 context, [port_forwarding], ri, interface_name, namespace,
                 iptables_manager)
 
-    @coordination.synchronized('port-forwarding-{namespace}')
+    @coordination.synchronized('router-lock-ns-{namespace}')
     def _process_update(self, port_forwardings, iptables_manager,
                         interface_name, namespace):
         if not port_forwardings:
@@ -326,7 +369,7 @@ class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
         iptables_manager.apply()
         self._store_local(port_forwardings, events.UPDATED)
 
-    @coordination.synchronized('port-forwarding-{namespace}')
+    @coordination.synchronized('router-lock-ns-{namespace}')
     def _process_delete(self, context, port_forwardings, ri, interface_name,
                         namespace, iptables_manager):
         if not port_forwardings:
@@ -343,9 +386,9 @@ class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
 
         iptables_manager.apply()
 
-        fip_id_cidrs = set([(pf.floatingip_id,
-                             str(netaddr.IPNetwork(pf.floating_ip_address)))
-                            for pf in port_forwardings])
+        fip_id_cidrs = {(pf.floatingip_id,
+                         str(netaddr.IPNetwork(pf.floating_ip_address)))
+                        for pf in port_forwardings}
         self._sync_and_remove_fip(context, fip_id_cidrs, device, ri)
         self._store_local(port_forwardings, events.DELETED)
 
@@ -388,8 +431,8 @@ class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
         return chain_name[:constants.MAX_IPTABLES_CHAIN_LEN_WRAP]
 
     def _install_default_rules(self, iptables_manager):
-        default_rule = '-j %s-%s' % (iptables_manager.wrap_name,
-                                     DEFAULT_PORT_FORWARDING_CHAIN)
+        default_rule = '-j {}-{}'.format(iptables_manager.wrap_name,
+                                         DEFAULT_PORT_FORWARDING_CHAIN)
         iptables_manager.ipv4['nat'].add_chain(DEFAULT_PORT_FORWARDING_CHAIN)
         iptables_manager.ipv4['nat'].add_rule('PREROUTING', default_rule)
         iptables_manager.apply()
@@ -458,7 +501,10 @@ class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
         :param context: RPC context.
         :param data: Router data.
         """
-        pass
+        self.mapping.clean_port_forwardings_by_router_id(data['id'])
 
     def ha_state_change(self, context, data):
+        pass
+
+    def update_network(self, context, data):
         pass

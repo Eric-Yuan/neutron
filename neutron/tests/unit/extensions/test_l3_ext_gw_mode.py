@@ -25,7 +25,6 @@ from neutron_lib import context as nctx
 from neutron_lib.db import api as db_api
 from neutron_lib.plugins import directory
 from neutron_lib.utils import net as net_utils
-from oslo_config import cfg
 from oslo_db import exception as db_exc
 from oslo_serialization import jsonutils
 from oslo_utils import uuidutils
@@ -41,7 +40,7 @@ from neutron.objects import ports as port_obj
 from neutron.objects import router as l3_obj
 from neutron.objects import subnet as subnet_obj
 from neutron.tests import base
-from neutron.tests.unit.db import test_db_base_plugin_v2
+from neutron.tests.common import test_db_base_plugin_v2
 from neutron.tests.unit.extensions import test_l3
 from neutron.tests.unit import testlib_api
 
@@ -56,7 +55,7 @@ FAKE_ROUTER_PORT_ID = _uuid()
 FAKE_ROUTER_PORT_MAC = 'bb:bb:bb:bb:bb:bb'
 
 
-class TestExtensionManager(object):
+class TestExtensionManager:
 
     def get_resources(self):
         return l3.L3.get_resources()
@@ -91,7 +90,7 @@ class TestGetEnableSnat(testscenarios.WithScenarios, base.BaseTestCase):
         ('disabled', {'enable_snat_by_default': False})]
 
     def setUp(self):
-        super(TestGetEnableSnat, self).setUp()
+        super().setUp()
         self.config(enable_snat_by_default=self.enable_snat_by_default)
 
     def _test_get_enable_snat(self, expected, info):
@@ -115,7 +114,7 @@ class TestGetEnableSnat(testscenarios.WithScenarios, base.BaseTestCase):
 class TestL3GwModeMixin(testlib_api.SqlTestCase):
 
     def setUp(self):
-        super(TestL3GwModeMixin, self).setUp()
+        super().setUp()
         plugin = __name__ + '.' + TestDbIntPlugin.__name__
         self.setup_coreplugin(plugin)
         self.target_object = TestDbIntPlugin()
@@ -184,12 +183,14 @@ class TestL3GwModeMixin(testlib_api.SqlTestCase):
             admin_state_up=True,
             status=constants.NET_STATUS_ACTIVE)
         self.int_sub = subnet_obj.Subnet(self.context,
-            id=self.int_sub_id,
-            project_id=self.tenant_id,
-            ip_version=constants.IP_VERSION_4,
-            cidr=net_utils.AuthenticIPNetwork('3.3.3.0/24'),
-            gateway_ip=netaddr.IPAddress('3.3.3.1'),
-            network_id=self.int_net_id)
+                                         id=self.int_sub_id,
+                                         project_id=self.tenant_id,
+                                         ip_version=constants.IP_VERSION_4,
+                                         cidr=net_utils.AuthenticIPNetwork(
+                                             '3.3.3.0/24'),
+                                         gateway_ip=netaddr.IPAddress(
+                                             '3.3.3.1'),
+                                         network_id=self.int_net_id)
         self.router_port = port_obj.Port(
             self.context,
             id=FAKE_ROUTER_PORT_ID,
@@ -200,7 +201,8 @@ class TestL3GwModeMixin(testlib_api.SqlTestCase):
             status=constants.PORT_STATUS_ACTIVE,
             mac_address=netaddr.EUI(FAKE_ROUTER_PORT_MAC),
             network_id=self.int_net_id)
-        self.router_port_ip_info = port_obj.IPAllocation(self.context,
+        self.router_port_ip_info = port_obj.IPAllocation(
+            self.context,
             port_id=self.router_port.id,
             network_id=self.int_net.id,
             subnet_id=self.int_sub_id,
@@ -220,7 +222,8 @@ class TestL3GwModeMixin(testlib_api.SqlTestCase):
             status=constants.PORT_STATUS_ACTIVE,
             mac_address=netaddr.EUI(FAKE_FIP_INT_PORT_MAC),
             network_id=self.int_net_id)
-        self.fip_int_ip_info = port_obj.IPAllocation(self.context,
+        self.fip_int_ip_info = port_obj.IPAllocation(
+            self.context,
             port_id=self.fip_int_port.id,
             network_id=self.int_net.id,
             subnet_id=self.int_sub_id,
@@ -243,8 +246,8 @@ class TestL3GwModeMixin(testlib_api.SqlTestCase):
                             'tenant_id': self.tenant_id}
 
     def _get_gwports_dict(self, gw_ports):
-        return dict((gw_port['id'], gw_port)
-                    for gw_port in gw_ports)
+        return {gw_port['id']: gw_port
+                for gw_port in gw_ports}
 
     def _reset_ext_gw(self):
         # Reset external gateway
@@ -257,11 +260,15 @@ class TestL3GwModeMixin(testlib_api.SqlTestCase):
         if not current_enable_snat:
             previous_gw_info = {'network_id': self.ext_net_id,
                                 'enable_snat': current_enable_snat}
+            request_body = {
+                l3_apidef.EXTERNAL_GW_INFO: previous_gw_info}
             self.target_object._update_router_gw_info(
-                self.context, self.router.id, previous_gw_info)
+                self.context, self.router.id, previous_gw_info, request_body)
 
+        request_body = {
+            l3_apidef.EXTERNAL_GW_INFO: gw_info}
         self.target_object._update_router_gw_info(
-            self.context, self.router.id, gw_info)
+            self.context, self.router.id, gw_info, request_body)
         router = self.target_object._get_router(
             self.context, self.router.id)
         try:
@@ -369,17 +376,15 @@ class ExtGwModeIntTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase,
         plugin = plugin or (
             'neutron.tests.unit.extensions.test_l3_ext_gw_mode.'
             'TestDbIntPlugin')
-        # for these tests we need to enable overlapping ips
-        cfg.CONF.set_default('allow_overlapping_ips', True)
         ext_mgr = ext_mgr or TestExtensionManager()
-        super(ExtGwModeIntTestCase, self).setUp(plugin=plugin,
-                                                ext_mgr=ext_mgr,
-                                                service_plugins=svc_plugins)
+        super().setUp(plugin=plugin,
+                      ext_mgr=ext_mgr,
+                      service_plugins=svc_plugins)
 
     def _set_router_external_gateway(self, router_id, network_id,
                                      snat_enabled=None,
                                      expected_code=exc.HTTPOk.code,
-                                     neutron_context=None):
+                                     tenant_id=None, as_admin=False):
         ext_gw_info = {'network_id': network_id}
         # Need to set enable_snat also if snat_enabled == False
         if snat_enabled is not None:
@@ -388,7 +393,8 @@ class ExtGwModeIntTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase,
                             {'router': {'external_gateway_info':
                                         ext_gw_info}},
                             expected_code=expected_code,
-                            neutron_context=neutron_context)
+                            request_tenant_id=tenant_id,
+                            as_admin=as_admin)
 
     def test_router_gateway_set_fail_after_port_create(self):
         with self.router() as r, self.subnet() as s:
@@ -443,7 +449,8 @@ class ExtGwModeIntTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase,
                           ('external_gateway_info', None)]
         with self.router(name=name, admin_state_up=True,
                          tenant_id=tenant_id) as router:
-            res = self._show('routers', router['router']['id'])
+            res = self._show('routers', router['router']['id'],
+                             tenant_id=tenant_id)
             for k, v in expected_value:
                 self.assertEqual(res['router'][k], v)
 
@@ -467,10 +474,12 @@ class ExtGwModeIntTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase,
                                     'subnet_id': s['subnet']['id']}]})]
             with self.router(name=name, admin_state_up=True,
                              tenant_id=tenant_id,
-                             external_gateway_info=input_value) as router:
-                res = self._show('routers', router['router']['id'])
+                             external_gateway_info=input_value,
+                             as_admin=True) as router:
+                res = self._show('routers', router['router']['id'],
+                                 tenant_id=tenant_id)
                 for k, v in expected_value:
-                    self.assertEqual(res['router'][k], v)
+                    self.assertEqual(v, res['router'][k])
 
     def test_router_create_show_ext_gwinfo_default(self):
         self._test_router_create_show_ext_gwinfo(None, True)
@@ -492,7 +501,8 @@ class ExtGwModeIntTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase,
                     self._set_router_external_gateway(
                         r['router']['id'], ext_net_id,
                         snat_enabled=snat_input_value,
-                        expected_code=expected_http_code)
+                        expected_code=expected_http_code,
+                        as_admin=True)
                     if expected_http_code != exc.HTTPOk.code:
                         return
                     body = self._show('routers', r['router']['id'])
@@ -532,7 +542,5 @@ class ExtGwModeSepTestCase(ExtGwModeIntTestCase):
         l3_plugin = ('neutron.tests.unit.extensions.test_l3_ext_gw_mode.'
                      'TestDbSepPlugin')
         svc_plugins = {'l3_plugin_name': l3_plugin}
-        # for these tests we need to enable overlapping ips
-        cfg.CONF.set_default('allow_overlapping_ips', True)
-        super(ExtGwModeSepTestCase, self).setUp(plugin=plugin,
-                                                svc_plugins=svc_plugins)
+        super().setUp(plugin=plugin,
+                      svc_plugins=svc_plugins)

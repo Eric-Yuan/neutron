@@ -37,7 +37,7 @@ IRONIC_CLIENT_VERSION = 1
 
 
 @registry.has_registry_receivers
-class Notifier(object):
+class Notifier:
 
     _instance = None
 
@@ -67,7 +67,8 @@ class Notifier(object):
             IRONIC_SESSION = self._get_session(IRONIC_CONF_SECTION)
 
         return connection.Connection(
-            session=IRONIC_SESSION, oslo_conf=cfg.CONF).baremetal
+            session=IRONIC_SESSION, oslo_conf=cfg.CONF,
+            connect_retries=cfg.CONF.http_retries).baremetal
 
     def send_events(self, batched_events):
         try:
@@ -77,12 +78,13 @@ class Notifier(object):
             os_exc.raise_from_response(response)
         except Exception as e:
             LOG.exception('Error encountered posting the event to '
-                          'ironic. {error}'.format(error=e))
+                          'ironic, error: %s', e)
 
     @registry.receives(resources.PORT, [events.AFTER_UPDATE])
     def process_port_update_event(self, resource, event, trigger,
-                                  original_port=None, port=None,
-                                  **kwargs):
+                                  payload):
+        original_port = payload.states[0]
+        port = payload.latest_state
         # We only want to notify about baremetal ports.
         if not (port[portbindings_def.VNIC_TYPE] ==
                 portbindings_def.VNIC_BAREMETAL):
@@ -97,13 +99,13 @@ class Notifier(object):
                                         n_const.PORT_STATUS_ERROR]):
             port_event = 'unbind_port'
         elif (original_port_status == n_const.PORT_STATUS_DOWN and
-                current_port_status in [n_const.PORT_STATUS_ACTIVE,
-                                        n_const.PORT_STATUS_ERROR]):
+              current_port_status in [n_const.PORT_STATUS_ACTIVE,
+                                      n_const.PORT_STATUS_ERROR]):
             port_event = 'bind_port'
-        LOG.debug('Queuing event for {event_type} for port {port} '
-                  'for status {status}.'.format(event_type=port_event,
-                                                port=port['id'],
-                                                status=current_port_status))
+        LOG.debug('Queuing event for %(event_type)s for port %(port)s '
+                  'for status %(status)s.', {'event_type': port_event,
+                                             'port': port['id'],
+                                             'status': current_port_status})
         if port_event:
             notify_event = {
                 'event': '.'.join([BAREMETAL_EVENT_TYPE, port_event]),
@@ -121,19 +123,19 @@ class Notifier(object):
 
     @registry.receives(resources.PORT, [events.AFTER_DELETE])
     def process_port_delete_event(self, resource, event, trigger,
-                                  original_port=None, port=None,
-                                  **kwargs):
+                                  payload):
         # We only want to notify about baremetal ports.
+        port = payload.latest_state
         if not (port[portbindings_def.VNIC_TYPE] ==
                 portbindings_def.VNIC_BAREMETAL):
             # TODO(TheJulia): Add the smartnic flag at some point...
             return
 
         port_event = 'delete_port'
-        LOG.debug('Queuing event for {event_type} for port {port} '
-                  'for status {status}.'.format(event_type=port_event,
-                                                port=port['id'],
-                                                status='DELETED'))
+        LOG.debug('Queuing event for %(event_type)s for port %(port)s '
+                  'for status %(status)s.', {'event_type': port_event,
+                                             'port': port['id'],
+                                             'status': 'DELETED'})
         notify_event = {
             'event': '.'.join([BAREMETAL_EVENT_TYPE, port_event]),
             'port_id': port['id'],

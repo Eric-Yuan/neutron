@@ -18,6 +18,8 @@ import threading
 from ovsdbapp.backend.ovs_idl import event
 from ovsdbapp.tests.functional.schema.ovn_southbound import event as test_event
 
+from neutron.common.ovn import constants as ovn_const
+
 
 class WaitForCrLrpPortBindingEvent(event.RowEvent):
     event_name = 'WaitForCrLrpPortBindingEvent'
@@ -27,8 +29,8 @@ class WaitForCrLrpPortBindingEvent(event.RowEvent):
     def __init__(self, timeout=5):
         self.logical_port_events = collections.defaultdict(threading.Event)
         self.timeout = timeout
-        super(WaitForCrLrpPortBindingEvent, self).__init__(
-            (self.ROW_CREATE,), 'Port_Binding', None)
+        super().__init__(
+            (self.ROW_CREATE, self.ROW_UPDATE), 'Port_Binding', None)
 
     def match_fn(self, event, row, old=None):
         return row.logical_port.startswith(self.PREFIX)
@@ -48,7 +50,7 @@ class WaitForCreatePortBindingEvent(test_event.WaitForPortBindingEvent):
 
     def run(self, event, row, old):
         self.row = row
-        super(WaitForCreatePortBindingEvent, self).run(event, row, old)
+        super().run(event, row, old)
 
 
 class WaitForUpdatePortBindingEvent(test_event.WaitForPortBindingEvent):
@@ -63,3 +65,20 @@ class WaitForUpdatePortBindingEvent(test_event.WaitForPortBindingEvent):
             (('logical_port', '=', port),
              ('mac', '=', mac)),
             timeout=timeout)
+
+
+class WaitForCreatePortBindingEventPerType(event.WaitEvent):
+    event_name = 'WaitForCreatePortBindingEventPerType'
+
+    def __init__(self, port_type=ovn_const.OVN_CHASSIS_REDIRECT,
+                 timeout=5):
+        super().__init__((self.ROW_CREATE,), 'Port_Binding',
+                         (('type', '=', port_type),), timeout=timeout)
+
+
+class WaitForLogicalRouterUpdate(event.WaitEvent):
+    event_name = 'WaitForLogicalRouterUpdate'
+
+    def __init__(self):
+        super().__init__((self.ROW_UPDATE,), 'Logical_Router', None,
+                         timeout=30)

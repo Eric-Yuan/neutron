@@ -21,8 +21,8 @@
       (Avoid deeper levels because they do not render well.)
 
 
-Objects in neutron
-==================
+Objects
+=======
 
 Object versioning is a key concept in achieving rolling upgrades. Since its
 initial implementation by the nova community, a versioned object model has been
@@ -355,48 +355,6 @@ model, the nullable parameter is by default :code:`True`, while for OVO fields,
 the nullable is set to :code:`False`. Make sure you correctly map database
 column nullability properties to relevant object fields.
 
-Database session activation
----------------------------
-
-By default, all objects use old ``oslo.db`` engine facade. To enable the new
-facade for a particular object, set ``new_facade`` class attribute to ``True``:
-
-.. code-block:: Python
-
-    @obj_base.VersionedObjectRegistry.register
-    class ExampleObject(base.NeutronDbObject):
-        new_facade = True
-
-It will make all OVO actions - ``get_object``, ``update``, ``count`` etc. - to
-use new ``reader.using`` or ``writer.using`` decorators to manage database
-transactions.
-
-Whenever you need to open a new subtransaction in scope of OVO code, use the
-following database session decorators:
-
-.. code-block:: Python
-
-    @obj_base.VersionedObjectRegistry.register
-    class ExampleObject(base.NeutronDbObject):
-
-        @classmethod
-        def get_object(cls, context, **kwargs):
-            with cls.db_context_reader(context):
-                super(ExampleObject,  cls).get_object(context, **kwargs)
-                # fetch more data in the same transaction
-
-        def create(self):
-            with self.db_context_writer(self.obj_context):
-                super(ExampleObject, self).create()
-                # apply more changes in the same transaction
-
-``db_context_reader`` and ``db_context_writer`` decorators abstract the choice
-of engine facade used for particular object from action implementation.
-
-Alternatively, you can call all OVO actions under an active ``reader.using`` /
-``writer.using`` context manager (or ``session.begin``). In this case, OVO will
-pick the appropriate method to open a subtransaction.
-
 Synthetic fields
 ----------------
 :code:`synthetic_fields` is a list of fields, that are not directly backed by
@@ -416,8 +374,8 @@ types that can be used to implement them.
     # implemented in some object-specific way.
     synthetic_fields = ['dhcp_agents', 'shared', 'subnets']
 
-:code:`ObjectField` and :code:`ListOfObjectsField`  take the name of object class
-as an argument.
+:code:`ObjectField` and :code:`ListOfObjectsField`  take the name of object
+class as an argument.
 
 
 Implementing custom synthetic fields
@@ -686,7 +644,6 @@ four releases newer than what is running on the computes.
 Known fast forward upgrade windows are:
 
 * Red Hat OpenStack Platform (RHOSP): X -> X+3 [#]_
-* SuSE OpenStack Cloud (SOC): X -> X+2 [#]_
 * Ubuntu Cloud Archive: X -> X+4 [#]_
 
 Therefore removal of OVO version downgrade code should be removed in the fifth
@@ -725,13 +682,12 @@ The :code:`convert_filters` method is available in
 
 References
 ----------
-.. [#] https://opendev.org/openstack/neutron/tree/neutron/objects/base.py?h=stable/ocata#n258
-.. [#] https://opendev.org/openstack/neutron/tree/neutron/db/standard_attr.py?h=stable/ocata
-.. [#] https://opendev.org/openstack/neutron/tree/neutron/objects/base.py?h=stable/ocata#n516
-.. [#] https://opendev.org/openstack/neutron/tree/neutron/objects/base.py?h=stable/ocata#n542
+.. [#] https://opendev.org/openstack/neutron/src/tag/ocata-eol/neutron/objects/base.py#L258
+.. [#] https://opendev.org/openstack/neutron/src/tag/ocata-eol/neutron/db/standard_attr.py
+.. [#] https://opendev.org/openstack/neutron/src/tag/ocata-eol/neutron/objects/base.py#L516
+.. [#] https://opendev.org/openstack/neutron/src/tag/ocata-eol/neutron/objects/base.py#L542
 .. [#] https://docs.openstack.org/neutron/latest/contributor/internals/db_layer.html#the-standard-attribute-table
-.. [#] https://opendev.org/openstack/neutron/tree/neutron/objects/rbac_db.py?h=stable/ocata#n291
+.. [#] https://opendev.org/openstack/neutron/src/tag/ocata-eol/neutron/objects/rbac_db.py#L291
 .. [#] https://access.redhat.com/support/policy/updates/openstack/platform/
-.. [#] https://www.suse.com/releasenotes/x86_64/SUSE-OPENSTACK-CLOUD/8/#Upgrade
 .. [#] https://www.ubuntu.com/about/release-cycle
-.. [#] https://opendev.org/openstack/neutron-lib/tree/neutron_lib/objects/utils.py
+.. [#] https://opendev.org/openstack/neutron-lib/src/neutron_lib/objects/utils.py

@@ -60,10 +60,10 @@ def check_sanity(connection):
 
 
 def get_duplicate_floating_ip_for_one_fixed_ip(connection):
-    insp = sa.engine.reflection.Inspector.from_engine(connection)
+    insp = sa.inspect(connection)
     if 'floatingips' not in insp.get_table_names():
         return []
-    session = sa.orm.Session(bind=connection.connect())
+    session = sa.orm.Session(bind=connection)
     query = (session.query(floatingips.c.fixed_ip_address)
              .group_by(floatingips.c.floating_network_id,
                        floatingips.c.fixed_port_id,

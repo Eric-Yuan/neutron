@@ -1,7 +1,7 @@
 .. _config-ovs-offload:
 
 ================================
-Open vSwitch hardware offloading
+Open vSwitch Hardware Offloading
 ================================
 
 The purpose of this page is to describe how to enable Open vSwitch hardware
@@ -75,7 +75,8 @@ Prerequisites
 Using Open vSwitch hardware offloading
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-In order to enable Open vSwitch hardware offloading, the following steps are required:
+In order to enable Open vSwitch hardware offloading, the following steps are
+required:
 
 #. Enable SR-IOV
 #. Configure NIC to switchdev mode (relevant Nodes)
@@ -166,7 +167,7 @@ network and has access to the private networks of all nodes.
       The PCI bus number of the PF (03:00.0) and VFs (03:00.2 .. 03:00.5)
       will be used later.
 
-   .. code-block::bash
+   .. code-block:: bash
 
       # lspci | grep Ethernet
       03:00.0 Ethernet controller: Mellanox Technologies MT27800 Family [ConnectX-5]
@@ -175,7 +176,6 @@ network and has access to the private networks of all nodes.
       03:00.3 Ethernet controller: Mellanox Technologies MT27800 Family [ConnectX-5 Virtual Function]
       03:00.4 Ethernet controller: Mellanox Technologies MT27800 Family [ConnectX-5 Virtual Function]
       03:00.5 Ethernet controller: Mellanox Technologies MT27800 Family [ConnectX-5 Virtual Function]
-
 
    .. code-block:: bash
 
@@ -356,27 +356,21 @@ Validate Open vSwitch hardware offloading
 
    .. code-block:: bash
 
-      # openstack port create --network private --vnic-type=direct --binding-profile '{"capabilities": ["switchdev"]}' direct_port1
+      # openstack port create --network private --vnic-type=direct direct_port1
 
 
 #. Create an instance using the direct port on 'First Compute Node'
 
    .. code-block:: bash
 
-      # openstack server create --flavor m1.small --image mellanox_fedora --nic port-id=direct_port1 vm1
-
-
-   .. note::
-
-      In this example, we used Mellanox Image with NIC Drivers that can be downloaded from
-      http://www.mellanox.com/repository/solutions/openstack/images/mellanox_eth.img
+      # openstack server create --flavor m1.small --image cloud_image --nic port-id=direct_port1 vm1
 
 
 #. Repeat steps above and create a second instance on 'Second Compute Node'
 
    .. code-block:: bash
 
-      # openstack port create --network private --vnic-type=direct --binding-profile '{"capabilities": ["switchdev"]}' direct_port2
+      # openstack port create --network private --vnic-type=direct direct_port2
       # openstack server create --flavor m1.small --image mellanox_fedora --nic port-id=direct_port2 vm2
 
    .. note::
@@ -432,7 +426,8 @@ Validate Open vSwitch hardware offloading
 
    .. end
 
-#. Check traffic on the representor port. Verify that only the first ICMP packet appears.
+#. Check traffic on the representor port. Verify that only the first ICMP
+   packet appears.
 
    .. code-block:: console
 

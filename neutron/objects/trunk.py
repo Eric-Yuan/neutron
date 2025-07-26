@@ -13,11 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import trunk as trunk_def
+from neutron_lib.db import resource_extend
 from neutron_lib import exceptions as n_exc
 from neutron_lib.objects import common_types
 from neutron_lib.objects import exceptions as o_exc
 from oslo_db import exception as o_db_exc
-from oslo_utils import versionutils
 from oslo_versionedobjects import fields as obj_fields
 
 from neutron.objects import base
@@ -31,7 +32,6 @@ class SubPort(base.NeutronDbObject):
     VERSION = '1.0'
 
     db_model = models.SubPort
-    new_facade = True
 
     primary_keys = ['port_id']
     foreign_keys = {'Trunk': {'trunk_id': 'id'}}
@@ -46,7 +46,7 @@ class SubPort(base.NeutronDbObject):
     fields_no_update = ['segmentation_type', 'segmentation_id', 'trunk_id']
 
     def to_dict(self):
-        _dict = super(SubPort, self).to_dict()
+        _dict = super().to_dict()
         # trunk_id is redundant in the subport dict.
         _dict.pop('trunk_id')
         return _dict
@@ -54,15 +54,14 @@ class SubPort(base.NeutronDbObject):
     def create(self):
         try:
             with self.db_context_writer(self.obj_context):
-                super(SubPort, self).create()
+                super().create()
         except o_db_exc.DBReferenceError as ex:
             if ex.key_table is None:
-                # NOTE(ivc): 'key_table' is provided by 'oslo.db' [1]
-                # only for a limited set of database backends (i.e.
-                # MySQL and PostgreSQL). Other database backends
-                # (including SQLite) would have 'key_table' set to None.
-                # We emulate the 'key_table' support for such database
-                # backends.
+                # NOTE(ivc): 'key_table' is provided by 'oslo.db' [1] only for
+                # a limited set of database backends (i.e. MySQL). Other
+                # database backends (including SQLite) would have 'key_table'
+                # set to None. We emulate the 'key_table' support for such
+                # database backends.
                 #
                 # [1] https://github.com/openstack/oslo.db/blob/3fadd5a
                 #     /oslo_db/sqlalchemy/exc_filters.py#L190-L203
@@ -90,7 +89,6 @@ class Trunk(base.NeutronDbObject):
     VERSION = '1.1'
 
     db_model = models.Trunk
-    new_facade = True
 
     fields = {
         'admin_state_up': obj_fields.BooleanField(),
@@ -113,7 +111,7 @@ class Trunk(base.NeutronDbObject):
                 sub_ports = self.sub_ports
 
             try:
-                super(Trunk, self).create()
+                super().create()
             except o_db_exc.DBReferenceError:
                 raise n_exc.PortNotFound(port_id=self.port_id)
 
@@ -126,21 +124,21 @@ class Trunk(base.NeutronDbObject):
 
     def update(self, **kwargs):
         self.update_fields(kwargs)
-        super(Trunk, self).update()
+        super().update()
 
-    # TODO(hichihara): For tag mechanism. This will be removed in bug/1704137
     def to_dict(self):
-        _dict = super(Trunk, self).to_dict()
-        try:
-            _dict['tags'] = [t.tag for t in self.db_obj.standard_attr.tags]
-        except AttributeError:
-            # AttrtibuteError can be raised when accessing self.db_obj
-            # or self.db_obj.standard_attr
-            pass
+        _dict = super().to_dict()
+        resource_extend.apply_funcs(trunk_def.TRUNKS, _dict, self.db_obj)
         return _dict
 
-    def obj_make_compatible(self, primitive, target_version):
-        _target_version = versionutils.convert_version_to_tuple(target_version)
+    @classmethod
+    def get_trunk_ids(cls, context):
+        """Returns only the trunk IDs.
 
-        if _target_version < (1, 1):
-            primitive['tenant_id'] = primitive.pop('project_id')
+        This method returns only the primary key ID, reducing the query
+        complexity and increasing the retrieval speed.
+        This query does not check the "Trunk" owner or RBACs.
+        """
+        with cls.db_context_reader(context):
+            return [_id[0] for _id in
+                    context.session.query(cls.db_model.id).all()]

@@ -15,15 +15,16 @@
 
 import glob
 import grp
+from http import client as httplib
 import os
 import pwd
 import shlex
 import socket
+import socketserver
+import subprocess
 import threading
 import time
 
-import eventlet
-from eventlet.green import subprocess
 from neutron_lib import exceptions
 from neutron_lib.utils import helpers
 from oslo_config import cfg
@@ -32,19 +33,16 @@ from oslo_rootwrap import client
 from oslo_utils import encodeutils
 from oslo_utils import excutils
 from oslo_utils import fileutils
-from six.moves import http_client as httplib
+import psutil
 
-from neutron._i18n import _
-from neutron.agent.linux import xenapi_root_helper
 from neutron.common import utils
 from neutron.conf.agent import common as config
-from neutron import wsgi
-
+from neutron.privileged.agent.linux import utils as priv_utils
 
 LOG = logging.getLogger(__name__)
 
 
-class RootwrapDaemonHelper(object):
+class RootwrapDaemonHelper:
     __client = None
     __lock = threading.Lock()
 
@@ -56,12 +54,8 @@ class RootwrapDaemonHelper(object):
     def get_client(cls):
         with cls.__lock:
             if cls.__client is None:
-                if (xenapi_root_helper.ROOT_HELPER_DAEMON_TOKEN ==
-                        cfg.CONF.AGENT.root_helper_daemon):
-                    cls.__client = xenapi_root_helper.XenAPIClient()
-                else:
-                    cls.__client = client.Client(
-                        shlex.split(cfg.CONF.AGENT.root_helper_daemon))
+                cls.__client = client.Client(
+                    shlex.split(cfg.CONF.AGENT.root_helper_daemon))
             return cls.__client
 
 
@@ -83,14 +77,29 @@ def create_process(cmd, run_as_root=False, addl_env=None):
     """
     cmd = list(map(str, addl_env_args(addl_env) + cmd))
     if run_as_root:
+        # NOTE(ralonsoh): to be removed once the migration to privsep
+        # execution is done.
         cmd = shlex.split(config.get_root_helper(cfg.CONF)) + cmd
     LOG.debug("Running command: %s", cmd)
-    obj = utils.subprocess_popen(cmd, shell=False,
-                                 stdin=subprocess.PIPE,
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE)
-
+    # pylint: disable=consider-using-with
+    obj = subprocess.Popen(  # noqa: S603
+        cmd,
+        shell=False,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
     return obj, cmd
+
+
+def _execute_process(cmd, _process_input, addl_env, run_as_root):
+    obj, cmd = create_process(cmd, run_as_root=run_as_root, addl_env=addl_env)
+    _stdout, _stderr = obj.communicate(_process_input)
+    returncode = obj.returncode
+    obj.stdin.close()
+    _stdout = helpers.safe_decode_utf8(_stdout)
+    _stderr = helpers.safe_decode_utf8(_stderr)
+    return _stdout, _stderr, returncode
 
 
 def execute_rootwrap_daemon(cmd, process_input, addl_env):
@@ -103,49 +112,53 @@ def execute_rootwrap_daemon(cmd, process_input, addl_env):
     LOG.debug("Running command (rootwrap daemon): %s", cmd)
     client = RootwrapDaemonHelper.get_client()
     try:
-        return client.execute(cmd, process_input)
+        returncode, _stdout, _stderr = client.execute(cmd, process_input)
     except Exception:
         with excutils.save_and_reraise_exception():
             LOG.error("Rootwrap error running command: %s", cmd)
 
+    _stdout = helpers.safe_decode_utf8(_stdout)
+    _stderr = helpers.safe_decode_utf8(_stderr)
+    return _stdout, _stderr, returncode
+
 
 def execute(cmd, process_input=None, addl_env=None,
             check_exit_code=True, return_stderr=False, log_fail_as_error=True,
-            extra_ok_codes=None, run_as_root=False):
+            extra_ok_codes=None, run_as_root=False, privsep_exec=False):
     try:
         if process_input is not None:
             _process_input = encodeutils.to_utf8(process_input)
         else:
             _process_input = None
-        if run_as_root and cfg.CONF.AGENT.root_helper_daemon:
-            returncode, _stdout, _stderr = (
-                execute_rootwrap_daemon(cmd, process_input, addl_env))
+
+        if run_as_root and privsep_exec:
+            _stdout, _stderr, returncode = priv_utils.execute_process(
+                cmd, _process_input, addl_env)
+        elif run_as_root and cfg.CONF.AGENT.root_helper_daemon:
+            _stdout, _stderr, returncode = execute_rootwrap_daemon(
+                cmd, process_input, addl_env)
         else:
-            obj, cmd = create_process(cmd, run_as_root=run_as_root,
-                                      addl_env=addl_env)
-            _stdout, _stderr = obj.communicate(_process_input)
-            returncode = obj.returncode
-            obj.stdin.close()
-        _stdout = helpers.safe_decode_utf8(_stdout)
-        _stderr = helpers.safe_decode_utf8(_stderr)
+            _stdout, _stderr, returncode = _execute_process(
+                cmd, _process_input, addl_env, run_as_root)
 
         extra_ok_codes = extra_ok_codes or []
         if returncode and returncode not in extra_ok_codes:
-            msg = _("Exit code: %(returncode)d; "
-                    "Stdin: %(stdin)s; "
-                    "Stdout: %(stdout)s; "
-                    "Stderr: %(stderr)s") % {
-                        'returncode': returncode,
-                        'stdin': process_input or '',
-                        'stdout': _stdout,
-                        'stderr': _stderr}
+            msg = ("Exit code: %(returncode)d; "
+                   "Cmd: %(cmd)s; "
+                   "Stdin: %(stdin)s; "
+                   "Stdout: %(stdout)s; "
+                   "Stderr: %(stderr)s" % {
+                       'returncode': returncode,
+                       'cmd': cmd,
+                       'stdin': process_input or '',
+                       'stdout': _stdout,
+                       'stderr': _stderr})
 
             if log_fail_as_error:
                 LOG.error(msg)
             if check_exit_code:
                 raise exceptions.ProcessExecutionError(msg,
                                                        returncode=returncode)
-
     finally:
         # NOTE(termie): this appears to be necessary to let the subprocess
         #               call clean something up in between calls, without
@@ -161,21 +174,31 @@ def find_child_pids(pid, recursive=False):
     It can also find all children through the hierarchy if recursive=True
     """
     try:
-        raw_pids = execute(['ps', '--ppid', pid, '-o', 'pid='],
-                           log_fail_as_error=False)
-    except exceptions.ProcessExecutionError as e:
-        # Unexpected errors are the responsibility of the caller
-        with excutils.save_and_reraise_exception() as ctxt:
-            # Exception has already been logged by execute
-            no_children_found = e.returncode == 1
-            if no_children_found:
-                ctxt.reraise = False
-                return []
-    child_pids = [x.strip() for x in raw_pids.split('\n') if x.strip()]
+        process = psutil.Process(pid=int(pid))
+    except psutil.NoSuchProcess:
+        return []
+
+    child_pids = [str(p.pid) for p in process.children()]
     if recursive:
         for child in child_pids:
-            child_pids = child_pids + find_child_pids(child, True)
+            child_pids += find_child_pids(child, recursive=True)
     return child_pids
+
+
+def pgrep(
+        command: str,
+        entire_command_line: bool = True
+) -> str | None:
+    cmd = ['pgrep']
+    if entire_command_line:
+        cmd += ['-f']
+    cmd += [command]
+    try:
+        result = execute(cmd).strip()
+    except exceptions.ProcessExecutionError:
+        return None
+
+    return result if result else None
 
 
 def find_parent_pid(pid):
@@ -184,29 +207,16 @@ def find_parent_pid(pid):
     If the pid doesn't exist in the system, this function will return
     None
     """
-    try:
-        ppid = execute(['ps', '-o', 'ppid=', pid],
-                       log_fail_as_error=False)
-    except exceptions.ProcessExecutionError as e:
-        # Unexpected errors are the responsibility of the caller
-        with excutils.save_and_reraise_exception() as ctxt:
-            # Exception has already been logged by execute
-            no_such_pid = e.returncode == 1
-            if no_such_pid:
-                ctxt.reraise = False
-                return
-    return ppid.strip()
+    process = psutil.Process(pid=int(pid))
+    if process:
+        return str(process.parent().pid)
+    return None
 
 
 def get_process_count_by_name(name):
     """Find the process count by name."""
-    try:
-        out = execute(['ps', '-C', name, '-o', 'comm='],
-                      log_fail_as_error=False)
-    except exceptions.ProcessExecutionError:
-        with excutils.save_and_reraise_exception(reraise=False):
-            return 0
-    return len(out.strip('\n').split('\n'))
+    return len([p for p in psutil.process_iter(['name']) if
+                p.info['name'] == name])
 
 
 def find_fork_top_parent(pid):
@@ -227,7 +237,8 @@ def find_fork_top_parent(pid):
 def kill_process(pid, signal, run_as_root=False):
     """Kill the process with the given pid using the given signal."""
     try:
-        execute(['kill', '-%d' % signal, pid], run_as_root=run_as_root)
+        execute(['kill', '-%d' % signal, pid], run_as_root=run_as_root,
+                privsep_exec=True)
     except exceptions.ProcessExecutionError:
         if process_is_running(pid):
             raise
@@ -246,18 +257,18 @@ def _get_conf_base(cfg_root, uuid, ensure_conf_dir):
 def get_conf_file_name(cfg_root, uuid, cfg_file, ensure_conf_dir=False):
     """Returns the file name for a given kind of config file."""
     conf_base = _get_conf_base(cfg_root, uuid, ensure_conf_dir)
-    return "%s.%s" % (conf_base, cfg_file)
+    return f"{conf_base}.{cfg_file}"
 
 
 def get_value_from_file(filename, converter=None):
 
     try:
-        with open(filename, 'r') as f:
+        with open(filename) as f:
             try:
                 return converter(f.read()) if converter else f.read()
             except ValueError:
                 LOG.error('Unable to convert value in %s', filename)
-    except IOError as error:
+    except OSError as error:
         LOG.debug('Unable to access %(filename)s; Error: %(error)s',
                   {'filename': filename, 'error': error})
 
@@ -327,9 +338,9 @@ def get_cmdline_from_pid(pid):
     # NOTE(jh): Even after the above check, the process may terminate
     # before the open below happens
     try:
-        with open('/proc/%s/cmdline' % pid, 'r') as f:
+        with open('/proc/%s/cmdline' % pid) as f:
             cmdline = f.readline().split('\0')[:-1]
-    except IOError:
+    except OSError:
         return []
 
     # NOTE(slaweq): sometimes it may happen that values in
@@ -344,7 +355,14 @@ def get_cmdline_from_pid(pid):
     return cmdline
 
 
-def cmd_matches_expected(cmd, expected_cmd):
+def cmd_matches_expected(cmd, expected_cmd, process_name):
+    if process_name and cmd and cmd[0] == process_name:
+        # If Neutron has defined the title (setproctitle) of the running
+        # process, the "ps" output will be "<process_name> (cmd)"
+        cmd = cmd[1:]
+        cmd[0] = cmd[0].strip('(')
+        cmd[-1] = cmd[-1].strip(')')
+
     abs_cmd = remove_abs_path(cmd)
     abs_expected_cmd = remove_abs_path(expected_cmd)
     if abs_cmd != abs_expected_cmd:
@@ -355,12 +373,12 @@ def cmd_matches_expected(cmd, expected_cmd):
     return abs_cmd == abs_expected_cmd
 
 
-def pid_invoked_with_cmdline(pid, expected_cmd):
+def pid_invoked_with_cmdline(pid, expected_cmd, process_name=None):
     """Validate process with given pid is running with provided parameters
 
     """
     cmd = get_cmdline_from_pid(pid)
-    return cmd_matches_expected(cmd, expected_cmd)
+    return cmd_matches_expected(cmd, expected_cmd, process_name)
 
 
 def ensure_directory_exists_without_file(path):
@@ -394,6 +412,26 @@ def is_effective_group(group_id_or_name):
     return group_id_or_name == effective_group_name
 
 
+def delete_if_exists(path, run_as_root=False):
+    """Delete a path, executed as normal user or with elevated privileges"""
+    if run_as_root:
+        priv_utils.delete_if_exists(path)
+    else:
+        fileutils.delete_if_exists(path)
+
+
+def read_if_exists(path: str, run_as_root=False) -> str:
+    """Return the content of a text file as a string
+
+    The output includes the empty lines too. If the file does not exist,
+    returns an empty string.
+    It could be called with elevated permissions (root).
+    """
+    if run_as_root:
+        return priv_utils.read_file(path)
+    return utils.read_file(path)
+
+
 class UnixDomainHTTPConnection(httplib.HTTPConnection):
     """Connection class for HTTP over UNIX domain socket."""
     def __init__(self, host, port=None, strict=None, timeout=None,
@@ -409,62 +447,34 @@ class UnixDomainHTTPConnection(httplib.HTTPConnection):
         self.sock.connect(self.socket_path)
 
 
-class UnixDomainHttpProtocol(eventlet.wsgi.HttpProtocol):
-    def __init__(self, *args):
-        # NOTE(yamahata): from eventlet v0.22 HttpProtocol.__init__
-        # signature was changed by changeset of
-        # 7f53465578543156e7251e243c0636e087a8445f
-        # Both have server as last arg, but first arg(s) differ
-        server = args[-1]
-
-        # Because the caller is eventlet.wsgi.Server.process_request,
-        # the number of arguments will dictate if it is new or old style.
-        if len(args) == 2:
-            conn_state = args[0]
-            client_address = conn_state[0]
-            if not client_address:
-                conn_state[0] = ('<local>', 0)
-            # base class is old-style, so super does not work properly
-            eventlet.wsgi.HttpProtocol.__init__(self, conn_state, server)
-        elif len(args) == 3:
-            request = args[0]
-            client_address = args[1]
-            if not client_address:
-                client_address = ('<local>', 0)
-            # base class is old-style, so super does not work properly
-            # NOTE: eventlet 0.22 or later changes the number of args to 2.
-            # If we install eventlet 0.22 or later into a venv for pylint,
-            # pylint complains this. Let's skip it. (bug 1791178)
-            # pylint: disable=too-many-function-args
-            eventlet.wsgi.HttpProtocol.__init__(
-                self, request, client_address, server)
-        else:
-            eventlet.wsgi.HttpProtocol.__init__(self, *args)
-
-
-class UnixDomainWSGIServer(wsgi.Server):
-    def __init__(self, name, num_threads=None):
-        self._socket = None
-        self._launcher = None
+class UnixDomainWSGIThreadServer:
+    def __init__(self, name, application, file_socket):
+        self._name = name
+        self._application = application
+        self._file_socket = file_socket
         self._server = None
-        super(UnixDomainWSGIServer, self).__init__(name, disable_ssl=True,
-                                                   num_threads=num_threads)
 
-    def start(self, application, file_socket, workers, backlog, mode=None):
-        self._socket = eventlet.listen(file_socket,
-                                       family=socket.AF_UNIX,
-                                       backlog=backlog)
-        if mode is not None:
-            os.chmod(file_socket, mode)
+    def run(self):
+        self._server = socketserver.ThreadingUnixStreamServer(
+            self._file_socket, self._application)
 
-        self._launch(application, workers=workers)
+    def wait(self):
+        self._server.serve_forever()
 
-    def _run(self, application, socket):
-        """Start a WSGI service in a new green thread."""
-        logger = logging.getLogger('eventlet.wsgi.server')
-        eventlet.wsgi.server(socket,
-                             application,
-                             max_size=self.num_threads,
-                             protocol=UnixDomainHttpProtocol,
-                             log=logger,
-                             log_format=cfg.CONF.wsgi_log_format)
+
+def get_attr(pyroute2_obj, attr_name):
+    """Get an attribute in a pyroute object
+
+    pyroute2 object attributes are stored under a key called 'attrs'. This key
+    contains a tuple of tuples. E.g.:
+      pyroute2_obj = {'attrs': (('TCA_KIND': 'htb'),
+                                ('TCA_OPTIONS': {...}))}
+
+    :param pyroute2_obj: (dict) pyroute2 object
+    :param attr_name: (string) first value of the tuple we are looking for
+    :return: (object) second value of the tuple, None if the tuple doesn't
+             exist
+    """
+    rule_attrs = pyroute2_obj.get('attrs', [])
+    for attr in (attr for attr in rule_attrs if attr[0] == attr_name):
+        return attr[1]

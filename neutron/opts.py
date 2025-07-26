@@ -19,7 +19,7 @@ from oslo_config import cfg
 
 import neutron.agent.agent_extensions_manager
 import neutron.agent.securitygroups_rpc
-import neutron.common.cache_utils
+import neutron.api.wsgi
 import neutron.conf.agent.agent_extensions_manager
 import neutron.conf.agent.common
 import neutron.conf.agent.database.agents_db
@@ -31,20 +31,20 @@ import neutron.conf.agent.linux
 import neutron.conf.agent.metadata.config as meta_conf
 import neutron.conf.agent.ovs_conf
 import neutron.conf.agent.ovsdb_api
-import neutron.conf.agent.xenapi_conf
 import neutron.conf.common
 import neutron.conf.db.dvr_mac_db
 import neutron.conf.db.extraroute_db
 import neutron.conf.db.l3_agentschedulers_db
 import neutron.conf.db.l3_dvr_db
+import neutron.conf.db.l3_extra_gws_db
 import neutron.conf.db.l3_gwmode_db
 import neutron.conf.db.l3_hamode_db
+import neutron.conf.experimental
 import neutron.conf.extensions.allowedaddresspairs
 import neutron.conf.extensions.conntrack_helper
 import neutron.conf.plugins.ml2.config
 import neutron.conf.plugins.ml2.drivers.agent
 import neutron.conf.plugins.ml2.drivers.driver_type
-import neutron.conf.plugins.ml2.drivers.linuxbridge
 import neutron.conf.plugins.ml2.drivers.macvtap
 import neutron.conf.plugins.ml2.drivers.mech_sriov.agent_common
 import neutron.conf.plugins.ml2.drivers.mech_sriov.mech_sriov_conf
@@ -52,32 +52,75 @@ import neutron.conf.plugins.ml2.drivers.openvswitch.mech_ovs_conf
 import neutron.conf.plugins.ml2.drivers.ovs_conf
 import neutron.conf.quota
 import neutron.conf.service
+import neutron.conf.services.extdns_designate_driver
 import neutron.conf.services.logging
 import neutron.conf.services.metering_agent
+import neutron.conf.services.provider_configuration
 import neutron.conf.wsgi
 import neutron.db.migration.cli
 import neutron.extensions.l3
 import neutron.extensions.securitygroup
 import neutron.plugins.ml2.drivers.mech_sriov.agent.common.config
-import neutron.wsgi
 
 
-NOVA_GROUP = 'nova'
-IRONIC_GROUP = 'ironic'
+AUTH_GROUPS_OPTS = {
+    'nova': {
+        'deprecations': {
+            'nova.cafile': [
+                cfg.DeprecatedOpt('ca_certificates_file', group='nova')
+            ],
+            'nova.insecure': [
+                cfg.DeprecatedOpt('api_insecure', group='nova')
+            ],
+            'nova.timeout': [
+                cfg.DeprecatedOpt('url_timeout', group='nova')
+            ]
+        }
+    },
+    'ironic': {},
+    'placement': {},
+    'designate': {}
+}
 
 CONF = cfg.CONF
 
-deprecations = {'nova.cafile': [cfg.DeprecatedOpt('ca_certificates_file',
-                                                  group=NOVA_GROUP)],
-                'nova.insecure': [cfg.DeprecatedOpt('api_insecure',
-                                                    group=NOVA_GROUP)],
-                'nova.timeout': [cfg.DeprecatedOpt('url_timeout',
-                                                   group=NOVA_GROUP)]}
 
-_nova_options = ks_loading.register_session_conf_options(
-            CONF, NOVA_GROUP, deprecated_opts=deprecations)
-_ironic_options = ks_loading.register_session_conf_options(
-            CONF, IRONIC_GROUP)
+def list_auth_opts(group):
+    group_conf = AUTH_GROUPS_OPTS.get(group)
+    kwargs = {'conf': CONF, 'group': group}
+    deprecations = group_conf.get('deprecations')
+    if deprecations:
+        kwargs['deprecated_opts'] = deprecations
+    opts = ks_loading.register_session_conf_options(
+        **kwargs
+    )
+    opt_list = copy.deepcopy(opts)
+    opt_list.insert(0, ks_loading.get_auth_common_conf_options()[0])
+    # NOTE(mhickey): There are a lot of auth plugins, we just generate
+    # the config options for a few common ones
+    plugins = ['password', 'v2password', 'v3password']
+    for name in plugins:
+        for plugin_option in ks_loading.get_auth_plugin_conf_options(name):
+            if all(option.name != plugin_option.name for option in opt_list):
+                opt_list.append(plugin_option)
+    opt_list.sort(key=operator.attrgetter('name'))
+    return [(group, opt_list)]
+
+
+def list_ironic_auth_opts():
+    return list_auth_opts('ironic')
+
+
+def list_nova_auth_opts():
+    return list_auth_opts('nova')
+
+
+def list_placement_auth_opts():
+    return list_auth_opts('placement')
+
+
+def list_designate_auth_opts():
+    return list_auth_opts('designate')
 
 
 def list_agent_opts():
@@ -122,11 +165,12 @@ def list_db_opts():
              neutron.conf.db.extraroute_db.EXTRA_ROUTE_OPTS,
              neutron.conf.db.l3_gwmode_db.L3GWMODE_OPTS,
              neutron.conf.agent.database.agentschedulers_db
-                    .AGENTS_SCHEDULER_OPTS,
+             .AGENTS_SCHEDULER_OPTS,
              neutron.conf.db.dvr_mac_db.DVR_MAC_ADDRESS_OPTS,
              neutron.conf.db.l3_dvr_db.ROUTER_DISTRIBUTED_OPTS,
              neutron.conf.db.l3_agentschedulers_db.L3_AGENTS_SCHEDULER_OPTS,
-             neutron.conf.db.l3_hamode_db.L3_HA_OPTS)
+             neutron.conf.db.l3_hamode_db.L3_HA_OPTS,
+             neutron.conf.db.l3_extra_gws_db.L3_EXTRA_GWS_OPTS)
          ),
         ('database',
          neutron.db.migration.cli.get_engine_config())
@@ -145,13 +189,22 @@ def list_opts():
          ),
         (neutron.conf.common.NOVA_CONF_SECTION,
          itertools.chain(
-              neutron.conf.common.nova_opts)
+             neutron.conf.common.nova_opts)
          ),
         (neutron.conf.common.IRONIC_CONF_SECTION,
          itertools.chain(
              neutron.conf.common.ironic_opts)
          ),
-        ('quotas', neutron.conf.quota.core_quota_opts)
+        (neutron.conf.common.PLACEMENT_CONF_SECTION,
+         itertools.chain(
+             neutron.conf.common.placement_opts)
+         ),
+        ('designate',
+         neutron.conf.services.extdns_designate_driver.designate_opts
+         ),
+        ('quotas', neutron.conf.quota.core_quota_opts),
+        ('service_providers',
+         neutron.conf.services.provider_configuration.serviceprovider_opts)
     ]
 
 
@@ -185,26 +238,9 @@ def list_dhcp_agent_opts():
              neutron.conf.agent.dhcp.DHCP_AGENT_OPTS,
              neutron.conf.agent.dhcp.DHCP_OPTS,
              neutron.conf.agent.dhcp.DNSMASQ_OPTS)
-         )
-    ]
-
-
-def list_linux_bridge_opts():
-    return [
-        ('linux_bridge',
-         neutron.conf.plugins.ml2.drivers.linuxbridge.bridge_opts),
-        ('vxlan',
-         neutron.conf.plugins.ml2.drivers.linuxbridge.vxlan_opts),
-        ('agent',
-         itertools.chain(
-             neutron.conf.plugins.ml2.drivers.agent.agent_opts,
-             neutron.conf.agent.agent_extensions_manager.
-             AGENT_EXT_MANAGER_OPTS)
          ),
-        ('securitygroup',
-         neutron.conf.agent.securitygroups_rpc.security_group_opts),
-        ('network_log',
-         neutron.conf.services.logging.log_driver_opts)
+        (meta_conf.RATE_LIMITING_GROUP,
+         meta_conf.METADATA_RATE_LIMITING_OPTS)
     ]
 
 
@@ -215,13 +251,14 @@ def list_l3_agent_opts():
              neutron.conf.agent.l3.config.OPTS,
              neutron.conf.service.SERVICE_OPTS,
              neutron.conf.agent.l3.ha.OPTS,
-             neutron.conf.agent.common.PD_DRIVER_OPTS,
              neutron.conf.agent.common.RA_OPTS)
          ),
         ('agent',
          neutron.conf.agent.agent_extensions_manager.AGENT_EXT_MANAGER_OPTS),
         ('network_log',
-         neutron.conf.services.logging.log_driver_opts)
+         neutron.conf.services.logging.log_driver_opts),
+        (meta_conf.RATE_LIMITING_GROUP,
+         meta_conf.METADATA_RATE_LIMITING_OPTS)
     ]
 
 
@@ -242,7 +279,8 @@ def list_metadata_agent_opts():
          itertools.chain(
              meta_conf.SHARED_OPTS,
              meta_conf.METADATA_PROXY_HANDLER_OPTS,
-             meta_conf.UNIX_DOMAIN_METADATA_PROXY_OPTS)
+             meta_conf.UNIX_DOMAIN_METADATA_PROXY_OPTS,
+             neutron.conf.service.RPC_EXTRA_OPTS)
          ),
         ('agent', neutron.conf.agent.common.AGENT_STATE_OPTS)
     ]
@@ -299,12 +337,24 @@ def list_ovs_opts():
         ('securitygroup',
          neutron.conf.agent.securitygroups_rpc.security_group_opts),
         ('network_log',
-         neutron.conf.services.logging.log_driver_opts)
+         neutron.conf.services.logging.log_driver_opts),
+        ('dhcp',
+         itertools.chain(
+             neutron.conf.plugins.ml2.drivers.ovs_conf.dhcp_opts,
+             neutron.conf.agent.common.DHCP_PROTOCOL_OPTS)),
+        ('metadata',
+         itertools.chain(
+             neutron.conf.plugins.ml2.drivers.ovs_conf.metadata_opts,
+             meta_conf.METADATA_PROXY_HANDLER_OPTS))
     ]
 
 
 def list_sriov_agent_opts():
     return [
+        ('DEFAULT',
+         itertools.chain(
+             neutron.conf.service.RPC_EXTRA_OPTS)
+         ),
         ('sriov_nic',
          neutron.conf.plugins.ml2.drivers.mech_sriov.agent_common.
          sriov_nic_opts),
@@ -313,36 +363,9 @@ def list_sriov_agent_opts():
     ]
 
 
-def list_auth_opts():
-    opt_list = copy.deepcopy(_nova_options)
-    opt_list.insert(0, ks_loading.get_auth_common_conf_options()[0])
-    # NOTE(mhickey): There are a lot of auth plugins, we just generate
-    # the config options for a few common ones
-    plugins = ['password', 'v2password', 'v3password']
-    for name in plugins:
-        for plugin_option in ks_loading.get_auth_plugin_conf_options(name):
-            if all(option.name != plugin_option.name for option in opt_list):
-                opt_list.append(plugin_option)
-    opt_list.sort(key=operator.attrgetter('name'))
-    return [(NOVA_GROUP, opt_list)]
-
-
-def list_ironic_auth_opts():
-    opt_list = copy.deepcopy(_ironic_options)
-    opt_list.insert(0, ks_loading.get_auth_common_conf_options()[0])
-    # NOTE(mhickey): There are a lot of auth plugins, we just generate
-    # the config options for a few common ones
-    plugins = ['password', 'v2password', 'v3password']
-    for name in plugins:
-        for plugin_option in ks_loading.get_auth_plugin_conf_options(name):
-            if all(option.name != plugin_option.name for option in opt_list):
-                opt_list.append(plugin_option)
-    opt_list.sort(key=operator.attrgetter('name'))
-    return [(IRONIC_GROUP, opt_list)]
-
-
-def list_xenapi_opts():
+def list_experimental_opts():
     return [
-        ('xenapi',
-         neutron.conf.agent.xenapi_conf.XENAPI_OPTS)
+        (neutron.conf.experimental.EXPERIMENTAL_CFG_GROUP,
+         itertools.chain(neutron.conf.experimental.experimental_opts)
+         ),
     ]

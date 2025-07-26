@@ -15,12 +15,13 @@
 
 from unittest import mock
 
-import eventlet
 from neutron_lib.api.definitions import portbindings as portbindings_def
+from neutron_lib.callbacks import events
 from neutron_lib import constants as n_const
 from openstack import connection
 from openstack import exceptions as os_exc
 
+from neutron.common import utils as n_utils
 from neutron.notifiers import batch_notifier
 from neutron.notifiers import ironic
 from neutron.tests import base
@@ -39,7 +40,7 @@ def get_fake_port():
 
 class TestIronicNotifier(base.BaseTestCase):
     def setUp(self):
-        super(TestIronicNotifier, self).setUp()
+        super().setUp()
         with mock.patch.object(connection.Connection, 'baremetal',
                                autospec=False):
             self.ironic_notifier = ironic.Notifier()
@@ -53,7 +54,8 @@ class TestIronicNotifier(base.BaseTestCase):
         original_port.update({'status': n_const.PORT_STATUS_DOWN})
         self.ironic_notifier.process_port_update_event(
             'fake_resource', 'fake_event', 'fake_trigger',
-            original_port=original_port, port=port, **{})
+            payload=events.DBEventPayload(
+                mock.Mock(), states=(original_port, port,)))
         mock_queue_event.assert_called_with(
             self.ironic_notifier.batch_notifier,
             {'event': 'network.bind_port',
@@ -73,7 +75,8 @@ class TestIronicNotifier(base.BaseTestCase):
         original_port.update({'status': n_const.PORT_STATUS_DOWN})
         self.ironic_notifier.process_port_update_event(
             'fake_resource', 'fake_event', 'fake_trigger',
-            original_port=original_port, port=port, **{})
+            payload=events.DBEventPayload(
+                mock.Mock(), states=(original_port, port,)))
         mock_queue_event.assert_called_with(
             self.ironic_notifier.batch_notifier,
             {'event': 'network.bind_port',
@@ -93,7 +96,8 @@ class TestIronicNotifier(base.BaseTestCase):
         original_port.update({'status': n_const.PORT_STATUS_ACTIVE})
         self.ironic_notifier.process_port_update_event(
             'fake_resource', 'fake_event', 'fake_trigger',
-            original_port=original_port, port=port, **{})
+            payload=events.DBEventPayload(
+                mock.Mock(), states=(original_port, port,)))
         mock_queue_event.assert_called_with(
             self.ironic_notifier.batch_notifier,
             {'event': 'network.unbind_port',
@@ -113,7 +117,8 @@ class TestIronicNotifier(base.BaseTestCase):
         original_port.update({'status': n_const.PORT_STATUS_ACTIVE})
         self.ironic_notifier.process_port_update_event(
             'fake_resource', 'fake_event', 'fake_trigger',
-            original_port=original_port, port=port, **{})
+            payload=events.DBEventPayload(
+                mock.Mock(), states=(original_port, port,)))
         mock_queue_event.assert_called_with(
             self.ironic_notifier.batch_notifier,
             {'event': 'network.unbind_port',
@@ -128,9 +133,11 @@ class TestIronicNotifier(base.BaseTestCase):
                        autospec=True)
     def test_process_port_delete_event(self, mock_queue_event):
         port = get_fake_port()
+        original_port = None
         self.ironic_notifier.process_port_delete_event(
-            'fake_resource', 'fake_event', 'fake_trigger', original_port=None,
-            port=port, **{})
+            'fake_resource', 'fake_event', 'fake_trigger',
+            payload=events.DBEventPayload(
+                mock.Mock(), states=(original_port, port)))
         mock_queue_event.assert_called_with(
             self.ironic_notifier.batch_notifier,
             {'event': 'network.delete_port',
@@ -145,10 +152,12 @@ class TestIronicNotifier(base.BaseTestCase):
                        autospec=True)
     def test_process_port_event_empty_uuid_field(self, mock_queue_event):
         port = get_fake_port()
+        original_port = None
         port.update({'device_id': ''})
         self.ironic_notifier.process_port_delete_event(
-            'fake_resource', 'fake_event', 'fake_trigger', original_port=None,
-            port=port, **{})
+            'fake_resource', 'fake_event', 'fake_trigger',
+            payload=events.DBEventPayload(
+                mock.Mock(), states=(original_port, port)))
         mock_queue_event.assert_called_with(
             self.ironic_notifier.batch_notifier,
             {'event': 'network.delete_port',
@@ -158,12 +167,14 @@ class TestIronicNotifier(base.BaseTestCase):
              'mac_address': 'de:ad:ca:fe:ba:be',
              'status': 'DELETED'})
 
-    @mock.patch.object(eventlet, 'spawn_n', autospec=True)
+    @mock.patch.object(n_utils, 'spawn_n')
     def test_queue_events(self, mock_spawn_n):
         port = get_fake_port()
+        original_port = None
         self.ironic_notifier.process_port_delete_event(
-            'fake_resource', 'fake_event', 'fake_trigger', original_port=None,
-            port=port, **{})
+            'fake_resource', 'fake_event', 'fake_trigger',
+            payload=events.DBEventPayload(
+                mock.Mock(), states=(original_port, port)))
 
         port = get_fake_port()
         port.update({'status': n_const.PORT_STATUS_ACTIVE})
@@ -171,7 +182,8 @@ class TestIronicNotifier(base.BaseTestCase):
         original_port.update({'status': n_const.PORT_STATUS_DOWN})
         self.ironic_notifier.process_port_update_event(
             'fake_resource', 'fake_event', 'fake_trigger',
-            original_port=original_port, port=port, **{})
+            payload=events.DBEventPayload(
+                mock.Mock(), states=(original_port, port,)))
 
         self.assertEqual(
             2, len(self.ironic_notifier.batch_notifier._pending_events.queue))

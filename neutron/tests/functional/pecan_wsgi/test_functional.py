@@ -43,8 +43,11 @@ class InjectContext(base.ConfigurableMiddleware):
         # Determine the tenant
         tenant_id = req.headers.get('X_PROJECT_ID')
 
-        # Suck out the roles
-        roles = [r.strip() for r in req.headers.get('X_ROLES', '').split(',')]
+        roles = ['member', 'reader']
+        # Suck out the roles if any are set
+        custom_roles = req.headers.get('X_ROLES')
+        if custom_roles:
+            roles = [r.strip() for r in custom_roles.split(',')]
 
         # Human-friendly names
         tenant_name = req.headers.get('X_PROJECT_NAME')
@@ -73,7 +76,7 @@ class PecanFunctionalTest(testlib_api.SqlTestCase,
 
     def setUp(self, service_plugins=None, extensions=None):
         self.setup_coreplugin('ml2', load_plugins=False)
-        super(PecanFunctionalTest, self).setUp()
+        super().setUp()
         self.addCleanup(exts.PluginAwareExtensionManager.clear_instance)
         self.set_config_overrides()
         manager.init()

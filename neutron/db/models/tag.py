@@ -13,10 +13,9 @@
 #
 
 from neutron_lib.db import model_base
+from neutron_lib.db import standard_attr
 import sqlalchemy as sa
 from sqlalchemy import orm
-
-from neutron.db import standard_attr
 
 
 class Tag(model_base.BASEV2):
@@ -24,8 +23,9 @@ class Tag(model_base.BASEV2):
         sa.BigInteger().with_variant(sa.Integer(), 'sqlite'),
         sa.ForeignKey(standard_attr.StandardAttribute.id, ondelete="CASCADE"),
         nullable=False, primary_key=True)
-    tag = sa.Column(sa.String(60), nullable=False, primary_key=True)
+    tag = sa.Column(sa.String(255), nullable=False, primary_key=True)
     standard_attr = orm.relationship(
         'StandardAttribute', load_on_pending=True,
-        backref=orm.backref('tags', lazy='subquery', viewonly=True))
+        backref=orm.backref('tags', lazy='selectin', viewonly=True),
+        sync_backref=False)
     revises_on_change = ('standard_attr', )

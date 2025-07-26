@@ -1,3 +1,4 @@
+# Copyright 2011 VMware, Inc.
 # Copyright (C) 2014,2015 VA Linux Systems Japan K.K.
 # Copyright (C) 2014,2015 YAMAMOTO Takashi <yamamoto at valinux co jp>
 # All Rights Reserved.
@@ -14,25 +15,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-# Copyright 2011 VMware, Inc.
-# All Rights Reserved.
-#
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-#    not use this file except in compliance with the License. You may obtain
-#    a copy of the License at
-#
-#         http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-#    License for the specific language governing permissions and limitations
-#    under the License.
-
-from os_ken.lib.packet import arp
+from neutron_lib.plugins.ml2 import ovs_constants as constants
 from os_ken.lib.packet import ether_types
 
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants
 from neutron.plugins.ml2.drivers.openvswitch.agent.openflow.native \
     import br_dvr_process
 from neutron.plugins.ml2.drivers.openvswitch.agent.openflow.native \
@@ -48,13 +33,19 @@ class OVSTunnelBridge(ovs_bridge.OVSAgentBridge,
     dvr_process_next_table_id = constants.PATCH_LV_TO_TUN
     of_tables = constants.TUN_BR_ALL_TABLES
 
-    def setup_default_table(self, patch_int_ofport, arp_responder_enabled):
+    def setup_default_table(
+            self, patch_int_ofport, arp_responder_enabled, dvr_enabled):
         (dp, ofp, ofpp) = self._get_dp()
 
-        # Table 0 (default) will sort incoming traffic depending on in_port
-        self.install_goto(dest_table_id=constants.PATCH_LV_TO_TUN,
-                          priority=1,
-                          in_port=patch_int_ofport)
+        if not dvr_enabled:
+            # Table 0 (default) will sort incoming traffic depending on in_port
+            # This table is needed only for non-dvr environment because
+            # OVSDVRProcessMixin overwrites this flow in its
+            # install_dvr_process() method.
+            self.install_goto(dest_table_id=constants.PATCH_LV_TO_TUN,
+                              priority=1,
+                              in_port=patch_int_ofport)
+
         self.install_drop()  # default drop
 
         if arp_responder_enabled:
@@ -217,28 +208,6 @@ class OVSTunnelBridge(ovs_bridge.OVSAgentBridge,
         return ofpp.OFPMatch(vlan_vid=vlan | ofp.OFPVID_PRESENT,
                              eth_type=ether_types.ETH_TYPE_ARP,
                              arp_tpa=ip)
-
-    def install_arp_responder(self, vlan, ip, mac):
-        (dp, ofp, ofpp) = self._get_dp()
-        match = self._arp_responder_match(ofp, ofpp, vlan, ip)
-        actions = [ofpp.OFPActionSetField(arp_op=arp.ARP_REPLY),
-                   ofpp.NXActionRegMove(src_field='arp_sha',
-                                        dst_field='arp_tha',
-                                        n_bits=48),
-                   ofpp.NXActionRegMove(src_field='arp_spa',
-                                        dst_field='arp_tpa',
-                                        n_bits=32),
-                   ofpp.OFPActionSetField(arp_sha=mac),
-                   ofpp.OFPActionSetField(arp_spa=ip),
-                   ofpp.NXActionRegMove(src_field='eth_src',
-                                        dst_field='eth_dst',
-                                        n_bits=48),
-                   ofpp.OFPActionSetField(eth_src=mac),
-                   ofpp.OFPActionOutput(ofp.OFPP_IN_PORT, 0)]
-        self.install_apply_actions(table_id=constants.ARP_RESPONDER,
-                                   priority=1,
-                                   match=match,
-                                   actions=actions)
 
     def delete_arp_responder(self, vlan, ip):
         (_dp, ofp, ofpp) = self._get_dp()

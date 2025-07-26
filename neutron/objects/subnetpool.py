@@ -14,6 +14,7 @@
 #    under the License.
 
 import netaddr
+from neutron_lib.db import api as db_api
 from neutron_lib.db import model_query
 from neutron_lib.objects import common_types
 from oslo_versionedobjects import fields as obj_fields
@@ -33,7 +34,8 @@ from neutron.objects import subnet
 @base.NeutronObjectRegistry.register
 class SubnetPoolRBAC(rbac.RBACBaseObject):
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Changed 'target_tenant' to 'target_project'
+    VERSION = '1.1'
 
     db_model = rbac_db_models.SubnetPoolRBAC
 
@@ -70,7 +72,7 @@ class SubnetPool(rbac_db.NeutronRbacObject):
     synthetic_fields = ['prefixes']
 
     def from_db_object(self, db_obj):
-        super(SubnetPool, self).from_db_object(db_obj)
+        super().from_db_object(db_obj)
         self.prefixes = []
         self.prefixes = [
             prefix.cidr
@@ -92,7 +94,7 @@ class SubnetPool(rbac_db.NeutronRbacObject):
         fields = self.obj_get_changes()
         with self.db_context_writer(self.obj_context):
             prefixes = self.prefixes
-            super(SubnetPool, self).create()
+            super().create()
             if 'prefixes' in fields:
                 self._attach_prefixes(prefixes)
 
@@ -100,12 +102,12 @@ class SubnetPool(rbac_db.NeutronRbacObject):
     def update(self):
         fields = self.obj_get_changes()
         with self.db_context_writer(self.obj_context):
-            super(SubnetPool, self).update()
+            super().update()
             if 'prefixes' in fields:
                 self._attach_prefixes(fields['prefixes'])
 
     @classmethod
-    def get_bound_tenant_ids(cls, context, obj_id):
+    def get_bound_project_ids(cls, context, obj_id):
         sn_objs = subnet.Subnet.get_objects(context, subnetpool_id=obj_id)
         return {snp.project_id for snp in sn_objs}
 
@@ -122,21 +124,22 @@ class SubnetPool(rbac_db.NeutronRbacObject):
             # Nothing to validate
             return
 
-        rbac_as_model = rbac_db_models.AddressScopeRBAC
+        with db_api.CONTEXT_READER.using(context):
+            rbac_as_model = rbac_db_models.AddressScopeRBAC
 
-        # Ensure that target project has access to AS
-        shared_to_target_project_or_to_all = (
-            sa.and_(
-                rbac_as_model.target_tenant.in_(
-                    ["*", policy['target_tenant']]
-                ),
-                rbac_as_model.object_id == db_obj["address_scope_id"]
+            # Ensure that target project has access to AS
+            shared_to_target_project_or_to_all = (
+                sa.and_(
+                    rbac_as_model.target_project.in_(
+                        ["*", policy['target_project']]
+                    ),
+                    rbac_as_model.object_id == db_obj["address_scope_id"]
+                )
             )
-        )
 
-        matching_policies = model_query.query_with_hooks(
-            context, rbac_db_models.AddressScopeRBAC
-        ).filter(shared_to_target_project_or_to_all).count()
+            matching_policies = model_query.query_with_hooks(
+                context, rbac_db_models.AddressScopeRBAC
+            ).filter(shared_to_target_project_or_to_all).count()
 
         if matching_policies == 0:
             raise ext_rbac.RbacPolicyInitError(
@@ -163,7 +166,7 @@ class SubnetPoolPrefix(base.NeutronDbObject):
     # custom type
     @classmethod
     def modify_fields_to_db(cls, fields):
-        result = super(SubnetPoolPrefix, cls).modify_fields_to_db(fields)
+        result = super().modify_fields_to_db(fields)
         if 'cidr' in result:
             result['cidr'] = cls.filter_to_str(result['cidr'])
         return result
@@ -172,7 +175,7 @@ class SubnetPoolPrefix(base.NeutronDbObject):
     # custom type
     @classmethod
     def modify_fields_from_db(cls, db_obj):
-        fields = super(SubnetPoolPrefix, cls).modify_fields_from_db(db_obj)
+        fields = super().modify_fields_from_db(db_obj)
         if 'cidr' in fields:
             fields['cidr'] = netaddr.IPNetwork(fields['cidr'])
         return fields

@@ -20,6 +20,7 @@ is supported by:
 * Binding security groups to ports (since Stein).
 * Assigning address scopes to subnet pools (since Ussuri).
 * Assigning subnet pools to subnets (since Ussuri).
+* Assigning address groups to security group rules (since Wallaby).
 
 
 Sharing an object with specific projects
@@ -283,6 +284,26 @@ This process can be repeated any number of times to share a security-group
 with an arbitrary number of projects.
 
 
+Creating an instance which uses a security group shared through RBAC, but only
+specifying the network ID when calling Nova will not work currently. In such
+cases Nova will check if the given security group exists in Neutron before it
+creates a port in the given network. The problem with that is that Nova asks
+only for the security groups filtered by the project_id thus it will not get
+the shared security group back from the Neutron API. See `bug 1942615
+<https://bugs.launchpad.net/neutron/+bug/1942615>`__ for details.
+To workaround the issue, the user needs to create a port in Neutron first, and
+then pass that port to Nova:
+
+.. code-block:: console
+
+   $ openstack port create --network net1 --security-group
+   5ba835b7-22b0-4be6-bdbe-e0722d1b5f24 shared-sg-port
+
+   $ openstack server create --image cirros-0.5.1-x86_64-disk --flavor m1.tiny
+   --port shared-sg-port vm-with-shared-sg
+
+
+
 Sharing an address scope with specific projects
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -444,6 +465,80 @@ the subnet pool is no longer in use:
 This process can be repeated any number of times to share a subnet pool
 with an arbitrary number of projects.
 
+Sharing an address group with specific projects
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Create an address group to share:
+
+.. code-block:: console
+
+   $ openstack address group create test-ag --address 10.1.1.1
+   +-------------+--------------------------------------+
+   | Field       | Value                                |
+   +-------------+--------------------------------------+
+   | addresses   | ['10.1.1.1/32']                      |
+   | description |                                      |
+   | id          | cdb6eb3e-f9a0-4d52-8478-358eaa2c4737 |
+   | name        | test-ag                              |
+   | project_id  | 66c77cf262454777a8f455cce48c12c0     |
+   +-------------+--------------------------------------+
+
+
+Create the RBAC policy entry using the :command:`openstack network rbac create`
+command (in this example, the ID of the project we want to share with is
+``bbd82892525d4372911390b984ed3265``):
+
+.. code-block:: console
+
+   $ openstack network rbac create --target-project \
+   bbd82892525d4372911390b984ed3265 --action access_as_shared \
+   --type address_group cdb6eb3e-f9a0-4d52-8478-358eaa2c4737
+   +-------------------+--------------------------------------+
+   | Field             | Value                                |
+   +-------------------+--------------------------------------+
+   | action            | access_as_shared                     |
+   | id                | c7414ac2-9a6b-420b-84c5-4158a6cca4f9 |
+   | name              | None                                 |
+   | object_id         | cdb6eb3e-f9a0-4d52-8478-358eaa2c4737 |
+   | object_type       | address_group                        |
+   | project_id        | 66c77cf262454777a8f455cce48c12c0     |
+   | target_project_id | bbd82892525d4372911390b984ed3265     |
+   +-------------------+--------------------------------------+
+
+
+The ``target-project`` parameter specifies the project that requires
+access to the address group. The ``action`` parameter specifies what
+the project is allowed to do. The ``type`` parameter says
+that the target object is an address group. The final parameter is the ID of
+the address group we are granting access to.
+
+Project ``bbd82892525d4372911390b984ed3265`` will now be able to see
+the address group when running :command:`openstack address group list` and
+:command:`openstack address group show` and will also be able to assign
+it to its security group rules. No other users (other than admins and the
+owner) will be able to see the address group.
+
+To remove access for that project, delete the RBAC policy that allows
+it using the :command:`openstack network rbac delete` command:
+
+.. code-block:: console
+
+   $ openstack network rbac delete c7414ac2-9a6b-420b-84c5-4158a6cca4f9
+
+If that project has security group rules with the address group applied to
+them, the server will not delete the RBAC policy until the address group is no
+longer in use:
+
+.. code-block:: console
+
+   $ openstack network rbac delete c7414ac2-9a6b-420b-84c5-4158a6cca4f9
+   RBAC policy on object cdb6eb3e-f9a0-4d52-8478-358eaa2c4737
+   cannot be removed because other objects depend on it
+
+This process can be repeated any number of times to share an address group
+with an arbitrary number of projects.
+
+
 How the 'shared' flag relates to these entries
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -526,7 +621,7 @@ Use the :command:`openstack network rbac show` command to see the details:
 
 The output shows that the entry allows the action ``access_as_shared``
 on object ``84a7e627-573b-49da-af66-c9a65244f3ce`` of type ``network``
-to target_tenant ``*``, which is a wildcard that represents all projects.
+to target_project ``*``, which is a wildcard that represents all projects.
 
 Currently, the ``shared`` flag is just a mapping to the underlying
 RBAC policies for a network. Setting the flag to ``True`` on a network
@@ -701,11 +796,46 @@ as any other RBAC ``access_as_external`` policy.
 Preventing regular users from sharing objects with each other
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The default ``policy.json`` file will not allow regular
+The default ``policy.yaml`` file will not allow regular
 users to share objects with every other project using a wildcard;
 however, it will allow them to share objects with specific project
 IDs.
 
 If an operator wants to prevent normal users from doing this, the
-``"create_rbac_policy":`` entry in ``policy.json`` can be adjusted
+``"create_rbac_policy":`` entry in ``policy.yaml`` can be adjusted
 from ``""`` to ``"rule:admin_only"``.
+
+
+Improve database RBAC query operations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Since [1]_, present in Yoga version, Neutron has indexes for
+"target_tenant" (now "target_project") and "action" columns in all
+RBAC related tables. That improves the SQL queries involving the
+RBAC tables [2]_. Any system before Yoga won't have these indexes
+but the system administrator can manually add them to the Neutron
+database following the next steps:
+
+* Find the RBAC tables:
+
+.. code-block:: console
+
+    $ tables=`mysql -e "use ovs_neutron; show tables;" | grep rbac`
+
+
+* Insert the indexes for the "target_tenant" and "action" columns:
+
+    $ for table in $tables do; mysql -e \
+        "alter table $table add key (action); \
+         alter table $table add key (target_tenant);"; done
+
+
+In order to prevent errors during a system upgrade, [3]_ was
+implemented and backported up to Yoga. This patch checks if any index
+is already present in the Neutron tables and avoids executing the
+index creation command again.
+
+
+.. [1] https://review.opendev.org/c/openstack/neutron/+/810072
+.. [2] https://github.com/openstack/neutron-lib/blob/890d62a3df3f35bb18bf1a11e79a9e97e7dd2d2c/neutron_lib/db/model_query.py#L123-L131
+.. [3] https://review.opendev.org/c/openstack/neutron/+/884617

@@ -18,10 +18,9 @@ import abc
 from neutron_lib.api import extensions as api_extensions
 from neutron_lib.services import base
 from oslo_serialization import jsonutils
-import six
 
 from neutron.api import extensions
-from neutron import wsgi
+from neutron.api import wsgi
 
 
 class FoxInSocksController(wsgi.Controller):
@@ -30,8 +29,7 @@ class FoxInSocksController(wsgi.Controller):
         return "Try to say this Mr. Knox, sir..."
 
 
-@six.add_metaclass(abc.ABCMeta)
-class FoxInSocksPluginInterface(base.ServicePluginBase):
+class FoxInSocksPluginInterface(base.ServicePluginBase, metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     def method_to_support_foxnsox_extension(self):
@@ -102,9 +100,9 @@ class Foxinsocks(api_extensions.ExtensionDescriptor):
         return request_exts
 
     def _add_tweedle_handler(self, input_dict, req, id):
-        return "Tweedle {0} Added.".format(
+        return "Tweedle {} Added.".format(
             input_dict['FOXNSOX:add_tweedle']['name'])
 
     def _delete_tweedle_handler(self, input_dict, req, id):
-        return "Tweedle {0} Deleted.".format(
+        return "Tweedle {} Deleted.".format(
             input_dict['FOXNSOX:delete_tweedle']['name'])

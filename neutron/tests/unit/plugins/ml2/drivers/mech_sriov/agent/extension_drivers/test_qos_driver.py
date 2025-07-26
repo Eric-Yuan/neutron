@@ -22,9 +22,9 @@ from oslo_utils import uuidutils
 
 from neutron.objects.qos import policy
 from neutron.objects.qos import rule
-from neutron.plugins.ml2.drivers.mech_sriov.agent.common import exceptions
 from neutron.plugins.ml2.drivers.mech_sriov.agent.extension_drivers import (
     qos_driver)
+from neutron.privileged.agent.linux import ip_lib as priv_ip_lib
 from neutron.tests import base
 
 
@@ -34,7 +34,7 @@ class QosSRIOVAgentDriverTestCase(base.BaseTestCase):
     PCI_SLOT = '0000:06:00.1'
 
     def setUp(self):
-        super(QosSRIOVAgentDriverTestCase, self).setUp()
+        super().setUp()
         self.context = context.get_admin_context()
         self.qos_driver = qos_driver.QosSRIOVAgentDriver()
         self.qos_driver.initialize()
@@ -75,11 +75,11 @@ class QosSRIOVAgentDriverTestCase(base.BaseTestCase):
 
     def _create_qos_policy_obj(self, rules):
         policy_dict = {'id': uuidutils.generate_uuid(),
-                'project_id': uuidutils.generate_uuid(),
-                'name': 'test',
-                'description': 'test',
-                'shared': False,
-                'rules': rules}
+                       'project_id': uuidutils.generate_uuid(),
+                       'name': 'test',
+                       'description': 'test',
+                       'shared': False,
+                       'rules': rules}
         policy_obj = policy.QosPolicy(self.context, **policy_dict)
         policy_obj.obj_reset_changes()
         for policy_rule in policy_obj.rules:
@@ -116,8 +116,16 @@ class QosSRIOVAgentDriverTestCase(base.BaseTestCase):
         self.clear_max_rate_mock.assert_called_once_with(self.PCI_SLOT)
 
     def test__set_vf_max_rate_captures_sriov_failure(self):
-        self.max_rate_mock.side_effect = exceptions.SriovNicError()
-        self.qos_driver._set_vf_max_rate(self.ASSIGNED_MAC, self.PCI_SLOT)
+        msg = 'Failed to set device %s max rate'
+        with mock.patch.object(qos_driver, 'LOG') as mock_log:
+            for exc in (priv_ip_lib.InterfaceOperationNotSupported(),
+                        priv_ip_lib.InvalidArgument()):
+                self.max_rate_mock.side_effect = exc
+                self.qos_driver._set_vf_max_rate(self.ASSIGNED_MAC,
+                                                 self.PCI_SLOT)
+                mock_log.exception.assert_called_once_with(msg,
+                                                           self.ASSIGNED_MAC)
+                mock_log.exception.reset_mock()
 
     def test__set_vf_max_rate_unknown_device(self):
         with mock.patch.object(self.qos_driver.eswitch_mgr, 'device_exists',

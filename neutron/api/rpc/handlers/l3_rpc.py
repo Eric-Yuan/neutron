@@ -25,12 +25,13 @@ from neutron_lib.plugins import directory
 from oslo_config import cfg
 from oslo_log import log as logging
 import oslo_messaging
+from sqlalchemy import orm
 
 
 LOG = logging.getLogger(__name__)
 
 
-class L3RpcCallback(object):
+class L3RpcCallback:
     """L3 agent RPC callback in plugin implementations."""
 
     # 1.0 L3PluginApi BASE_RPC_API_VERSION
@@ -47,7 +48,8 @@ class L3RpcCallback(object):
     # 1.10 Added update_all_ha_network_port_statuses
     # 1.11 Added get_host_ha_router_count
     # 1.12 Added get_networks
-    target = oslo_messaging.Target(version='1.12')
+    # 1.13 Removed process_prefix_update
+    target = oslo_messaging.Target(version='1.13')
 
     @property
     def plugin(self):
@@ -89,8 +91,13 @@ class L3RpcCallback(object):
                   "setting HA network ports %(ha_ports)s status to DOWN.",
                   {"host": host, "ha_ports": ha_ports})
         for p in ha_ports:
-            self.plugin.update_port(
-                context, p, {'port': {'status': constants.PORT_STATUS_DOWN}})
+            try:
+                self.plugin.update_port(
+                    context, p,
+                    {'port': {'status': constants.PORT_STATUS_DOWN}})
+            except (orm.exc.StaleDataError, orm.exc.ObjectDeletedError,
+                    exceptions.PortNotFound):
+                pass
 
     def get_router_ids(self, context, host):
         """Returns IDs of routers scheduled to l3 agent on <host>
@@ -137,12 +144,9 @@ class L3RpcCallback(object):
     def _routers_to_sync(self, context, router_ids, host=None):
         if extensions.is_extension_supported(
                 self.l3plugin, constants.L3_AGENT_SCHEDULER_EXT_ALIAS):
-            routers = (
-                self.l3plugin.list_active_sync_routers_on_active_l3_agent(
-                    context, host, router_ids))
-        else:
-            routers = self.l3plugin.get_sync_data(context, router_ids)
-        return routers
+            return self.l3plugin.list_active_sync_routers_on_active_l3_agent(
+                context, host, router_ids)
+        return self.l3plugin.get_sync_data(context, router_ids)
 
     def _ensure_host_set_on_ports(self, context, host, routers):
         for router in routers:
@@ -186,9 +190,9 @@ class L3RpcCallback(object):
             portbindings.VIF_TYPE_BINDING_FAILED,
             portbindings.VIF_TYPE_UNBOUND)
         if (port and host is not None and
-            (port.get('device_owner') !=
-             constants.DEVICE_OWNER_DVR_INTERFACE and
-             port.get(portbindings.HOST_ID) != host or not_bound)):
+                (port.get('device_owner') !=
+                 constants.DEVICE_OWNER_DVR_INTERFACE and
+                 port.get(portbindings.HOST_ID) != host or not_bound)):
 
             # Ports owned by non-HA routers are bound again if they're
             # already bound but the router moved to another host.
@@ -218,22 +222,21 @@ class L3RpcCallback(object):
                     active_host = (
                         self.l3plugin.get_active_host_for_ha_router(
                             context, router_id))
-                    if active_host:
-                        host = active_host
-                    # If there is currently no active router instance (For
-                    # example it's a new router), the host that requested
-                    # the routers (Essentially a random host) will do. The
-                    # port binding will be corrected when an active is
-                    # elected.
+                    if not active_host:
+                        LOG.debug("Router %(router)s is not active on any "
+                                  "host. Port %(port)s will not be updated "
+                                  "now.",
+                                  {'router': router_id, 'port': port['id']})
+                        return
                     try:
                         LOG.debug("Updating router %(router)s port %(port)s "
                                   "binding host %(host)s",
                                   {"router": router_id, "port": port['id'],
-                                   "host": host})
+                                   "host": active_host})
                         self.plugin.update_port(
                             context,
                             port['id'],
-                            {'port': {portbindings.HOST_ID: host}})
+                            {'port': {portbindings.HOST_ID: active_host}})
                     except exceptions.PortNotFound:
                         LOG.debug("Port %(port)s not found while updating "
                                   "agent binding for router %(router)s.",
@@ -324,17 +327,6 @@ class L3RpcCallback(object):
 
         LOG.debug('Updating HA routers states on host %s: %s', host, states)
         self.l3plugin.update_routers_states(context, states, host)
-
-    def process_prefix_update(self, context, **kwargs):
-        subnets = kwargs.get('subnets')
-
-        updated_subnets = []
-        for subnet_id, prefix in subnets.items():
-            updated_subnets.append(self.plugin.update_subnet(
-                                        context,
-                                        subnet_id,
-                                        {'subnet': {'cidr': prefix}}))
-        return updated_subnets
 
     @db_api.retry_db_errors
     def delete_agent_gateway_port(self, context, **kwargs):

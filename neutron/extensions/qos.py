@@ -22,7 +22,6 @@ from neutron_lib.api import extensions as api_extensions
 from neutron_lib.plugins import constants
 from neutron_lib.plugins import directory
 from neutron_lib.services import base as service_base
-import six
 
 from neutron.api import extensions
 from neutron.api.v2 import base
@@ -49,11 +48,11 @@ class Qos(api_extensions.APIExtensionDescriptor):
                 apidef.SUB_RESOURCE_ATTRIBUTE_MAP))
 
         resources = resource_helper.build_resource_info(
-                plural_mappings,
-                apidef.RESOURCE_ATTRIBUTE_MAP,
-                constants.QOS,
-                translate_name=True,
-                allow_bulk=True)
+                        plural_mappings,
+                        apidef.RESOURCE_ATTRIBUTE_MAP,
+                        constants.QOS,
+                        translate_name=True,
+                        allow_bulk=True)
 
         plugin = directory.get_plugin(constants.QOS)
         for collection_name in apidef.SUB_RESOURCE_ATTRIBUTE_MAP:
@@ -80,27 +79,30 @@ class Qos(api_extensions.APIExtensionDescriptor):
         return resources
 
 
-@six.add_metaclass(abc.ABCMeta)
-class QoSPluginBase(service_base.ServicePluginBase):
+class QoSPluginBase(service_base.ServicePluginBase, metaclass=abc.ABCMeta):
 
     path_prefix = apidef.API_PREFIX
 
     # The rule object type to use for each incoming rule-related request.
-    rule_objects = {'bandwidth_limit': rule_object.QosBandwidthLimitRule,
-                    'dscp_marking': rule_object.QosDscpMarkingRule,
-                    'minimum_bandwidth': rule_object.QosMinimumBandwidthRule}
+    rule_objects = {
+        'bandwidth_limit': rule_object.QosBandwidthLimitRule,
+        'dscp_marking': rule_object.QosDscpMarkingRule,
+        'minimum_bandwidth': rule_object.QosMinimumBandwidthRule,
+        'minimum_packet_rate': rule_object.QosMinimumPacketRateRule,
+        'packet_rate_limit': rule_object.QosPacketRateLimitRule,
+    }
 
     # Patterns used to call method proxies for all policy-rule-specific
     # method calls (see __getattr__ docstring, below).
     qos_rule_method_patterns = [
-            re.compile(
-                r"^((create|update|delete)_policy_(?P<rule_type>.*)_rule)$"),
-            re.compile(
-                r"^(get_policy_(?P<rule_type>.*)_(rules|rule))$"),
-            # The following entry handles rule alias calls
-            re.compile(
-                r"^((update|delete|get)_alias_(?P<rule_type>.*)_rule)$"),
-                               ]
+        re.compile(
+            r"^((create|update|delete)_policy_(?P<rule_type>.*)_rule)$"),
+        re.compile(
+            r"^(get_policy_(?P<rule_type>.*)_(rules|rule))$"),
+        # The following entry handles rule alias calls
+        re.compile(
+            r"^((update|delete|get)_alias_(?P<rule_type>.*)_rule)$"),
+                ]
 
     def __getattr__(self, attrib):
         """Implement method proxies for all policy-rule-specific requests. For

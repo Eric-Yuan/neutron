@@ -16,6 +16,7 @@ from neutron_lib.objects import common_types
 from oslo_versionedobjects import fields as obj_fields
 import sqlalchemy as sa
 from sqlalchemy import sql
+from sqlalchemy import types as sqltypes
 
 from neutron.db.quota import models
 from neutron.objects import base
@@ -60,7 +61,7 @@ class Reservation(base.NeutronDbObject):
     def create(self):
         deltas = self.resource_deltas
         with self.db_context_writer(self.obj_context):
-            super(Reservation, self).create()
+            super().create()
             if deltas:
                 for delta in deltas:
                     delta.reservation_id = self.id
@@ -69,7 +70,7 @@ class Reservation(base.NeutronDbObject):
                 self.obj_reset_changes(['resource_deltas'])
 
     @classmethod
-    def delete_expired(cls, context, now, project_id):
+    def delete_expired(cls, context, expiring_time, project_id):
         resv_query = context.session.query(models.Reservation)
         if project_id:
             project_expr = (models.Reservation.project_id == project_id)
@@ -79,7 +80,7 @@ class Reservation(base.NeutronDbObject):
         # object/db/api.py once comparison operations are
         # supported
         resv_query = resv_query.filter(sa.and_(
-            project_expr, models.Reservation.expiration < now))
+            project_expr, models.Reservation.expiration < expiring_time))
         return resv_query.delete()
 
     @classmethod
@@ -90,8 +91,9 @@ class Reservation(base.NeutronDbObject):
         resv_query = context.session.query(
             models.ResourceDelta.resource,
             models.Reservation.expiration,
-            sql.func.sum(models.ResourceDelta.amount)).join(
-            models.Reservation)
+            sql.func.cast(
+                sql.func.sum(models.ResourceDelta.amount),
+                sqltypes.Integer)).join(models.Reservation)
         if expired:
             exp_expr = (models.Reservation.expiration < now)
         else:
@@ -100,10 +102,10 @@ class Reservation(base.NeutronDbObject):
             models.Reservation.project_id == project_id,
             models.ResourceDelta.resource.in_(resources),
             exp_expr)).group_by(
-            models.ResourceDelta.resource,
-            models.Reservation.expiration)
-        return dict((resource, total_reserved)
-                    for (resource, exp, total_reserved) in resv_query)
+                models.ResourceDelta.resource,
+                models.Reservation.expiration)
+        return {resource: total_reserved
+                for (resource, exp, total_reserved) in resv_query}
 
 
 @base.NeutronObjectRegistry.register

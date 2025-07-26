@@ -14,6 +14,8 @@
 
 import datetime
 
+from neutron_lib.db import api as db_api
+from oslo_utils import timeutils
 from oslo_utils import uuidutils
 
 from neutron.objects import quota
@@ -32,7 +34,7 @@ class ResourceDeltaDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
     _test_class = quota.ResourceDelta
 
     def setUp(self):
-        super(ResourceDeltaDbObjectTestCase, self).setUp()
+        super().setUp()
         for obj in self.obj_fields:
             self._create_test_reservation(res_id=obj['reservation_id'])
 
@@ -54,28 +56,32 @@ class ReservationDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
     def _create_test_reservation(self, res=None, exp=None):
         res_id = uuidutils.generate_uuid()
         reservation = self._test_class(self.context,
-            id=res_id, resource=res, expiration=exp)
+                                       id=res_id, resource=res, expiration=exp)
         reservation.create()
         return reservation
 
     def test_delete_expired(self):
-        dt = datetime.datetime.utcnow()
+        dt = timeutils.utcnow()
         resources = {'goals': 2, 'assists': 1}
         exp_date1 = datetime.datetime(2016, 3, 31, 14, 30)
-        res1 = self._create_test_reservation(resources, exp_date1)
         exp_date2 = datetime.datetime(2015, 3, 31, 14, 30)
-        res2 = self._create_test_reservation(resources, exp_date2)
-        self.assertEqual(2, self._test_class.delete_expired(
-            self.context, dt, None))
-        objs = self._test_class.get_objects(self.context,
-            id=[res1.id, res2.id])
+        with db_api.CONTEXT_WRITER.using(self.context):
+            res1 = self._create_test_reservation(resources, exp_date1)
+            res2 = self._create_test_reservation(resources, exp_date2)
+        with db_api.CONTEXT_WRITER.using(self.context):
+            self.assertEqual(2, self._test_class.delete_expired(
+                self.context, dt, None))
+        with db_api.CONTEXT_READER.using(self.context):
+            objs = self._test_class.get_objects(self.context,
+                                                id=[res1.id, res2.id])
         self.assertEqual([], objs)
 
     def test_reservation_synthetic_field(self):
         res = self._create_test_reservation()
         resource = 'test-res'
-        res_delta = quota.ResourceDelta(self.context,
-            resource=resource, reservation_id=res.id, amount='10')
+        res_delta = quota.ResourceDelta(
+            self.context, resource=resource,
+            reservation_id=res.id, amount='10')
         res_delta.create()
         obj = self._test_class.get_object(self.context, id=res.id)
         self.assertEqual(res_delta, obj.resource_deltas[0])

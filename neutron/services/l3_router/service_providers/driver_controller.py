@@ -33,7 +33,7 @@ LOG = logging.getLogger(__name__)
 
 
 @registry.has_registry_receivers
-class DriverController(object):
+class DriverController:
     """Driver controller for the L3 service plugin.
 
     This component is responsible for dispatching router requests to L3
@@ -48,7 +48,7 @@ class DriverController(object):
         self.l3_plugin = l3_plugin
         self._stm = st_db.ServiceTypeManager.get_instance()
         self._stm.add_provider_configuration(
-                plugin_constants.L3, _LegacyPlusProviderConfiguration())
+            plugin_constants.L3, _LegacyPlusProviderConfiguration())
         self._load_drivers()
 
     def _load_drivers(self):
@@ -67,27 +67,31 @@ class DriverController(object):
 
     @registry.receives(resources.ROUTER, [events.BEFORE_CREATE],
                        priority_group.PRIORITY_ROUTER_CONTROLLER)
-    def _check_router_request(self, resource, event, trigger, context,
-                              router, **kwargs):
+    def _check_router_request(self, resource, event, trigger, payload):
         """Validates that API request is sane (flags compat with flavor)."""
+        context = payload.context
+        router = payload.latest_state
         drv = self._get_provider_for_create(context, router)
         _ensure_driver_supports_request(drv, router)
 
     @registry.receives(resources.ROUTER, [events.PRECOMMIT_CREATE],
                        priority_group.PRIORITY_ROUTER_CONTROLLER)
-    def _set_router_provider(self, resource, event, trigger, context, router,
-                             router_db, **kwargs):
+    def _set_router_provider(self, resource, event, trigger, payload):
         """Associates a router with a service provider.
 
         Association is done by flavor_id if it's specified, otherwise it will
         fallback to determining which loaded driver supports the ha/distributed
         attributes associated with the router.
         """
-        if _flavor_specified(router):
+        context = payload.context
+        router = payload.latest_state
+        router_db = payload.metadata['router_db']
+        router_id = payload.resource_id
+        if flavor_specified(router):
             router_db.flavor_id = router['flavor_id']
         drv = self._get_provider_for_create(context, router)
         self._stm.add_resource_association(context, plugin_constants.L3,
-                                           drv.name, router['id'])
+                                           drv.name, router_id)
         registry.publish(
             resources.ROUTER_CONTROLLER, events.PRECOMMIT_ADD_ASSOCIATION,
             trigger, payload=events.DBEventPayload(
@@ -97,9 +101,10 @@ class DriverController(object):
 
     @registry.receives(resources.ROUTER, [events.PRECOMMIT_DELETE],
                        priority_group.PRIORITY_ROUTER_CONTROLLER)
-    def _clear_router_provider(self, resource, event, trigger, context,
-                               router_id, **kwargs):
+    def _clear_router_provider(self, resource, event, trigger, payload):
         """Remove the association between a router and a service provider."""
+        context = payload.context
+        router_id = payload.resource_id
         drv = self.get_provider_for_router(context, router_id)
         registry.publish(
             resources.ROUTER_CONTROLLER, events.PRECOMMIT_DELETE_ASSOCIATIONS,
@@ -122,7 +127,7 @@ class DriverController(object):
         drv = self.get_provider_for_router(payload.context,
                                            payload.resource_id)
         new_drv = None
-        if _flavor_specified(payload.request_body):
+        if flavor_specified(payload.request_body):
             if (payload.request_body['flavor_id'] !=
                     payload.states[0]['flavor_id']):
                 # TODO(kevinbenton): this is currently disallowed by the API
@@ -134,7 +139,7 @@ class DriverController(object):
         # attributes via the API.
         try:
             _ensure_driver_supports_request(drv, payload.request_body)
-        except lib_exc.InvalidInput:
+        except lib_exc.InvalidInput as exc:
             # the current driver does not support this request, we need to
             # migrate to a new provider. populate the distributed and ha
             # flags from the previous state if not in the update so we can
@@ -157,7 +162,7 @@ class DriverController(object):
                       {'ha_flag': payload.request_body['ha'],
                        'distributed_flag':
                        payload.request_body['distributed']})
-            new_drv = self._attrs_to_driver(payload.request_body)
+            new_drv = self._attrs_to_driver(payload.request_body, exc=exc)
         if new_drv:
             LOG.debug("Router %(id)s migrating from %(old)s provider to "
                       "%(new)s provider.", {'id': payload.resource_id,
@@ -190,7 +195,7 @@ class DriverController(object):
             router = self.l3_plugin.get_router(context, router_id)
             driver = self._attrs_to_driver(router)
             driver_name = driver.name
-            with context.session.begin(subtransactions=True):
+            with db_api.CONTEXT_WRITER.using(context):
                 self._stm.add_resource_association(
                     context, plugin_constants.L3,
                     driver_name, router_id)
@@ -205,7 +210,7 @@ class DriverController(object):
 
     def _get_provider_for_create(self, context, router):
         """Get provider based on flavor or ha/distributed flags."""
-        if not _flavor_specified(router):
+        if not flavor_specified(router):
             return self._attrs_to_driver(router)
         return self._get_l3_driver_by_flavor(context, router['flavor_id'])
 
@@ -219,18 +224,21 @@ class DriverController(object):
         driver = self.drivers[provider['provider']]
         return driver
 
-    def _attrs_to_driver(self, router):
+    def _attrs_to_driver(self, router, exc=None):
         """Get a provider driver handle based on the ha/distributed flags."""
         distributed = _is_distributed(
             router.get('distributed', lib_const.ATTR_NOT_SPECIFIED))
         ha = _is_ha(router.get('ha', lib_const.ATTR_NOT_SPECIFIED))
-        drivers = self.drivers.values()
+        drivers = list(self.drivers.values())
         # make sure default is tried before the rest if defined
         if self.default_provider:
             drivers.insert(0, self.drivers[self.default_provider])
         for driver in drivers:
             if _is_driver_compatible(distributed, ha, driver):
                 return driver
+
+        if exc:
+            raise exc
         raise NotImplementedError(
             _("Could not find a service provider that supports "
               "distributed=%(d)s and ha=%(h)s") % {'d': distributed, 'h': ha}
@@ -249,8 +257,8 @@ class _LegacyPlusProviderConfiguration(
         # loads up ha, dvr, and single_node service providers automatically.
         # If an operator has setup explicit values that conflict with these,
         # the operator defined values will take priority.
-        super(_LegacyPlusProviderConfiguration, self).__init__(
-              svc_type=plugin_constants.L3)
+        super().__init__(
+            svc_type=plugin_constants.L3)
         for name, driver in (('dvrha', 'dvrha.DvrHaDriver'),
                              ('dvr', 'dvr.DvrDriver'), ('ha', 'ha.HaDriver'),
                              ('single_node', 'single_node.SingleNodeDriver')):
@@ -288,7 +296,7 @@ def _is_ha(ha_attr):
     return True
 
 
-def _flavor_specified(router):
+def flavor_specified(router):
     return ('flavor_id' in router and
             router['flavor_id'] != lib_const.ATTR_NOT_SPECIFIED)
 

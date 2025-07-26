@@ -23,18 +23,23 @@ from neutron.common import config
 from neutron.common import utils
 from neutron.conf.agent import common as agent_conf
 from neutron.conf.agent.metadata import config as meta
+from neutron.conf import service as service_conf
 
 LOG = logging.getLogger(__name__)
 
 
 def main():
+    config.register_common_config_options()
     meta.register_meta_conf_opts(meta.SHARED_OPTS)
     meta.register_meta_conf_opts(meta.UNIX_DOMAIN_METADATA_PROXY_OPTS)
     meta.register_meta_conf_opts(meta.METADATA_PROXY_HANDLER_OPTS)
     cache.register_oslo_configs(cfg.CONF)
     agent_conf.register_agent_state_opts_helper(cfg.CONF)
+    service_conf.register_service_opts(service_conf.RPC_EXTRA_OPTS, cfg.CONF)
+
     config.init(sys.argv[1:])
     config.setup_logging()
+    config.setup_gmr()
     utils.log_opt_values(LOG)
     proxy = agent.UnixDomainMetadataProxy(cfg.CONF)
     proxy.run()

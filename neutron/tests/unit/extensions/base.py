@@ -25,6 +25,7 @@ from webob import exc
 import webtest
 
 from neutron.api import extensions
+from neutron.conf import quota as quota_conf
 from neutron import manager
 from neutron import quota
 from neutron.tests.unit.api import test_extensions
@@ -83,11 +84,11 @@ class ExtensionTestCase(testlib_api.WebTestCase):
             setattr(instance, native_sorting_attr_name, True)
         if use_quota:
             quota.QUOTAS._driver = None
-            cfg.CONF.set_override('quota_driver', 'neutron.quota.ConfDriver',
+            cfg.CONF.set_override('quota_driver', quota_conf.QUOTA_DB_DRIVER,
                                   group='QUOTAS')
         setattr(instance, 'path_prefix', resource_prefix)
 
-        class ExtensionTestExtensionManager(object):
+        class ExtensionTestExtensionManager:
             def get_resources(self):
                 return extension_class.get_resources()
 

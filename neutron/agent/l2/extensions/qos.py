@@ -21,7 +21,6 @@ from neutron_lib import constants
 from neutron_lib.services.qos import constants as qos_consts
 from oslo_concurrency import lockutils
 from oslo_log import log as logging
-import six
 
 from neutron.api.rpc.callbacks.consumer import registry
 from neutron.api.rpc.callbacks import events
@@ -32,8 +31,7 @@ from neutron import manager
 LOG = logging.getLogger(__name__)
 
 
-@six.add_metaclass(abc.ABCMeta)
-class QosAgentDriver(object):
+class QosAgentDriver(metaclass=abc.ABCMeta):
     """Defines stable abstract interface for QoS Agent Driver.
 
     QoS Agent driver defines the interface to be implemented by Agent
@@ -113,8 +111,8 @@ class QosAgentDriver(object):
     def _handle_rule_delete(self, port, rule_type, ingress=False):
         handler_name = "".join(("delete_", rule_type))
         if ingress:
-            handler_name = "%s_%s" % (handler_name,
-                                      constants.INGRESS_DIRECTION)
+            handler_name = "{}_{}".format(handler_name,
+                                          constants.INGRESS_DIRECTION)
         handler = getattr(self, handler_name)
         handler(port)
 
@@ -140,7 +138,7 @@ class QosAgentDriver(object):
         return rule_direction == constants.INGRESS_DIRECTION
 
 
-class PortPolicyMap(object):
+class PortPolicyMap:
     def __init__(self):
         # we cannot use a dict of sets here because port dicts are not hashable
         self.qos_policy_ports = collections.defaultdict(dict)
@@ -247,9 +245,9 @@ class QosAgentExtension(l2_extension.L2AgentExtension):
         Update events are handled in _handle_notification.
         """
         port_id = port['port_id']
-        port_qos_policy_id = port.get('qos_policy_id')
-        network_qos_policy_id = port.get('network_qos_policy_id')
-        qos_policy_id = port_qos_policy_id or network_qos_policy_id
+        port_qos_policy_id = port.get(qos_consts.QOS_POLICY_ID)
+        qos_network_policy_id = port.get(qos_consts.QOS_NETWORK_POLICY_ID)
+        qos_policy_id = port_qos_policy_id or qos_network_policy_id
         if qos_policy_id is None:
             self._process_reset_port(port)
             return
@@ -259,7 +257,7 @@ class QosAgentExtension(l2_extension.L2AgentExtension):
 
         qos_policy = self.policy_map.get_policy(
             qos_policy_id) or self.resource_rpc.pull(
-            context, resources.QOS_POLICY, qos_policy_id)
+                context, resources.QOS_POLICY, qos_policy_id)
         if qos_policy is None:
             LOG.info("QoS policy %(qos_policy_id)s applied to port "
                      "%(port_id)s is not available on server, "

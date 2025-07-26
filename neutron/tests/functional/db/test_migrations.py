@@ -23,11 +23,11 @@ from oslo_config import fixture as config_fixture
 from oslo_db.sqlalchemy import test_migrations
 from oslo_log import log as logging
 from oslotest import base as oslotest_base
-import six
 import sqlalchemy
 from sqlalchemy import event  # noqa
 from sqlalchemy.sql import ddl as sqla_ddl
 
+from neutron.common import config
 from neutron.db import migration as migration_root
 from neutron.db.migration.alembic_migrations import external
 from neutron.db.migration import cli as migration
@@ -36,7 +36,6 @@ from neutron.tests import base as test_base
 from neutron.tests.functional import base as functional_base
 from neutron.tests.unit import testlib_api
 
-cfg.CONF.import_opt('core_plugin', 'neutron.conf.common')
 
 CREATION_OPERATIONS = {
     'sqla': (sqla_ddl.CreateIndex,
@@ -65,27 +64,33 @@ migration.log_warning = LOG.warning
 migration.log_info = LOG.info
 
 
+def render_url_str(_url):
+    """Render a ``URL`` instance as string and the password in clear text"""
+    try:
+        return _url.render_as_string(hide_password=False)
+    except AttributeError:
+        # NOTE(ralonsoh): ``URL`` objects from SQLAlchemy<2.0.0 don't have
+        # ``render_as_string`` method but it is not necessary.
+        return str(_url)
+
+
 def upgrade(engine, alembic_config, branch_name='heads'):
-    cfg.CONF.set_override('connection', engine.url, group='database')
+    url_str = render_url_str(engine.url)
+    cfg.CONF.set_override('connection', url_str, group='database')
     migration.do_alembic_command(alembic_config, 'upgrade',
                                  branch_name)
 
 
-class _TestModelsMigrations(test_migrations.ModelsMigrationsSync):
+class TestModelsMigrations(test_migrations.ModelsMigrationsSync,
+                           testlib_api.MySQLTestCaseMixin,
+                           testlib_api.SqlTestCaseLight,
+                           functional_base.BaseLoggingTestCase):
     '''Test for checking of equality models state and migrations.
 
     For the opportunistic testing you need to set up a db named
     'openstack_citest' with user 'openstack_citest' and password
     'openstack_citest' on localhost.
     The test will then use that db and user/password combo to run the tests.
-
-    For PostgreSQL on Ubuntu this can be done with the following commands::
-
-        sudo -u postgres psql
-        postgres=# create user openstack_citest with createdb login password
-                  'openstack_citest';
-        postgres=# create database openstack_citest with owner
-                   openstack_citest;
 
     For MySQL on Ubuntu this can be done with the following commands::
 
@@ -144,7 +149,8 @@ class _TestModelsMigrations(test_migrations.ModelsMigrationsSync):
     TIMEOUT_SCALING_FACTOR = 4
 
     def setUp(self):
-        super(_TestModelsMigrations, self).setUp()
+        config.register_common_config_options()
+        super().setUp()
         self.cfg = self.useFixture(config_fixture.Config())
         self.cfg.config(core_plugin='ml2')
         self.alembic_config = migration.get_neutron_config()
@@ -167,7 +173,7 @@ class _TestModelsMigrations(test_migrations.ModelsMigrationsSync):
                                  name in external.TABLES):
             return False
 
-        return super(_TestModelsMigrations, self).include_object(
+        return super().include_object(
             object_, name, type_, reflected, compare_to)
 
     def filter_metadata_diff(self, diff):
@@ -176,8 +182,7 @@ class _TestModelsMigrations(test_migrations.ModelsMigrationsSync):
     # Remove some difference that are not mistakes just specific of
     # dialects, etc
     def remove_unrelated_errors(self, element):
-        insp = sqlalchemy.engine.reflection.Inspector.from_engine(
-            self.get_engine())
+        insp = sqlalchemy.inspect(self.get_engine())
         dialect = self.get_engine().dialect.name
         if isinstance(element, tuple):
             if dialect == 'mysql' and element[0] == 'remove_index':
@@ -200,13 +205,13 @@ class _TestModelsMigrations(test_migrations.ModelsMigrationsSync):
 
     def test_upgrade_expand_branch(self):
         # Verify that "command neutron-db-manage upgrade --expand" works
-        #  without errors. Check this for both MySQL and PostgreSQL.
+        # without errors.
         upgrade(self.engine, self.alembic_config,
                 branch_name='%s@head' % migration.EXPAND_BRANCH)
 
     def test_upgrade_contract_branch(self):
         # Verify that "command neutron-db-manage upgrade --contract" works
-        # without errors. Check this for both MySQL and PostgreSQL.
+        # without errors.
         upgrade(self.engine, self.alembic_config,
                 branch_name='%s@head' % migration.CONTRACT_BRANCH)
 
@@ -251,7 +256,7 @@ class _TestModelsMigrations(test_migrations.ModelsMigrationsSync):
                 if not get_excepted_elements:
                     continue
                 explanation = getattr(get_excepted_elements, '__doc__', "")
-                if len(explanation) < 1:
+                if not explanation:
                     self.fail("%s() requires docstring with explanation" %
                               '.'.join([m.module.__name__,
                                         get_excepted_elements.__name__]))
@@ -273,7 +278,7 @@ class _TestModelsMigrations(test_migrations.ModelsMigrationsSync):
             """Identify excepted operations that are allowed for the branch."""
             # For alembic the clause is AddColumn or DropColumn
             column = clauseelement.column.name
-            table = clauseelement.column.table.name
+            table = clauseelement.table_name
             element_name = '.'.join([table, column])
             for alembic_type, excepted_names in exceptions.items():
                 if alembic_type == sqlalchemy.Column:
@@ -288,11 +293,13 @@ class _TestModelsMigrations(test_migrations.ModelsMigrationsSync):
                 return is_excepted_alembic(clauseelement, exceptions)
             return True
 
-        def check_expand_branch(conn, clauseelement, multiparams, params):
+        def check_expand_branch(conn, clauseelement, multiparams, params,
+                                execution_options):
             if not is_allowed(clauseelement, drop_exceptions, DROP_OPERATIONS):
                 self.fail("Migration in expand branch contains drop command")
 
-        def check_contract_branch(conn, clauseelement, multiparams, params):
+        def check_contract_branch(conn, clauseelement, multiparams, params,
+                                  execution_options):
             if not is_allowed(clauseelement, creation_exceptions,
                               CREATION_OPERATIONS):
                 self.fail("Migration in contract branch contains create "
@@ -300,7 +307,8 @@ class _TestModelsMigrations(test_migrations.ModelsMigrationsSync):
 
         find_migration_exceptions()
         engine = self.engine
-        cfg.CONF.set_override('connection', engine.url, group='database')
+        url_str = render_url_str(engine.url)
+        cfg.CONF.set_override('connection', url_str, group='database')
 
         with engine.begin() as connection:
             self.alembic_config.attributes['connection'] = connection
@@ -325,28 +333,13 @@ class _TestModelsMigrations(test_migrations.ModelsMigrationsSync):
                     self.alembic_config, 'upgrade',
                     '%s@head' % migration.CONTRACT_BRANCH)
 
-    def _test_has_offline_migrations(self, revision, expected):
-        engine = self.get_engine()
-        cfg.CONF.set_override('connection', engine.url, group='database')
-        migration.do_alembic_command(self.alembic_config, 'upgrade', revision)
-        self.assertEqual(expected,
-                         migration.has_offline_migrations(self.alembic_config,
-                                                          'unused'))
-
-    def test_has_offline_migrations_pending_contract_scripts(self):
-        self._test_has_offline_migrations('kilo', True)
-
-    def test_has_offline_migrations_all_heads_upgraded(self):
-        self._test_has_offline_migrations('heads', False)
-
     # NOTE(ihrachys): if this test fails for you, it probably means that you
     # attempt to add an unsafe contract migration script, that is in
     # contradiction to blueprint online-upgrades
-    # TODO(ihrachys): revisit later in Pike+ where some contract scripts may be
-    # safe again
     def test_forbid_offline_migrations_starting_newton(self):
         engine = self.get_engine()
-        cfg.CONF.set_override('connection', engine.url, group='database')
+        url_str = render_url_str(engine.url)
+        cfg.CONF.set_override('connection', url_str, group='database')
         # the following revisions are Newton heads
         for revision in ('5cd92597d11d', '5c85685d616d'):
             migration.do_alembic_command(
@@ -355,26 +348,15 @@ class _TestModelsMigrations(test_migrations.ModelsMigrationsSync):
             self.alembic_config, 'unused'),
             msg='Offline contract migration scripts are forbidden for Ocata+')
 
-
-class TestModelsMigrationsMysql(testlib_api.MySQLTestCaseMixin,
-                                _TestModelsMigrations,
-                                testlib_api.SqlTestCaseLight,
-                                functional_base.BaseLoggingTestCase):
-
-    @test_base.skip_if_timeout("bug 1687027")
-    def test_forbid_offline_migrations_starting_newton(self):
-        super(TestModelsMigrationsMysql,
-              self).test_forbid_offline_migrations_starting_newton()
-
-    @test_base.skip_if_timeout("bug 1687027")
     def test_check_mysql_engine(self):
         engine = self.get_engine()
-        cfg.CONF.set_override('connection', engine.url, group='database')
+        url_str = render_url_str(engine.url)
+        cfg.CONF.set_override('connection', url_str, group='database')
         with engine.begin() as connection:
             self.alembic_config.attributes['connection'] = connection
             migration.do_alembic_command(self.alembic_config, 'upgrade',
                                          'heads')
-            insp = sqlalchemy.engine.reflection.Inspector.from_engine(engine)
+            insp = sqlalchemy.inspect(engine)
             # Test that table creation on MySQL only builds InnoDB tables
             tables = insp.get_table_names()
             self.assertGreater(len(tables), 0,
@@ -385,44 +367,12 @@ class TestModelsMigrationsMysql(testlib_api.MySQLTestCaseMixin,
                    table != 'alembic_version']
             self.assertEqual(0, len(res), "%s non InnoDB tables created" % res)
 
-    @test_base.skip_if_timeout("bug 1687027")
-    def test_upgrade_expand_branch(self):
-        super(TestModelsMigrationsMysql, self).test_upgrade_expand_branch()
-
-    @test_base.skip_if_timeout("bug 1687027")
-    def test_upgrade_contract_branch(self):
-        super(TestModelsMigrationsMysql, self).test_upgrade_contract_branch()
-
-    @test_base.skip_if_timeout("bug 1687027")
-    def test_branches(self):
-        super(TestModelsMigrationsMysql, self).test_branches()
-
-    @test_base.skip_if_timeout("bug 1687027")
-    def test_has_offline_migrations_pending_contract_scripts(self):
-        super(TestModelsMigrationsMysql,
-              self).test_has_offline_migrations_pending_contract_scripts()
-
-    @test_base.skip_if_timeout("bug 1687027")
-    def test_has_offline_migrations_all_heads_upgraded(self):
-        super(TestModelsMigrationsMysql,
-              self).test_has_offline_migrations_all_heads_upgraded()
-
-    @test_base.skip_if_timeout("bug 1687027")
-    def test_models_sync(self):
-        super(TestModelsMigrationsMysql, self).test_models_sync()
-
-
-class TestModelsMigrationsPsql(testlib_api.PostgreSQLTestCaseMixin,
-                               _TestModelsMigrations,
-                               testlib_api.SqlTestCaseLight):
-    pass
-
 
 class TestSanityCheck(testlib_api.SqlTestCaseLight):
     BUILD_SCHEMA = False
 
     def setUp(self):
-        super(TestSanityCheck, self).setUp()
+        super().setUp()
         self.alembic_config = migration.get_neutron_config()
         self.alembic_config.neutron_config = cfg.CONF
 
@@ -437,7 +387,7 @@ class TestSanityCheck(testlib_api.SqlTestCaseLight):
             sqlalchemy.Column('router_id', sqlalchemy.String(36)),
             sqlalchemy.Column('l3_agent_id', sqlalchemy.String(36)))
 
-        with self.engine.connect() as conn:
+        with self.engine.begin() as conn:
             ha_router_agent_port_bindings.create(conn)
             self.addCleanup(self._drop_table, ha_router_agent_port_bindings)
             # NOTE(haleyb): without this disabled, pylint complains
@@ -462,7 +412,7 @@ class TestSanityCheck(testlib_api.SqlTestCaseLight):
             sqlalchemy.Column('port_id', sqlalchemy.String(36)),
             sqlalchemy.Column('port_type', sqlalchemy.String(255)))
 
-        with self.engine.connect() as conn:
+        with self.engine.begin() as conn:
             routerports.create(conn)
             self.addCleanup(self._drop_table, routerports)
             # NOTE(haleyb): without this disabled, pylint complains
@@ -487,7 +437,7 @@ class TestSanityCheck(testlib_api.SqlTestCaseLight):
             sqlalchemy.Column('fixed_port_id', sqlalchemy.String(36)),
             sqlalchemy.Column('fixed_ip_address', sqlalchemy.String(64)))
 
-        with self.engine.connect() as conn:
+        with self.engine.begin() as conn:
             floatingips.create(conn)
             self.addCleanup(self._drop_table, floatingips)
             # NOTE(haleyb): without this disabled, pylint complains
@@ -514,7 +464,7 @@ class TestSanityCheck(testlib_api.SqlTestCaseLight):
             sqlalchemy.Column('fixed_port_id', sqlalchemy.String(36)),
             sqlalchemy.Column('fixed_ip_address', sqlalchemy.String(64)))
 
-        with self.engine.connect() as conn:
+        with self.engine.begin() as conn:
             floatingips.create(conn)
             self.addCleanup(self._drop_table, floatingips)
             # NOTE(haleyb): without this disabled, pylint complains
@@ -537,15 +487,14 @@ class TestSanityCheck(testlib_api.SqlTestCaseLight):
 class TestWalkDowngrade(oslotest_base.BaseTestCase):
 
     def setUp(self):
-        super(TestWalkDowngrade, self).setUp()
+        super().setUp()
         self.alembic_config = migration.get_neutron_config()
         self.alembic_config.neutron_config = cfg.CONF
 
     def test_no_downgrade(self):
         script_dir = alembic_script.ScriptDirectory.from_config(
             self.alembic_config)
-        versions = [v for v in script_dir.walk_revisions(base='base',
-                                                         head='heads')]
+        versions = list(script_dir.walk_revisions(base='base', head='heads'))
         failed_revisions = []
         for version in versions:
             if hasattr(version.module, 'downgrade'):
@@ -556,29 +505,34 @@ class TestWalkDowngrade(oslotest_base.BaseTestCase):
             return True
 
 
-class _TestWalkMigrations(object):
-    '''This will add framework for testing schema migration
-       for different backends.
-
-    '''
+class _BaseTestWalkMigrations:
 
     BUILD_SCHEMA = False
-
-    def execute_cmd(self, cmd=None):
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, shell=True)
-        output = proc.communicate()[0]
-        self.assertEqual(0, proc.returncode, 'Command failed with '
-                         'output:\n%s' % output)
 
     def _get_alembic_config(self, uri):
         db_config = migration.get_neutron_config()
         self.script_dir = alembic_script.ScriptDirectory.from_config(db_config)
         db_config.neutron_config = cfg.CONF
         db_config.neutron_config.set_override('connection',
-                                              six.text_type(uri),
+                                              str(uri),
                                               group='database')
         return db_config
+
+
+class TestWalkMigrations(_BaseTestWalkMigrations,
+                         testlib_api.MySQLTestCaseMixin,
+                         testlib_api.SqlTestCaseLight):
+    '''This will add framework for testing schema migration
+       for different backends.
+
+    '''
+
+    def execute_cmd(self, cmd=None):
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, shell=True) as proc:
+            output = proc.communicate()[0]
+            self.assertEqual(0, proc.returncode, 'Command failed with '
+                             'output:\n%s' % output)
 
     def _revisions(self):
         """Provides revisions and its parent revisions.
@@ -593,49 +547,90 @@ class _TestWalkMigrations(object):
             # Destination, current
             yield rev.revision, rev.down_revision
 
-    def _migrate_up(self, config, engine, dest, curr, with_data=False):
-        if with_data:
-            data = None
-            pre_upgrade = getattr(
-                self, "_pre_upgrade_%s" % dest, None)
-            if pre_upgrade:
-                data = pre_upgrade(engine)
-        migration.do_alembic_command(config, 'upgrade', dest)
-        if with_data:
-            check = getattr(self, "_check_%s" % dest, None)
-            if check and data:
-                check(engine, data)
+    def _migrate_up(self, config, engine, dest, curr):
+        data = None
+        check = getattr(self, "_check_%s" % dest, None)
+        pre_upgrade = getattr(self, "_pre_upgrade_%s" % dest, None)
+        if pre_upgrade:
+            if curr:
+                migration.do_alembic_command(config, 'upgrade', curr)
+            data = pre_upgrade(engine)
 
+        if check and data:
+            migration.do_alembic_command(config, 'upgrade', dest)
+            check(engine, data)
+
+    # NOTE(slaweq): this workaround is taken from Manila patch:
+    # https://review.opendev.org/#/c/291397/
+    # Set 5 minutes timeout for case of running it on very slow nodes/VMs.
+    # Note, that this test becomes slower with each addition of new DB
+    # migration. On fast nodes it can take about 5-10 secs having Mitaka set of
+    # migrations.
+    @test_base.set_timeout(600)
     def test_walk_versions(self):
         """Test migrations ability to upgrade and downgrade.
 
         """
         engine = self.engine
-        config = self._get_alembic_config(engine.url)
+        url_str = render_url_str(engine.url)
+        config = self._get_alembic_config(url_str)
         revisions = self._revisions()
+        upgrade_dest = None
         for dest, curr in revisions:
-            self._migrate_up(config, engine, dest, curr, with_data=True)
+            self._migrate_up(config, engine, dest, curr)
+            upgrade_dest = dest
+
+        if upgrade_dest:
+            migration.do_alembic_command(config, 'upgrade', upgrade_dest)
 
 
-class TestWalkMigrationsMysql(testlib_api.MySQLTestCaseMixin,
-                              _TestWalkMigrations,
-                              testlib_api.SqlTestCaseLight):
+class TestMigrationsIdempotency(_BaseTestWalkMigrations,
+                                testlib_api.MySQLTestCaseMixin,
+                                testlib_api.SqlTestCaseLight):
+    '''This class tests if the migration scripts are idempotent
+    '''
+
+    def _revert_alembic_version(self, target_versions=None):
+        alembic_version = sqlalchemy.Table(
+            'alembic_version', sqlalchemy.MetaData(),
+            sqlalchemy.Column('version_num', sqlalchemy.String(32)))
+
+        with self.engine.begin() as conn:
+            # Revision "5c85685d616d" is the head of the CONTRACT branch,
+            # it is from Newton release and we don't allow any new CONTRACT
+            # DB upgrades, so let's don't bother with that branch
+            conn.execute(
+                alembic_version.delete().where(
+                    alembic_version.c.version_num != '5c85685d616d'
+                )
+            )
+            if target_versions:
+                conn.execute(
+                    alembic_version.insert(),
+                    [{'version_num': tv} for tv in target_versions]
+                )
 
     # NOTE(slaweq): this workaround is taken from Manila patch:
     # https://review.opendev.org/#/c/291397/
-    # Set 5 minutes timeout for case of running it on
-    # very slow nodes/VMs. Note, that this test becomes slower with each
-    # addition of new DB migration. On fast nodes it can take about 5-10
-    # secs having Mitaka set of migrations. 'pymysql' works much slower
-    # on slow nodes than 'psycopg2' and because of that this increased
-    # timeout is required only when for testing with 'mysql' backend.
+    # Set 5 minutes timeout for case of running it on very slow nodes/VMs.
+    # Note, that this test becomes slower with each addition of new DB
+    # migration. On fast nodes it can take about 5-10 secs having Mitaka set of
+    # migrations.
     @test_base.set_timeout(600)
-    @test_base.skip_if_timeout("bug 1687027")
-    def test_walk_versions(self):
-        super(TestWalkMigrationsMysql, self).test_walk_versions()
+    def test_db_upgrade_is_idempotent(self):
+        """Tests if Alembic upgrade scripts are idempotent.
 
+        This function tests if running Alembic upgrade scripts multiple times
+        results in the same database state. It does this by first upgrading the
+        database to the latest revision, then reverting it to a previous state,
+        and finally upgrading it again to the latest revision.
+        """
+        url_str = render_url_str(self.engine.url)
+        config = self._get_alembic_config(url_str)
+        migration.do_alembic_command(config, 'upgrade', 'heads')
 
-class TestWalkMigrationsPsql(testlib_api.PostgreSQLTestCaseMixin,
-                             _TestWalkMigrations,
-                             testlib_api.SqlTestCaseLight):
-    pass
+        # Now lets get back with revision to the 2023.2 HEAD ('89c58a70ceba')
+        # and then test again upgrade from from that point through all next
+        # releases, starting from 2024.1 if db migration scripts are idempotent
+        self._revert_alembic_version(["89c58a70ceba"])
+        migration.do_alembic_command(config, 'upgrade', 'heads')

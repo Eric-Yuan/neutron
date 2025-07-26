@@ -13,57 +13,75 @@
 #
 
 import atexit
+import collections
 import copy
 import datetime
 import functools
+import multiprocessing
+import netaddr
 import operator
-import signal
 import threading
 import types
+import uuid
 
 from neutron_lib.api.definitions import portbindings
+from neutron_lib.api.definitions import provider_net
+from neutron_lib.api.definitions import segment as segment_def
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
 from neutron_lib import constants as const
 from neutron_lib import context as n_context
+from neutron_lib.db import api as db_api
 from neutron_lib import exceptions as n_exc
+from neutron_lib.exceptions import availability_zone as az_exc
+from neutron_lib.placement import constants as place_const
+from neutron_lib.placement import utils as place_utils
 from neutron_lib.plugins import directory
 from neutron_lib.plugins.ml2 import api
+from neutron_lib.utils import helpers
 from oslo_config import cfg
 from oslo_db import exception as os_db_exc
 from oslo_log import log
+from oslo_service import service as oslo_service
 from oslo_utils import timeutils
+from oslo_utils import uuidutils
 from ovsdbapp.backend.ovs_idl import idlutils
 
 from neutron._i18n import _
+from neutron.api import wsgi
 from neutron.common.ovn import acl as ovn_acl
 from neutron.common.ovn import constants as ovn_const
+from neutron.common.ovn import exceptions as ovn_exceptions
+from neutron.common.ovn import extensions as ovn_extensions
 from neutron.common.ovn import utils as ovn_utils
 from neutron.common import utils as n_utils
+from neutron.common import wsgi_utils
 from neutron.conf.plugins.ml2.drivers.ovn import ovn_conf
 from neutron.db import ovn_hash_ring_db
 from neutron.db import ovn_revision_numbers_db
 from neutron.db import provisioning_blocks
+from neutron.extensions import securitygroup as ext_sg
+from neutron.objects import router
 from neutron.plugins.ml2 import db as ml2_db
+from neutron.plugins.ml2.drivers.ovn.agent import neutron_agent as n_agent
+from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb.extensions \
+    import placement as placement_ext
 from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import impl_idl_ovn
 from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import maintenance
 from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import ovn_client
 from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import ovn_db_sync
-from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import ovsdb_monitor
+from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import ovs_fixes
 from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import worker
+from neutron import service
+from neutron.services.logapi.drivers.ovn import driver as log_driver
 from neutron.services.qos.drivers.ovn import driver as qos_driver
 from neutron.services.segments import db as segment_service_db
 from neutron.services.trunk.drivers.ovn import trunk_driver
 
 
 LOG = log.getLogger(__name__)
-METADATA_READY_WAIT_TIMEOUT = 15
-AGENTS = {}
-
-
-class MetadataServiceReadyWaitTimeoutException(Exception):
-    pass
+OVN_MIN_GENEVE_MAX_HEADER_SIZE = 38
 
 
 class OVNPortUpdateError(n_exc.BadRequest):
@@ -90,6 +108,8 @@ class OVNMechanismDriver(api.MechanismDriver):
     update network/port case, all data validation must be done within
     methods that are part of the database transaction.
     """
+    resource_provider_uuid5_namespace = ovn_const.OVN_RP_UUID
+
     def initialize(self):
         """Perform driver initialization.
 
@@ -103,20 +123,38 @@ class OVNMechanismDriver(api.MechanismDriver):
         self._plugin_property = None
         self._ovn_client_inst = None
         self._maintenance_thread = None
-        self.node_uuid = None
+        self._hash_ring_thread = None
+        self._hash_ring_probe_event = multiprocessing.Event()
+        self._node_uuid = None
         self.hash_ring_group = ovn_const.HASH_RING_ML2_GROUP
         self.sg_enabled = ovn_acl.is_sg_enabled()
-        # NOTE(lucasagomes): _clean_hash_ring() must be called before
-        # self.subscribe() to avoid processes racing when adding or
-        # deleting nodes from the Hash Ring during service initialization
-        self._clean_hash_ring()
+        ovn_conf.register_opts()
         self._post_fork_event = threading.Event()
         if cfg.CONF.SECURITYGROUP.firewall_driver:
             LOG.warning('Firewall driver configuration is ignored')
+        if (const.TYPE_GENEVE in cfg.CONF.ml2.type_drivers and
+                cfg.CONF.ml2_type_geneve.max_header_size <
+                OVN_MIN_GENEVE_MAX_HEADER_SIZE):
+            LOG.critical('Geneve max_header_size set too low for OVN '
+                         '(%d vs %d)',
+                         cfg.CONF.ml2_type_geneve.max_header_size,
+                         OVN_MIN_GENEVE_MAX_HEADER_SIZE)
+            raise SystemExit(1)
         self._setup_vif_port_bindings()
         self.subscribe()
         self.qos_driver = qos_driver.OVNQosDriver.create(self)
         self.trunk_driver = trunk_driver.OVNTrunkDriver.create(self)
+        self.log_driver = log_driver.register(self)
+        self._start_time = None
+        self._agent_cache = None
+
+    @property
+    def nb_schema_helper(self):
+        return impl_idl_ovn.OvsdbNbOvnIdl.schema_helper
+
+    @property
+    def sb_schema_helper(self):
+        return impl_idl_ovn.OvsdbSbOvnIdl.schema_helper
 
     @property
     def _plugin(self):
@@ -127,42 +165,128 @@ class OVNMechanismDriver(api.MechanismDriver):
     @property
     def _ovn_client(self):
         if self._ovn_client_inst is None:
-            if not(self._nb_ovn and self._sb_ovn):
-                # Wait until the post_fork_initialize method has finished and
-                # IDLs have been correctly setup.
-                self._post_fork_event.wait()
-            self._ovn_client_inst = ovn_client.OVNClient(self._nb_ovn,
-                                                         self._sb_ovn)
+            self._ovn_client_inst = ovn_client.OVNClient(self.nb_ovn,
+                                                         self.sb_ovn)
         return self._ovn_client_inst
 
     @property
     def nb_ovn(self):
-        # NOTE (twilson): This and sb_ovn can be moved to instance variables
-        # once all references to the private versions are changed
+        self._post_fork_event.wait()
         return self._nb_ovn
+
+    @nb_ovn.setter
+    def nb_ovn(self, val):
+        self._nb_ovn = val
 
     @property
     def sb_ovn(self):
+        self._post_fork_event.wait()
         return self._sb_ovn
 
+    @sb_ovn.setter
+    def sb_ovn(self, val):
+        self._sb_ovn = val
+
+    @property
+    def start_time(self):
+        if self._start_time:
+            return self._start_time
+
+        self._start_time = wsgi_utils.get_start_time()
+        if not self._start_time:
+            LOG.warning('uWSGI must provide a start time using the '
+                        'configuration parameter "start-time %t" in the '
+                        'configuration file')
+            # NOTE(ralonsoh): this is happening if the uWSGI configuration file
+            # does not have the "start-time %t" parameter or when using the
+            # Neutron API eventlet server, still in use in the grenade
+            # skip-level jobs. This should be removed in the F release.
+            self._start_time = wsgi_utils.get_start_time(current_time=True)
+
+        return self._start_time
+
+    @property
+    def node_uuid(self):
+        if self._node_uuid:
+            return self._node_uuid
+
+        worker_id = wsgi_utils.get_api_worker_id()
+        if worker_id is None:
+            # NOTE(ralonsoh): the hash ring node UUID should be based on the
+            # Neutron API worker ID. Right now only uWSGI mode is supported.
+            # The worker ID is provided via ``uwsgi`` library. If other loader
+            # is used, a random node UUID will be provided.
+            LOG.warning('uWSGI is the only supported loader for the Neutron '
+                        'API; it provides, via ``uwsgi`` library, the worker '
+                        'ID. If other loader is used, a random hash ring node '
+                        'UUID will be provided')
+            self._node_uuid = uuidutils.generate_uuid()
+        else:
+            self._node_uuid = ovn_hash_ring_db.get_node_uuid(
+                self.hash_ring_group, cfg.CONF.host, worker_id)
+
+        return self._node_uuid
+
+    def get_supported_vif_types(self):
+        vif_types = set()
+        for ch in self.sb_ovn.chassis_list().execute(check_error=True):
+            other_config = ovn_utils.get_ovn_chassis_other_config(ch)
+            dp_type = other_config.get(ovn_const.OVN_DATAPATH_TYPE, '')
+            if dp_type == ovn_const.CHASSIS_DATAPATH_NETDEV:
+                vif_types.add(portbindings.VIF_TYPE_VHOST_USER)
+            else:
+                vif_types.add(portbindings.VIF_TYPE_OVS)
+        return list(vif_types)
+
+    def check_vlan_transparency(self, context):
+        """OVN driver vlan transparency support."""
+        vlan_transparency_network_types = [
+            const.TYPE_LOCAL,
+            const.TYPE_GENEVE,
+            const.TYPE_VXLAN,
+            const.TYPE_VLAN
+        ]
+        return (context.current.get(provider_net.NETWORK_TYPE)
+                in vlan_transparency_network_types)
+
+    def check_vlan_qinq(self, context):
+        """OVN driver vlan QinQ support."""
+        vlan_qinq_network_types = [
+            const.TYPE_VLAN,
+        ]
+        return (context.current.get(provider_net.NETWORK_TYPE)
+                in vlan_qinq_network_types)
+
     def _setup_vif_port_bindings(self):
-        self.supported_vnic_types = [portbindings.VNIC_NORMAL,
-                                     portbindings.VNIC_DIRECT,
-                                     portbindings.VNIC_DIRECT_PHYSICAL,
-                                     portbindings.VNIC_MACVTAP]
+        self.supported_vnic_types = ovn_const.OVN_SUPPORTED_VNIC_TYPES
         self.vif_details = {
             portbindings.VIF_TYPE_OVS: {
-                portbindings.CAP_PORT_FILTER: self.sg_enabled
+                portbindings.CAP_PORT_FILTER: self.sg_enabled,
+                portbindings.VIF_DETAILS_CONNECTIVITY: self.connectivity,
+            },
+            portbindings.VIF_TYPE_AGILIO_OVS: {
+                portbindings.CAP_PORT_FILTER: self.sg_enabled,
+                portbindings.VIF_DETAILS_CONNECTIVITY: self.connectivity,
             },
             portbindings.VIF_TYPE_VHOST_USER: {
                 portbindings.CAP_PORT_FILTER: False,
                 portbindings.VHOST_USER_MODE:
                 portbindings.VHOST_USER_MODE_SERVER,
-                portbindings.VHOST_USER_OVS_PLUG: True
+                portbindings.VHOST_USER_OVS_PLUG: True,
+                portbindings.VIF_DETAILS_CONNECTIVITY: self.connectivity,
             },
-            portbindings.VIF_DETAILS_CONNECTIVITY:
-                portbindings.CONNECTIVITY_L2,
         }
+
+    @property
+    def connectivity(self):
+        return portbindings.CONNECTIVITY_L2
+
+    def supported_extensions(self, extensions):
+        return set(ovn_extensions.ML2_SUPPORTED_API_EXTENSIONS) & extensions
+
+    @staticmethod
+    def provider_network_attribute_updates_supported():
+        return [provider_net.SEGMENTATION_ID]
 
     def subscribe(self):
         registry.subscribe(self.pre_fork_initialize,
@@ -170,12 +294,22 @@ class OVNMechanismDriver(api.MechanismDriver):
                            events.BEFORE_SPAWN)
         registry.subscribe(self.post_fork_initialize,
                            resources.PROCESS,
-                           events.AFTER_INIT)
+                           events.AFTER_INIT,
+                           cancellable=True)
         registry.subscribe(self._add_segment_host_mapping_for_segment,
                            resources.SEGMENT,
                            events.AFTER_CREATE)
+        registry.subscribe(self.create_segment_provnet_port,
+                           resources.SEGMENT,
+                           events.AFTER_CREATE)
+        registry.subscribe(self.delete_segment_provnet_port,
+                           resources.SEGMENT,
+                           events.AFTER_DELETE)
+        registry.subscribe(self._validate_allowed_address_pairs,
+                           resources.ALLOWED_ADDRESS_PAIR,
+                           events.BEFORE_CREATE)
 
-        # Handle security group/rule notifications
+        # Handle security group/rule or address group notifications
         if self.sg_enabled:
             registry.subscribe(self._create_security_group_precommit,
                                resources.SECURITY_GROUP,
@@ -186,6 +320,9 @@ class OVNMechanismDriver(api.MechanismDriver):
             registry.subscribe(self._create_security_group,
                                resources.SECURITY_GROUP,
                                events.AFTER_CREATE)
+            registry.subscribe(self._delete_security_group_precommit,
+                               resources.SECURITY_GROUP,
+                               events.PRECOMMIT_DELETE)
             registry.subscribe(self._delete_security_group,
                                resources.SECURITY_GROUP,
                                events.AFTER_DELETE)
@@ -198,64 +335,96 @@ class OVNMechanismDriver(api.MechanismDriver):
             registry.subscribe(self._process_sg_rule_notification,
                                resources.SECURITY_GROUP_RULE,
                                events.BEFORE_DELETE)
+            registry.subscribe(self._process_ag_notification,
+                               resources.ADDRESS_GROUP,
+                               events.AFTER_CREATE)
+            registry.subscribe(self._process_ag_notification,
+                               resources.ADDRESS_GROUP,
+                               events.AFTER_UPDATE)
+            registry.subscribe(self._process_ag_notification,
+                               resources.ADDRESS_GROUP,
+                               events.AFTER_DELETE)
 
-    def _clean_hash_ring(self, *args, **kwargs):
+    def _remove_node_from_hash_ring(self, *args, **kwargs):
+        # The node_uuid attribute will be empty for worker types
+        # that are not added to the Hash Ring and can be skipped
+        if self.node_uuid is None:
+            return
         admin_context = n_context.get_admin_context()
-        ovn_hash_ring_db.remove_nodes_from_host(admin_context,
-                                                self.hash_ring_group)
+        ovn_hash_ring_db.remove_node_by_uuid(
+            admin_context, self.node_uuid)
 
     def pre_fork_initialize(self, resource, event, trigger, payload=None):
         """Pre-initialize the ML2/OVN driver."""
-        atexit.register(self._clean_hash_ring)
-        signal.signal(signal.SIGTERM, self._clean_hash_ring)
-        self._create_neutron_pg_drop()
+        ovn_utils.create_neutron_pg_drop()
 
-    def _create_neutron_pg_drop(self):
-        """Create neutron_pg_drop Port Group.
+    @staticmethod
+    def should_post_fork_initialize(worker_class):
+        return worker_class in (wsgi.WorkerService,
+                                worker.MaintenanceWorker,
+                                service.RpcWorker)
 
-        The method creates a short living connection to the Northbound
-        database. Because of multiple controllers can attempt to create the
-        Port Group at the same time the transaction can fail and raise
-        RuntimeError. In such case, we make sure the Port Group was created,
-        otherwise the error is something else and it's raised to the caller.
+    def _setup_hash_ring(self):
+        """Setup the hash ring.
+
+        The first worker to execute this method will remove the hash ring from
+        previous runs as well as start the probing thread for this host.
+        Subsequently workers just need to register themselves to the hash ring.
         """
-        idl = ovsdb_monitor.OvnInitPGNbIdl.from_server(
-            ovn_conf.get_ovn_nb_connection(), 'OVN_Northbound', self)
-        with ovsdb_monitor.short_living_ovsdb_api(
-                impl_idl_ovn.OvsdbNbOvnIdl, idl) as pre_ovn_nb_api:
-            try:
-                create_default_drop_port_group(pre_ovn_nb_api)
-            except RuntimeError as re:
-                if pre_ovn_nb_api.get_port_group(
-                        ovn_const.OVN_DROP_PORT_GROUP_NAME):
-                    LOG.debug(
-                        "Port Group %(port_group)s already exists, "
-                        "ignoring RuntimeError %(error)s", {
-                            'port_group': ovn_const.OVN_DROP_PORT_GROUP_NAME,
-                            'error': re})
-                else:
-                    raise
+        # Attempt to remove the node from the ring when the worker stops
+        sh = oslo_service.SignalHandler()
+        atexit.register(self._remove_node_from_hash_ring)
+        sh.add_handler("SIGTERM", self._remove_node_from_hash_ring)
+        self._init_hash_ring(n_context.get_admin_context())
+        self._register_hash_ring_maintenance()
+
+    def _register_hash_ring_maintenance(self):
+        """Maintenance method for the node OVN hash ring register
+
+        The ``self.node_uuid`` value must be set before calling this method.
+        """
+        self._hash_ring_thread = maintenance.MaintenanceThread()
+        self._hash_ring_thread.add_periodics(
+            maintenance.HashRingHealthCheckPeriodics(
+                self.hash_ring_group, self.node_uuid))
+        self._hash_ring_thread.start()
+        LOG.info('Hash Ring probing thread for node %s has started',
+                 self.node_uuid)
+
+    @db_api.retry_if_session_inactive()
+    @db_api.CONTEXT_WRITER
+    def _init_hash_ring(self, context):
+        LOG.debug('Hash Ring setup using WSGI start time %s',
+                  str(n_utils.ts_to_datetime(self.start_time)))
+        created_at = n_utils.ts_to_datetime(self.start_time)
+        ovn_hash_ring_db.remove_nodes_from_host(
+            context, self.hash_ring_group, created_at=created_at)
+        ovn_hash_ring_db.add_node(
+            context, self.hash_ring_group, self.node_uuid,
+            created_at=created_at)
+        newer_nodes = ovn_hash_ring_db.get_nodes(
+            context, self.hash_ring_group, created_at=created_at)
+        LOG.debug('Hash Ring setup, this worker has detected %s OVN hash '
+                  'ring registers in the database', len(newer_nodes))
 
     def post_fork_initialize(self, resource, event, trigger, payload=None):
-        # NOTE(rtheis): This will initialize all workers (API, RPC,
-        # plugin service and OVN) with OVN IDL connections.
+        # Initialize API/Maintenance workers with OVN IDL connections
+        worker_class = ovn_utils.get_method_class(trigger)
+        if not self.should_post_fork_initialize(worker_class):
+            return
+
         self._post_fork_event.clear()
-        self._wait_for_pg_drop_event()
         self._ovn_client_inst = None
 
-        is_maintenance = (ovn_utils.get_method_class(trigger) ==
-                          worker.MaintenanceWorker)
-        if not is_maintenance:
-            admin_context = n_context.get_admin_context()
-            self.node_uuid = ovn_hash_ring_db.add_node(admin_context,
-                                                       self.hash_ring_group)
+        # Patch python-ovs for fixes not yet released
+        ovs_fixes.apply_ovs_fixes()
 
-        self._nb_ovn, self._sb_ovn = impl_idl_ovn.get_ovn_idls(
-            self, trigger, binding_events=not is_maintenance)
+        if worker_class == wsgi.WorkerService:
+            self._setup_hash_ring()
 
-        # AGENTS must be populated after fork so if ovn-controller is stopped
-        # before a worker handles a get_agents request, we still show agents
-        populate_agents(self)
+        # Initialize singleton agent cache and keep a copy.
+        self._agent_cache = n_agent.AgentCache(self)
+        self.nb_ovn, self.sb_ovn = impl_idl_ovn.get_ovn_idls(self, trigger)
 
         # Override agents API methods
         self.patch_plugin_merge("get_agents", get_agents)
@@ -263,25 +432,34 @@ class OVNMechanismDriver(api.MechanismDriver):
         self.patch_plugin_choose("update_agent", update_agent)
         self.patch_plugin_choose("delete_agent", delete_agent)
 
+        # Override availability zone methods
+        self.patch_plugin_merge("get_availability_zones",
+                                get_availability_zones)
+        self.patch_plugin_choose("validate_availability_zones",
+                                 validate_availability_zones)
+        self.patch_plugin_choose("get_network_availability_zones",
+                                 get_network_availability_zones)
+
         # Now IDL connections can be safely used.
         self._post_fork_event.set()
 
-        if is_maintenance:
+        if worker_class == worker.MaintenanceWorker:
             # Call the synchronization task if its maintenance worker
             # This sync neutron DB to OVN-NB DB only in inconsistent states
             self.nb_synchronizer = ovn_db_sync.OvnNbSynchronizer(
                 self._plugin,
-                self._nb_ovn,
-                self._sb_ovn,
+                self.nb_ovn,
+                self.sb_ovn,
                 ovn_conf.get_ovn_neutron_sync_mode(),
-                self
+                self,
+                is_maintenance=True,
             )
             self.nb_synchronizer.sync()
 
             # This sync neutron DB to OVN-SB DB only in inconsistent states
             self.sb_synchronizer = ovn_db_sync.OvnSbSynchronizer(
                 self._plugin,
-                self._sb_ovn,
+                self.sb_ovn,
                 self
             )
             self.sb_synchronizer.sync()
@@ -289,77 +467,148 @@ class OVNMechanismDriver(api.MechanismDriver):
             self._maintenance_thread = maintenance.MaintenanceThread()
             self._maintenance_thread.add_periodics(
                 maintenance.DBInconsistenciesPeriodics(self._ovn_client))
-            self._maintenance_thread.add_periodics(
-                maintenance.HashRingHealthCheckPeriodics(
-                    self.hash_ring_group))
             self._maintenance_thread.start()
+            LOG.info("Maintenance task thread has started")
 
-    def _wait_for_pg_drop_event(self):
-        """Wait for event that occurs when neutron_pg_drop Port Group exists.
-
-        The method creates a short living connection to the Northbound
-        database. It waits for CREATE event caused by the Port Group.
-        Such event occurs when:
-            1) The Port Group doesn't exist and is created by other process.
-            2) The Port Group already exists and event is emitted when DB copy
-               is available to the IDL.
-        """
-        idl = ovsdb_monitor.OvnInitPGNbIdl.from_server(
-            ovn_conf.get_ovn_nb_connection(), 'OVN_Northbound', self,
-            pg_only=True)
-        with ovsdb_monitor.short_living_ovsdb_api(
-                impl_idl_ovn.OvsdbNbOvnIdl, idl) as ovn_nb_api:
-            ovn_nb_api.idl.neutron_pg_drop_event.wait()
+        LOG.info('%s process has finished the post initialization',
+                 worker_class.__name__)
 
     def _create_security_group_precommit(self, resource, event, trigger,
-                                         **kwargs):
+                                         payload):
+        context = payload.context
+        security_group = payload.latest_state
         ovn_revision_numbers_db.create_initial_revision(
-            kwargs['context'], kwargs['security_group']['id'],
-            ovn_const.TYPE_SECURITY_GROUPS)
+            context, security_group['id'],
+            ovn_const.TYPE_SECURITY_GROUPS,
+            std_attr_id=security_group['standard_attr_id'])
+        for sg_rule in security_group['security_group_rules']:
+            ovn_revision_numbers_db.create_initial_revision(
+                context, sg_rule['id'],
+                ovn_const.TYPE_SECURITY_GROUP_RULES,
+                std_attr_id=sg_rule['standard_attr_id'])
 
-    def _create_security_group(self, resource, event, trigger,
-                               security_group, **kwargs):
-        self._ovn_client.create_security_group(kwargs['context'],
+    def _create_security_group(self, resource, event, trigger, payload):
+        context = payload.context
+        security_group = payload.latest_state
+        self._ovn_client.create_security_group(context,
                                                security_group)
 
-    def _delete_security_group(self, resource, event, trigger,
-                               security_group_id, **kwargs):
-        self._ovn_client.delete_security_group(kwargs['context'],
-                                               security_group_id)
+    def _delete_security_group_precommit(self, resource, event, trigger,
+                                         payload):
+        context = n_context.get_admin_context()
+        security_group_id = payload.resource_id
+        for sg_rule in self._plugin.get_security_group_rules(
+                context, filters={'remote_group_id': [security_group_id]}):
+            self._ovn_client.delete_security_group_rule(context, sg_rule)
 
-    def _update_security_group(self, resource, event, trigger,
-                               security_group, **kwargs):
-        # OVN doesn't care about updates to security groups, only if they
-        # exist or not. We are bumping the revision number here so it
-        # doesn't show as inconsistent to the maintenance periodic task
+    def _delete_security_group(self, resource, event, trigger, payload):
+        context = payload.context
+        security_group_id = payload.resource_id
+        self._ovn_client.delete_security_group(
+            context, security_group_id, delete_sg_rules=True)
+
+    def _update_security_group(self, resource, event, trigger, payload):
+        context = payload.context
+        security_group = payload.latest_state
+
+        old_state, new_state = payload.states
+        old_stateful = ovn_acl.is_sg_stateful(old_state)
+        new_stateful = ovn_acl.is_sg_stateful(new_state)
+        if old_stateful != new_stateful:
+            for rule in self._plugin.get_security_group_rules(
+                    context, {'security_group_id': [security_group['id']]}):
+                self._ovn_client.delete_security_group_rule(context, rule)
+                self._ovn_client.create_security_group_rule(context, rule)
+
         ovn_revision_numbers_db.bump_revision(
-            kwargs['context'], security_group, ovn_const.TYPE_SECURITY_GROUPS)
+            context, security_group, ovn_const.TYPE_SECURITY_GROUPS)
 
-    def _create_sg_rule_precommit(self, resource, event, trigger, **kwargs):
-        sg_rule = kwargs.get('security_group_rule')
-        context = kwargs.get('context')
+    def _create_sg_rule_precommit(self, resource, event, trigger,
+                                  payload):
+        sg_rule = payload.latest_state
+        context = payload.context
         ovn_revision_numbers_db.create_initial_revision(
-            context, sg_rule['id'], ovn_const.TYPE_SECURITY_GROUP_RULES)
+            context, sg_rule['id'], ovn_const.TYPE_SECURITY_GROUP_RULES,
+            std_attr_id=sg_rule['standard_attr_id'])
 
     def _process_sg_rule_notification(
-            self, resource, event, trigger, **kwargs):
+            self, resource, event, trigger, payload):
+        context = payload.context
+        security_group_rule = payload.latest_state
+        security_group_rule_id = payload.resource_id
         if event == events.AFTER_CREATE:
             self._ovn_client.create_security_group_rule(
-                kwargs['context'], kwargs.get('security_group_rule'))
+                context, security_group_rule)
         elif event == events.BEFORE_DELETE:
-            sg_rule = self._plugin.get_security_group_rule(
-                kwargs['context'], kwargs.get('security_group_rule_id'))
+            try:
+                sg_rule = self._plugin.get_security_group_rule(
+                    context, security_group_rule_id)
+            except ext_sg.SecurityGroupRuleNotFound:
+                return
+
+            if sg_rule.get('remote_ip_prefix') is not None:
+                if self._sg_has_rules_with_same_normalized_cidr(sg_rule):
+                    return
             self._ovn_client.delete_security_group_rule(
-                kwargs['context'],
+                context,
                 sg_rule)
+
+    def _sg_has_rules_with_same_normalized_cidr(self, sg_rule):
+        compare_keys = [
+            'ethertype', 'direction', 'protocol',
+            'port_range_min', 'port_range_max']
+        sg_rules = self._plugin.get_security_group_rules(
+            n_context.get_admin_context(),
+            {'security_group_id': [sg_rule['security_group_id']]})
+
+        def _rules_equal(rule1, rule2):
+            return not any(
+                rule1.get(key) != rule2.get(key) for key in compare_keys)
+
+        for rule in sg_rules:
+            if not rule.get('remote_ip_prefix') or rule['id'] == sg_rule['id']:
+                continue
+            if sg_rule.get('normalized_cidr') != rule.get('normalized_cidr'):
+                continue
+            if _rules_equal(sg_rule, rule):
+                return True
+        return False
+
+    def _process_ag_notification(
+            self, resource, event, trigger, payload):
+        context = payload.context
+        address_group = payload.latest_state
+        address_group_id = payload.resource_id
+        if event == events.AFTER_CREATE:
+            ovn_revision_numbers_db.create_initial_revision(
+                context, address_group_id, ovn_const.TYPE_ADDRESS_GROUPS,
+                std_attr_id=address_group['standard_attr_id'])
+            self._ovn_client.create_address_group(
+                context, address_group)
+        elif event == events.AFTER_UPDATE:
+            self._ovn_client.update_address_group(
+                context, address_group)
+        elif event == events.AFTER_DELETE:
+            self._ovn_client.delete_address_group(
+                context,
+                address_group_id)
 
     def _is_network_type_supported(self, network_type):
         return (network_type in [const.TYPE_LOCAL,
                                  const.TYPE_FLAT,
                                  const.TYPE_GENEVE,
+                                 const.TYPE_VXLAN,
                                  const.TYPE_VLAN])
 
+    def _get_max_tunid(self):
+        try:
+            return int(self.nb_ovn.nb_global.options.get('max_tunid'))
+        except (ValueError, TypeError):
+            # max_tunid may be absent in older OVN versions, return None
+            pass
+
     def _validate_network_segments(self, network_segments):
+        max_tunid = self._get_max_tunid()
         for network_segment in network_segments:
             network_type = network_segment['network_type']
             segmentation_id = network_segment['segmentation_id']
@@ -374,6 +623,70 @@ class OVNMechanismDriver(api.MechanismDriver):
             if not self._is_network_type_supported(network_type):
                 msg = _('Network type %s is not supported') % network_type
                 raise n_exc.InvalidInput(error_message=msg)
+            if segmentation_id and max_tunid and segmentation_id > max_tunid:
+                m = (
+                    _('Segmentation ID should be lower or equal to %d') %
+                    max_tunid
+                )
+                raise n_exc.InvalidInput(error_message=m)
+
+    def _validate_allowed_address_pairs(self, resource, event, trigger,
+                                        payload):
+        context = payload.desired_state['context']
+        allowed_address_pairs = payload.desired_state['allowed_address_pairs']
+        network_id = payload.desired_state['network_id']
+        if not allowed_address_pairs:
+            return
+
+        port_allowed_address_pairs_ip_addresses = [
+            netaddr.IPNetwork(pair['ip_address'])
+            for pair in allowed_address_pairs]
+
+        distributed_ports = self._plugin.get_ports(
+            context.elevated(),
+            filters={'device_owner': [const.DEVICE_OWNER_DISTRIBUTED],
+                     'network_id': [network_id]})
+        if not distributed_ports:
+            return
+
+        def _get_common_ips(ip_addresses, ip_networks):
+            common_ips = set()
+            for ip_address in ip_addresses:
+                if any(ip_address in ip_net for ip_net in ip_networks):
+                    common_ips.add(str(ip_address))
+            return common_ips
+
+        for distributed_port in distributed_ports:
+            distributed_port_ip_addresses = [
+                netaddr.IPAddress(fixed_ip['ip_address']) for fixed_ip in
+                distributed_port.get('fixed_ips', [])]
+
+            common_ips = _get_common_ips(
+                distributed_port_ip_addresses,
+                port_allowed_address_pairs_ip_addresses)
+
+            if common_ips:
+                err_msg = (
+                    _("IP addresses '%s' already used by the '%s' port(s) in "
+                      "the same network" % (";".join(common_ips),
+                                            const.DEVICE_OWNER_DISTRIBUTED))
+                )
+                raise n_exc.InvalidInput(error_message=err_msg)
+
+    def create_segment_provnet_port(self, resource, event, trigger,
+                                    payload=None):
+        segment = payload.latest_state
+        if not segment.get(segment_def.PHYSICAL_NETWORK):
+            return
+        self._ovn_client.create_provnet_port(segment['network_id'], segment)
+
+    def delete_segment_provnet_port(self, resource, event, trigger,
+                                    payload):
+        # NOTE(mjozefcz): Get the last state of segment resource.
+        segment = payload.states[-1]
+        if segment.get(segment_def.PHYSICAL_NETWORK):
+            self._ovn_client.delete_provnet_port(
+                segment['network_id'], segment)
 
     def create_network_precommit(self, context):
         """Allocate resources for a new network.
@@ -388,8 +701,9 @@ class OVNMechanismDriver(api.MechanismDriver):
         """
         self._validate_network_segments(context.network_segments)
         ovn_revision_numbers_db.create_initial_revision(
-            context._plugin_context, context.current['id'],
-            ovn_const.TYPE_NETWORKS)
+            context.plugin_context, context.current['id'],
+            ovn_const.TYPE_NETWORKS,
+            std_attr_id=context.current['standard_attr_id'])
 
     def create_network_postcommit(self, context):
         """Create a network.
@@ -403,7 +717,7 @@ class OVNMechanismDriver(api.MechanismDriver):
         cause the deletion of the resource.
         """
         network = context.current
-        self._ovn_client.create_network(context._plugin_context, network)
+        self._ovn_client.create_network(context.plugin_context, network)
 
     def update_network_precommit(self, context):
         """Update resources of a network.
@@ -439,12 +753,8 @@ class OVNMechanismDriver(api.MechanismDriver):
         network state.  It is up to the mechanism driver to ignore
         state or state changes that it does not know or care about.
         """
-        # FIXME(lucasagomes): We can delete this conditional after
-        # https://bugs.launchpad.net/neutron/+bug/1739798 is fixed.
-        if context._plugin_context.session.is_active:
-            return
         self._ovn_client.update_network(
-            context._plugin_context, context.current,
+            context.plugin_context, context.current,
             original_network=context.original)
 
     def delete_network_postcommit(self, context):
@@ -460,26 +770,40 @@ class OVNMechanismDriver(api.MechanismDriver):
         deleted.
         """
         self._ovn_client.delete_network(
-            context._plugin_context,
+            context.plugin_context,
             context.current['id'])
 
     def create_subnet_precommit(self, context):
         ovn_revision_numbers_db.create_initial_revision(
-            context._plugin_context, context.current['id'],
-            ovn_const.TYPE_SUBNETS)
+            context.plugin_context, context.current['id'],
+            ovn_const.TYPE_SUBNETS,
+            std_attr_id=context.current['standard_attr_id'])
 
     def create_subnet_postcommit(self, context):
-        self._ovn_client.create_subnet(context._plugin_context,
+        self._ovn_client.create_subnet(context.plugin_context,
                                        context.current,
                                        context.network.current)
 
     def update_subnet_postcommit(self, context):
         self._ovn_client.update_subnet(
-            context._plugin_context, context.current, context.network.current)
+            context.plugin_context, context.current, context.network.current)
 
     def delete_subnet_postcommit(self, context):
-        self._ovn_client.delete_subnet(context._plugin_context,
+        self._ovn_client.delete_subnet(context.plugin_context,
                                        context.current['id'])
+
+    def _validate_port_extra_dhcp_opts(self, port):
+        result = ovn_utils.validate_port_extra_dhcp_opts(port)
+        if not result.failed:
+            return
+        ipv4_opts = ', '.join(result.invalid_ipv4)
+        ipv6_opts = ', '.join(result.invalid_ipv6)
+        LOG.info('The following extra DHCP options for port %(port_id)s '
+                 'are not supported by OVN. IPv4: "%(ipv4_opts)s" and '
+                 'IPv6: "%(ipv6_opts)s"',
+                 {'port_id': port['id'],
+                  'ipv4_opts': ipv4_opts,
+                  'ipv6_opts': ipv6_opts})
 
     def create_port_precommit(self, context):
         """Allocate resources for a new port.
@@ -495,19 +819,28 @@ class OVNMechanismDriver(api.MechanismDriver):
         if ovn_utils.is_lsp_ignored(port):
             return
         ovn_utils.validate_and_get_data_from_binding_profile(port)
+        self._validate_port_extra_dhcp_opts(port)
         if self._is_port_provisioning_required(port, context.host):
-            self._insert_port_provisioning_block(context._plugin_context,
+            self._insert_port_provisioning_block(context.plugin_context,
                                                  port['id'])
 
         ovn_revision_numbers_db.create_initial_revision(
-            context._plugin_context, port['id'], ovn_const.TYPE_PORTS)
+            context.plugin_context, port['id'], ovn_const.TYPE_PORTS,
+            std_attr_id=context.current['standard_attr_id'])
 
         # in the case of router ports we also need to
         # track the creation and update of the LRP OVN objects
-        if ovn_utils.is_lsp_router_port(port):
+        if (ovn_utils.is_lsp_router_port(port) and
+                self._is_ovn_router_flavor_port(context, port)):
             ovn_revision_numbers_db.create_initial_revision(
-                context._plugin_context, port['id'],
-                ovn_const.TYPE_ROUTER_PORTS)
+                context.plugin_context, port['id'],
+                ovn_const.TYPE_ROUTER_PORTS,
+                std_attr_id=context.current['standard_attr_id'])
+
+    def _is_ovn_router_flavor_port(self, context, port):
+        router_obj = router.Router.get_object(context.plugin_context,
+                                              id=port['device_id'])
+        return ovn_utils.is_ovn_provider_router(router_obj)
 
     def _is_port_provisioning_required(self, port, host, original_host=None):
         vnic_type = port.get(portbindings.VNIC_TYPE, portbindings.VNIC_NORMAL)
@@ -532,7 +865,7 @@ class OVNMechanismDriver(api.MechanismDriver):
                       port['id'])
             return False
 
-        if not self._sb_ovn.chassis_exists(host):
+        if not self.sb_ovn.chassis_exists(host):
             LOG.debug('No provisioning block for port %(port_id)s since no '
                       'OVN chassis for host: %(host)s',
                       {'port_id': port['id'], 'host': host})
@@ -575,6 +908,35 @@ class OVNMechanismDriver(api.MechanismDriver):
                     'device_owner': original_port['device_owner']})
             raise OVNPortUpdateError(resource='port', msg=msg)
 
+    def _ovn_update_port(self, plugin_context, port, original_port,
+                         retry_on_revision_mismatch):
+        try:
+            self._ovn_client.update_port(plugin_context, port,
+                                         port_object=original_port)
+        except ovn_exceptions.RevisionConflict:
+            if retry_on_revision_mismatch:
+                # NOTE(slaweq): I know this is terrible hack but there is no
+                # other way to workaround possible race between port update
+                # event from the OVN (port down on the src node) and API
+                # request from nova-compute to activate binding of the port on
+                # the dest node.
+                original_port_migrating_to = original_port.get(
+                    portbindings.PROFILE, {}).get('migrating_to')
+                port_host_id = port.get(portbindings.HOST_ID)
+                if (original_port_migrating_to is not None and
+                        original_port_migrating_to == port_host_id):
+                    LOG.debug("Revision number of the port %s has changed "
+                              "probably during live migration. Retrying "
+                              "update port in OVN.", port)
+                    db_port = self._plugin.get_port(plugin_context,
+                                                    port['id'])
+                    port['revision_number'] = db_port['revision_number']
+                    self._ovn_update_port(plugin_context, port, original_port,
+                                          retry_on_revision_mismatch=False)
+        except ovn_revision_numbers_db.StandardAttributeIDNotFound:
+            LOG.debug("Standard attribute was not found for port %s. It was "
+                      "possibly deleted concurrently.", port['id'])
+
     def create_port_postcommit(self, context):
         """Create a port.
 
@@ -587,7 +949,7 @@ class OVNMechanismDriver(api.MechanismDriver):
         """
         port = copy.deepcopy(context.current)
         port['network'] = context.network.current
-        self._ovn_client.create_port(context._plugin_context, port)
+        self._ovn_client.create_port(context.plugin_context, port)
         self._notify_dhcp_updated(port['id'])
 
     def update_port_precommit(self, context):
@@ -609,18 +971,23 @@ class OVNMechanismDriver(api.MechanismDriver):
         original_port = context.original
         self._validate_ignored_port(port, original_port)
         ovn_utils.validate_and_get_data_from_binding_profile(port)
+        self._validate_port_extra_dhcp_opts(port)
+        ovn_utils.validate_port_binding_and_virtual_port(
+            context, self.nb_ovn, self._plugin, port, original_port)
         if self._is_port_provisioning_required(port, context.host,
                                                context.original_host):
-            self._insert_port_provisioning_block(context._plugin_context,
+            self._insert_port_provisioning_block(context.plugin_context,
                                                  port['id'])
 
-        if ovn_utils.is_lsp_router_port(port):
+        if (ovn_utils.is_lsp_router_port(port) and
+                self._is_ovn_router_flavor_port(context, port)):
             # handle the case when an existing port is added to a
             # logical router so we need to track the creation of the lrp
             if not ovn_utils.is_lsp_router_port(original_port):
                 ovn_revision_numbers_db.create_initial_revision(
-                    context._plugin_context, port['id'],
-                    ovn_const.TYPE_ROUTER_PORTS, may_exist=True)
+                    context.plugin_context, port['id'],
+                    ovn_const.TYPE_ROUTER_PORTS, may_exist=True,
+                    std_attr_id=context.current['standard_attr_id'])
 
     def update_port_postcommit(self, context):
         """Update a port.
@@ -647,13 +1014,15 @@ class OVNMechanismDriver(api.MechanismDriver):
         # the port status from DOWN to UP in order to generate 'fake'
         # vif-interface-plugged event. This workaround is needed to
         # perform live-migration with live_migration_wait_for_vif_plug=True.
-        if ((port['status'] == const.PORT_STATUS_DOWN and
-             ovn_const.MIGRATING_ATTR in port[portbindings.PROFILE].keys() and
-             port[portbindings.VIF_TYPE] == portbindings.VIF_TYPE_OVS)):
+        if (port['status'] == const.PORT_STATUS_DOWN and
+            ovn_const.MIGRATING_ATTR in port[portbindings.PROFILE].keys() and
+            port[portbindings.VIF_TYPE] in (
+                 portbindings.VIF_TYPE_OVS,
+                 portbindings.VIF_TYPE_VHOST_USER)):
             LOG.info("Setting port %s status from DOWN to UP in order "
                      "to emit vif-interface-plugged event.",
                      port['id'])
-            self._plugin.update_port_status(context._plugin_context,
+            self._plugin.update_port_status(context.plugin_context,
                                             port['id'],
                                             const.PORT_STATUS_ACTIVE)
             # The revision has been changed. In the meantime
@@ -662,8 +1031,8 @@ class OVNMechanismDriver(api.MechanismDriver):
             # will fail that OVN has port with bigger revision.
             return
 
-        self._ovn_client.update_port(context._plugin_context, port,
-                                     port_object=original_port)
+        self._ovn_update_port(context.plugin_context, port, original_port,
+                              retry_on_revision_mismatch=True)
         self._notify_dhcp_updated(port['id'])
 
     def delete_port_postcommit(self, context):
@@ -680,9 +1049,7 @@ class OVNMechanismDriver(api.MechanismDriver):
         """
         port = copy.deepcopy(context.current)
         port['network'] = context.network.current
-        # FIXME(lucasagomes): PortContext does not have a session, therefore
-        # we need to use the _plugin_context attribute.
-        self._ovn_client.delete_port(context._plugin_context, port['id'],
+        self._ovn_client.delete_port(context.plugin_context, port['id'],
                                      port_object=port)
 
     def bind_port(self, context):
@@ -734,27 +1101,49 @@ class OVNMechanismDriver(api.MechanismDriver):
                       {'port_id': port['id'], 'vnic_type': vnic_type})
             return
 
-        capabilities = ovn_utils.get_port_capabilities(port)
-        if (vnic_type in ovn_const.EXTERNAL_PORT_TYPES and
-                ovn_const.PORT_CAP_SWITCHDEV not in capabilities):
+        if ovn_utils.is_port_external(port):
             LOG.debug("Refusing to bind port due to unsupported vnic_type: %s "
                       "with no switchdev capability", vnic_type)
             return
 
         # OVN chassis information is needed to ensure a valid port bind.
         # Collect port binding data and refuse binding if the OVN chassis
-        # cannot be found.
-        chassis_physnets = []
+        # cannot be found or is dead.
         try:
-            datapath_type, iface_types, chassis_physnets = (
-                self._sb_ovn.get_chassis_data_for_ml2_bind_port(context.host))
-            iface_types = iface_types.split(',') if iface_types else []
-        except RuntimeError:
-            LOG.debug('Refusing to bind port %(port_id)s due to '
-                      'no OVN chassis for host: %(host)s',
-                      {'port_id': port['id'], 'host': context.host})
+            # The PortContext host property contains special handling that
+            # we need to take into account, thus passing both the port Dict
+            # and the PortContext instance so that the helper can decide
+            # which to use.
+            bind_host = ovn_utils.determine_bind_host(self._sb_ovn, port,
+                                                      port_context=context)
+        except n_exc.InvalidInput as e:
+            # The port binding profile is validated both on port creation and
+            # update.  The new rules apply to a VNIC type previously not
+            # consumed by the OVN mechanism driver, so this should never
+            # happen.
+            LOG.error('Validation of binding profile unexpectedly failed '
+                      'while attempting to bind port %s', port['id'])
+            raise e
+        agents = n_agent.AgentCache().get_agents(
+            {'host': bind_host,
+             'agent_type': ovn_const.OVN_CONTROLLER_TYPES})
+        if not agents:
+            LOG.warning('Refusing to bind port %(port_id)s due to '
+                        'no OVN chassis for host: %(host)s',
+                        {'port_id': port['id'], 'host': bind_host})
             return
-
+        agent = agents[0]
+        if not agent.alive:
+            LOG.warning("Refusing to bind port %(pid)s to dead agent:  "
+                        "%(agent)s", {'pid': context.current['id'],
+                                      'agent': agent})
+            return
+        chassis = agent.chassis
+        other_config = ovn_utils.get_ovn_chassis_other_config(chassis)
+        datapath_type = other_config.get(ovn_const.OVN_DATAPATH_TYPE, '')
+        iface_types = other_config.get('iface-types', '')
+        iface_types = iface_types.split(',') if iface_types else []
+        chassis_physnets = self.sb_ovn._get_chassis_physnets(chassis)
         for segment_to_bind in context.segments_to_bind:
             network_type = segment_to_bind['network_type']
             segmentation_id = segment_to_bind['segmentation_id']
@@ -764,7 +1153,7 @@ class OVNMechanismDriver(api.MechanismDriver):
                       'segmentation ID %(segmentation_id)s, '
                       'physical network %(physical_network)s',
                       {'port_id': port['id'],
-                       'host': context.host,
+                       'host': bind_host,
                        'network_type': network_type,
                        'segmentation_id': segmentation_id,
                        'physical_network': physical_network})
@@ -779,7 +1168,7 @@ class OVNMechanismDriver(api.MechanismDriver):
                          {'port_id': port['id'],
                           'network_type': network_type})
 
-            if ((network_type in ['flat', 'vlan']) and
+            if ((network_type in [const.TYPE_FLAT, const.TYPE_VLAN]) and
                     (physical_network not in chassis_physnets)):
                 LOG.info('Refusing to bind port %(port_id)s on '
                          'host %(host)s due to the OVN chassis '
@@ -787,7 +1176,7 @@ class OVNMechanismDriver(api.MechanismDriver):
                          '%(chassis_physnets)s not supporting '
                          'physical network: %(physical_network)s',
                          {'port_id': port['id'],
-                          'host': context.host,
+                          'host': bind_host,
                           'chassis_physnets': chassis_physnets,
                           'physical_network': physical_network})
             else:
@@ -798,16 +1187,59 @@ class OVNMechanismDriver(api.MechanismDriver):
                     vif_type = portbindings.VIF_TYPE_VHOST_USER
                     port[portbindings.VIF_DETAILS].update({
                         portbindings.VHOST_USER_SOCKET: vhost_user_socket})
-                    vif_details = dict(self.vif_details[vif_type])
+                    vif_details = copy.deepcopy(self.vif_details[vif_type])
                     vif_details[portbindings.VHOST_USER_SOCKET] = (
                         vhost_user_socket)
+                elif (vnic_type == portbindings.VNIC_VIRTIO_FORWARDER):
+                    vhost_user_socket = ovn_utils.ovn_vhu_sockpath(
+                        ovn_conf.get_ovn_vhost_sock_dir(), port['id'])
+                    vif_type = portbindings.VIF_TYPE_AGILIO_OVS
+                    port[portbindings.VIF_DETAILS].update({
+                        portbindings.VHOST_USER_SOCKET: vhost_user_socket})
+                    vif_details = copy.deepcopy(self.vif_details[vif_type])
+                    vif_details[portbindings.VHOST_USER_SOCKET] = (
+                        vhost_user_socket)
+                    vif_details[portbindings.VHOST_USER_MODE] = (
+                        portbindings.VHOST_USER_MODE_CLIENT)
                 else:
                     vif_type = portbindings.VIF_TYPE_OVS
-                    vif_details = self.vif_details[vif_type]
+                    vif_details = copy.deepcopy(self.vif_details[vif_type])
 
+                ovn_bridge = ovn_utils.get_ovn_bridge_from_chassis_private(
+                    agent.chassis_private)
+                dp_type = ovn_utils.get_datapath_type(bind_host, self.sb_ovn)
+                vif_details.update({
+                    portbindings.VIF_DETAILS_BRIDGE_NAME: ovn_bridge,
+                    portbindings.OVS_DATAPATH_TYPE: dp_type,
+                })
                 context.set_binding(segment_to_bind[api.ID], vif_type,
                                     vif_details)
                 break
+
+    def update_virtual_port_host(self, port_id, chassis_id):
+        if chassis_id:
+            hostname = self.sb_ovn.db_get(
+                'Chassis', chassis_id, 'hostname').execute(check_error=True)
+        else:
+            hostname = ''
+
+        # Updates neutron database with hostname for virtual port
+        context = n_context.get_admin_context()
+        self._plugin.update_virtual_port_host(context, port_id, hostname)
+        db_port = self._plugin.get_port(context, port_id)
+        check_rev_cmd = self.nb_ovn.check_revision_number(
+            port_id, db_port, ovn_const.TYPE_PORTS)
+        # Updates OVN NB database with hostname for lsp virtual port
+        with self.nb_ovn.transaction(check_error=True) as txn:
+            ext_ids = ('external_ids',
+                       {ovn_const.OVN_HOST_ID_EXT_ID_KEY: hostname})
+            txn.add(
+                self.nb_ovn.db_set(
+                    'Logical_Switch_Port', port_id, ext_ids))
+            txn.add(check_rev_cmd)
+        if check_rev_cmd.result == ovn_const.TXN_COMMITTED:
+            ovn_revision_numbers_db.bump_revision(context, db_port,
+                                                  ovn_const.TYPE_PORTS)
 
     def get_workers(self):
         """Get any worker instances that should have their own process
@@ -820,15 +1252,12 @@ class OVNMechanismDriver(api.MechanismDriver):
 
     def _update_dnat_entry_if_needed(self, port_id, up=True):
         """Update DNAT entry if using distributed floating ips."""
-        if not ovn_conf.is_ovn_distributed_floating_ip():
-            return
+        if not self.nb_ovn:
+            self.nb_ovn = self._ovn_client._nb_idl
 
-        if not self._nb_ovn:
-            self._nb_ovn = self._ovn_client._nb_idl
-
-        nat = self._nb_ovn.db_find('NAT',
-                                   ('logical_port', '=', port_id),
-                                   ('type', '=', 'dnat_and_snat')).execute()
+        nat = self.nb_ovn.db_find('NAT',
+                                  ('logical_port', '=', port_id),
+                                  ('type', '=', 'dnat_and_snat')).execute()
         if not nat:
             return
         # We take first entry as one port can only have one FIP
@@ -837,22 +1266,26 @@ class OVNMechanismDriver(api.MechanismDriver):
         # TODO(dalvarez): Remove this code in T cycle when we're sure that
         # all DNAT entries have the external_id.
         if not nat['external_ids'].get(ovn_const.OVN_FIP_EXT_MAC_KEY):
-            self._nb_ovn.db_set('NAT', nat['_uuid'],
-                                ('external_ids',
+            self.nb_ovn.db_set('NAT', nat['_uuid'],
+                               ('external_ids',
                                 {ovn_const.OVN_FIP_EXT_MAC_KEY:
                                  nat['external_mac']})).execute()
 
-        if up:
-            mac = nat['external_ids'][ovn_const.OVN_FIP_EXT_MAC_KEY]
-            LOG.debug("Setting external_mac of port %s to %s",
-                      port_id, mac)
-            self._nb_ovn.db_set(
-                'NAT', nat['_uuid'],
-                ('external_mac', mac)).execute(check_error=True)
+        if ovn_conf.is_ovn_distributed_floating_ip():
+            if up:
+                mac = nat['external_ids'].get(ovn_const.OVN_FIP_EXT_MAC_KEY)
+                if mac and nat['external_mac'] != mac:
+                    LOG.debug("Setting external_mac of port %s to %s",
+                              port_id, mac)
+                    self.nb_ovn.db_set(
+                        'NAT', nat['_uuid'], ('external_mac', mac)).execute(
+                            check_error=True)
         else:
-            LOG.debug("Clearing up external_mac of port %s", port_id)
-            self._nb_ovn.db_clear(
-                'NAT', nat['_uuid'], 'external_mac').execute(check_error=True)
+            if nat['external_mac']:
+                LOG.debug("Clearing up external_mac of port %s", port_id)
+                self.nb_ovn.db_clear(
+                    'NAT', nat['_uuid'], 'external_mac').execute(
+                        check_error=True)
 
     def _should_notify_nova(self, db_port):
         # NOTE(twilson) It is possible for a test to override a config option
@@ -870,7 +1303,6 @@ class OVNMechanismDriver(api.MechanismDriver):
         LOG.info("OVN reports status up for port: %s", port_id)
 
         self._update_dnat_entry_if_needed(port_id)
-        self._wait_for_metadata_provisioned_if_needed(port_id)
 
         admin_context = n_context.get_admin_context()
         provisioning_blocks.provisioning_complete(
@@ -883,7 +1315,7 @@ class OVNMechanismDriver(api.MechanismDriver):
             # NOTE(lucasagomes): Router ports in OVN is never bound
             # to a host given their decentralized nature. By calling
             # provisioning_complete() - as above - don't do it for us
-            # becasue the router ports are unbind so, for OVN we are
+            # because the router ports are unbind so, for OVN we are
             # forcing the status here. Maybe it's something that we can
             # change in core Neutron in the future.
             db_port = ml2_db.get_port(admin_context, port_id)
@@ -897,9 +1329,27 @@ class OVNMechanismDriver(api.MechanismDriver):
                                                 const.PORT_STATUS_ACTIVE)
             elif self._should_notify_nova(db_port):
                 self._plugin.nova_notifier.notify_port_active_direct(db_port)
+
+            self._ovn_client.update_lsp_host_info(admin_context, db_port)
         except (os_db_exc.DBReferenceError, n_exc.PortNotFound):
             LOG.debug('Port not found during OVN status up report: %s',
                       port_id)
+
+        # NOTE(lucasagomes): If needed, re-sync the HA Chassis Group for
+        # the external port removing the chassis which the port is bound
+        # to from the group so the external port does not live in the
+        # same chassis as the VM
+        if (ovn_utils.is_port_external(db_port) and
+                self.sb_ovn.get_extport_chassis_from_cms_options()):
+            try:
+                with self.nb_ovn.transaction(check_error=True) as txn:
+                    ovn_utils.sync_ha_chassis_group_network(
+                        admin_context, self.nb_ovn, self.sb_ovn,
+                        db_port['id'], db_port['network_id'], txn)
+            except Exception as e:
+                LOG.error('Error while syncing the HA Chassis Group for the '
+                          'external port %s during set port status up. '
+                          'Error: %s', db_port['id'], e)
 
     def set_port_status_down(self, port_id):
         # Port provisioning is required now that OVN has reported that the
@@ -921,20 +1371,30 @@ class OVNMechanismDriver(api.MechanismDriver):
 
             if self._should_notify_nova(db_port):
                 self._plugin.nova_notifier.record_port_status_changed(
-                    db_port, const.PORT_STATUS_ACTIVE, const.PORT_STATUS_DOWN,
+                    db_port, const.PORT_STATUS_DOWN, const.PORT_STATUS_ACTIVE,
                     None)
                 self._plugin.nova_notifier.send_port_status(
                     None, None, db_port)
+
+            self._ovn_client.update_lsp_host_info(
+                admin_context, db_port, up=False)
         except (os_db_exc.DBReferenceError, n_exc.PortNotFound):
             LOG.debug("Port not found during OVN status down report: %s",
                       port_id)
 
     def delete_mac_binding_entries(self, external_ip):
         """Delete all MAC_Binding entries associated to this IP address"""
-        mac_binds = self._sb_ovn.db_find_rows(
-            'MAC_Binding', ('ip', '=', external_ip)).execute() or []
-        for entry in mac_binds:
-            self._sb_ovn.db_destroy('MAC_Binding', entry.uuid).execute()
+        cmd = [
+            "OVN_Southbound", {
+                "op": "delete",
+                "table": "MAC_Binding",
+                "where": [
+                    ["ip", "==", external_ip]
+                ]
+            }
+        ]
+
+        return ovn_utils.OvsdbClientTransactCommand.run(cmd)
 
     def update_segment_host_mapping(self, host, phy_nets):
         """Update SegmentHostMapping in DB"""
@@ -947,156 +1407,36 @@ class OVNMechanismDriver(api.MechanismDriver):
 
         available_seg_ids = {
             segment['id'] for segment in segments
-            if segment['network_type'] in ('flat', 'vlan')}
+            if segment['network_type'] in (const.TYPE_FLAT, const.TYPE_VLAN)}
 
         segment_service_db.update_segment_host_mapping(
             ctx, host, available_seg_ids)
 
     def _add_segment_host_mapping_for_segment(self, resource, event, trigger,
-                                              context, segment):
+                                              payload=None):
+        context = payload.context
+        segment = payload.latest_state
         phynet = segment.physical_network
         if not phynet:
             return
 
-        host_phynets_map = self._sb_ovn.get_chassis_hostname_and_physnets()
+        host_phynets_map = self.sb_ovn.get_chassis_hostname_and_physnets()
         hosts = {host for host, phynets in host_phynets_map.items()
                  if phynet in phynets}
         segment_service_db.map_segment_to_hosts(context, segment.id, hosts)
 
-    def _wait_for_metadata_provisioned_if_needed(self, port_id):
-        """Wait for metadata service to be provisioned.
+    def check_segment_for_agent(self, segment, agent):
+        """Check if the OVN controller agent br mappings has segment physnet
 
-        Wait until metadata service has been setup for this port in the chassis
-        it resides. If metadata is disabled or DHCP is not enabled for its
-        subnets, this function will return right away.
+        Only segments on physical networks (flat or vlan) can be associated
+        to a host.
         """
-        if ovn_conf.is_ovn_metadata_enabled() and self._sb_ovn:
-            # Wait until metadata service has been setup for this port in the
-            # chassis it resides.
-            result = (
-                self._sb_ovn.get_logical_port_chassis_and_datapath(port_id))
-            if not result:
-                LOG.warning("Logical port %s doesn't exist in OVN", port_id)
-                return
-            chassis, datapath = result
-            if not chassis:
-                LOG.warning("Logical port %s is not bound to a "
-                            "chassis", port_id)
-                return
+        if agent['agent_type'] not in ovn_const.OVN_CONTROLLER_TYPES:
+            return False
 
-            # Check if the port belongs to some IPv4 subnet with DHCP enabled.
-            context = n_context.get_admin_context()
-            port = self._plugin.get_port(context, port_id)
-            port_subnet_ids = set(
-                ip['subnet_id'] for ip in port['fixed_ips'] if
-                n_utils.get_ip_version(ip['ip_address']) == const.IP_VERSION_4)
-            if not port_subnet_ids:
-                # The port doesn't belong to any IPv4 subnet
-                return
-
-            subnets = self._plugin.get_subnets(context, filters=dict(
-                network_id=[port['network_id']], ip_version=[4],
-                enable_dhcp=True))
-
-            subnet_ids = set(
-                s['id'] for s in subnets if s['id'] in port_subnet_ids)
-            if not subnet_ids:
-                return
-
-            try:
-                n_utils.wait_until_true(
-                    lambda: datapath in
-                    self._sb_ovn.get_chassis_metadata_networks(chassis),
-                    timeout=METADATA_READY_WAIT_TIMEOUT,
-                    exception=MetadataServiceReadyWaitTimeoutException)
-            except MetadataServiceReadyWaitTimeoutException:
-                # If we reach this point it means that metadata agent didn't
-                # provision the datapath for this port on its chassis. Either
-                # the agent is not running or it crashed. We'll complete the
-                # provisioning block though.
-                LOG.warning("Metadata service is not ready for port %s, check"
-                            " networking-ovn-metadata-agent status/logs.",
-                            port_id)
-
-    def agent_alive(self, chassis, type_):
-        nb_cfg = chassis.nb_cfg
-        key = ovn_const.OVN_LIVENESS_CHECK_EXT_ID_KEY
-        if type_ == ovn_const.OVN_METADATA_AGENT:
-            nb_cfg = int(chassis.external_ids.get(
-                ovn_const.OVN_AGENT_METADATA_SB_CFG_KEY, 0))
-            key = ovn_const.METADATA_LIVENESS_CHECK_EXT_ID_KEY
-
-        try:
-            updated_at = timeutils.parse_isotime(chassis.external_ids[key])
-        except KeyError:
-            updated_at = timeutils.utcnow(with_timezone=True)
-
-        # Allow a maximum of 1 difference between expected and read values
-        # to avoid false positives.
-        if self._nb_ovn.nb_global.nb_cfg - nb_cfg <= 1:
-            # update the time of our successful check
-            value = timeutils.utcnow(with_timezone=True).isoformat()
-            self._sb_ovn.db_set('Chassis', chassis.uuid,
-                                ('external_ids', {key: value})).execute(
-                check_error=True)
-            return True
-        now = timeutils.utcnow(with_timezone=True)
-
-        if (now - updated_at).total_seconds() < cfg.CONF.agent_down_time:
-            # down, but not yet timed out
-            return True
-        return False
-
-    def _format_agent_info(self, chassis, binary, agent_id, type_,
-                           description, alive):
-        return {
-            'binary': binary,
-            'host': chassis.hostname,
-            'heartbeat_timestamp': timeutils.utcnow(),
-            'availability_zone': 'n/a',
-            'topic': 'n/a',
-            'description': description,
-            'configurations': {
-                'chassis_name': chassis.name,
-                'bridge-mappings':
-                    chassis.external_ids.get('ovn-bridge-mappings', '')},
-            'start_flag': True,
-            'agent_type': type_,
-            'id': agent_id,
-            'alive': alive,
-            'admin_state_up': True}
-
-    def agents_from_chassis(self, chassis):
-        agent_dict = {}
-
-        # Check for ovn-controller / ovn-controller gateway
-        agent_type = ovn_const.OVN_CONTROLLER_AGENT
-        # Only the chassis name stays consistent after ovn-controller restart
-        agent_id = chassis.name
-        if ('enable-chassis-as-gw' in
-                chassis.external_ids.get('ovn-cms-options', [])):
-            agent_type = ovn_const.OVN_CONTROLLER_GW_AGENT
-
-        alive = self.agent_alive(chassis, agent_type)
-        description = chassis.external_ids.get(
-            ovn_const.OVN_AGENT_DESC_KEY, '')
-        agent_dict[agent_id] = self._format_agent_info(
-            chassis, 'ovn-controller', agent_id, agent_type, description,
-            alive)
-
-        # Check for the metadata agent
-        metadata_agent_id = chassis.external_ids.get(
-            ovn_const.OVN_AGENT_METADATA_ID_KEY)
-        if metadata_agent_id:
-            agent_type = ovn_const.OVN_METADATA_AGENT
-            alive = self.agent_alive(chassis, agent_type)
-            description = chassis.external_ids.get(
-                ovn_const.OVN_AGENT_METADATA_DESC_KEY, '')
-            agent_dict[metadata_agent_id] = self._format_agent_info(
-                chassis, 'networking-ovn-metadata-agent',
-                metadata_agent_id, agent_type, description, alive)
-
-        return agent_dict
+        br_map = agent.get('configurations', {}).get('bridge-mappings', '')
+        mapping_dict = helpers.parse_mappings(br_map.split(','))
+        return segment['physical_network'] in mapping_dict
 
     def patch_plugin_merge(self, method_name, new_fn, op=operator.add):
         old_method = getattr(self._plugin, method_name)
@@ -1117,62 +1457,118 @@ class OVNMechanismDriver(api.MechanismDriver):
             new_method = types.MethodType(new_fn, self._plugin)
             try:
                 return new_method(*args, _driver=self, **kwargs)
-            except KeyError:
+            except n_exc.NotFound:
                 return old_method(*args, **kwargs)
 
         setattr(self._plugin, method_name, types.MethodType(fn, self._plugin))
 
-    def ping_chassis(self):
-        """Update NB_Global.nb_cfg so that Chassis.nb_cfg will increment"""
-        last_ping = self._nb_ovn.nb_global.external_ids.get(
+    def ping_all_chassis(self):
+        """Update NB_Global.nb_cfg so that Chassis.nb_cfg will increment
+
+        :returns: (bool) True if nb_cfg was updated. False if it was updated
+            recently and this call didn't trigger any update.
+        """
+        last_ping = self.nb_ovn.nb_global.external_ids.get(
             ovn_const.OVN_LIVENESS_CHECK_EXT_ID_KEY)
         if last_ping:
             interval = max(cfg.CONF.agent_down_time // 2, 1)
             next_ping = (timeutils.parse_isotime(last_ping) +
                          datetime.timedelta(seconds=interval))
             if timeutils.utcnow(with_timezone=True) < next_ping:
-                return
+                return False
 
-        with self._nb_ovn.create_transaction(check_error=True,
-                                             bump_nb_cfg=True) as txn:
-            txn.add(self._nb_ovn.check_liveness())
+        with self.nb_ovn.create_transaction(check_error=True,
+                                            bump_nb_cfg=True) as txn:
+            txn.add(self.nb_ovn.check_liveness())
+        return True
 
+    def list_availability_zones(self, context, filters=None):
+        """List all availability zones from gateway chassis."""
+        azs = {}
+        # TODO(lucasagomes): In the future, once the agents API in OVN
+        # gets more stable we should consider getting the information from
+        # the availability zones from the agents API itself. That would
+        # allow us to do things like: Do not schedule router ports on
+        # chassis that are offline (via the "alive" attribute for agents).
+        for ch in self.sb_ovn.chassis_list().execute(check_error=True):
+            # Only take in consideration gateway chassis because that's where
+            # the router ports are scheduled on
+            if not ovn_utils.is_gateway_chassis(ch):
+                continue
 
-def populate_agents(driver):
-    for ch in driver._sb_ovn.tables['Chassis'].rows.values():
-        # update the cache, rows are hashed on uuid but it is the name that
-        # stays consistent across ovn-controller restarts
-        AGENTS.update({ch.name: ch})
+            azones = ovn_utils.get_chassis_availability_zones(ch)
+            for azone in azones:
+                azs[azone] = {'name': azone, 'resource': 'router',
+                              'state': 'available',
+                              'tenant_id': context.project_id}
+        return azs
+
+    def responsible_for_ports_allocation(self, context):
+        """Report if a chassis is responsible for a resource provider.
+
+        New "allocation" resource request defined in
+        https://review.opendev.org/c/openstack/neutron-specs/+/785236
+
+        This method replicates the logic implemented in
+        ``AgentMechanismDriverBase.responsible_for_ports_allocation``.
+
+        :param context: PortContext instance describing the port
+        :returns: True for responsible, False for not responsible
+        """
+        uuid_ns = self.resource_provider_uuid5_namespace
+        if uuid_ns is None:
+            return False
+        try:
+            allocation = context.current['binding:profile'][
+                place_const.ALLOCATION]
+        except KeyError:
+            return False
+
+        reported = collections.defaultdict(list)
+        _placement = self._ovn_client.placement_extension
+        for ch_name, state in _placement.get_chassis_config().items():
+            for device in state._rp_bandwidths:
+                # chassis = {RP_HYPERVISORS:
+                #     {device1: {name: hostname1, uuid: uuid1}
+                #     {device2: {name: hostname1, uuid: uuid2} ...}
+                hostname = state._hypervisor_rps.get(device, {}).get('name')
+                if not hostname:
+                    continue
+                device_rp_uuid = place_utils.device_resource_provider_uuid(
+                    namespace=uuid_ns, host=hostname, device=device)
+                for group, rp in allocation.items():
+                    if device_rp_uuid == uuid.UUID(rp):
+                        reported[group].append((ch_name, state))
+
+        for group, states in reported.items():
+            if len(states) == 1:
+                ch_name = states[0][0]
+                ch_rp = placement_ext.dict_chassis_config(states[0][1])
+                LOG.debug('Chassis %s is reponsible of the resource provider '
+                          '%s', ch_name, ch_rp)
+                return True
+            if len(states) > 1:
+                rps = {state[0]: placement_ext.dict_chassis_config(state[1])
+                       for state in states}
+                LOG.error('Several chassis reported the requested resource '
+                          'provider: %s', rps)
+                return False
+
+        return False
 
 
 def get_agents(self, context, filters=None, fields=None, _driver=None):
-    _driver.ping_chassis()
+    _driver.ping_all_chassis()
     filters = filters or {}
-    agent_list = []
-    populate_agents(_driver)
-    for ch in AGENTS.values():
-        for agent in _driver.agents_from_chassis(ch).values():
-            if all(agent[k] in v for k, v in filters.items()):
-                agent_list.append(agent)
-    return agent_list
+    agent_list = n_agent.AgentCache().get_agents(filters)
+    return [agent.as_dict() for agent in agent_list]
 
 
 def get_agent(self, context, id, fields=None, _driver=None):
-    chassis = None
     try:
-        # look up Chassis by *name*, which the id attribte is
-        chassis = _driver._sb_ovn.lookup('Chassis', id)
-    except idlutils.RowNotFound:
-        # If the UUID is not found, check for the metadata agent ID
-        for ch in _driver._sb_ovn.tables['Chassis'].rows.values():
-            metadata_agent_id = ch.external_ids.get(
-                ovn_const.OVN_AGENT_METADATA_ID_KEY)
-            if id == metadata_agent_id:
-                chassis = ch
-                break
-        else:
-            raise n_exc.agent.AgentNotFound(id=id)
-    return _driver.agents_from_chassis(chassis)[id]
+        return n_agent.AgentCache().get(id).as_dict()
+    except KeyError:
+        raise n_exc.agent.AgentNotFound(id=id)
 
 
 def update_agent(self, context, id, agent, _driver=None):
@@ -1184,42 +1580,72 @@ def update_agent(self, context, id, agent, _driver=None):
     # and we can just fall through to raising in the case that admin_state_up
     # is being set to False, otherwise the end-state will be fine
     if not agent.get('admin_state_up', True):
-        pass
-    elif 'description' in agent:
-        _driver._sb_ovn.set_chassis_neutron_description(
+        raise n_exc.BadRequest(resource='agent',
+                               msg='OVN agent status cannot be updated')
+    if 'description' in agent:
+        _driver.sb_ovn.set_chassis_neutron_description(
             chassis_name, agent['description'],
             agent_type).execute(check_error=True)
-        return agent
-    else:
-        # admin_state_up=True w/o description
-        return agent
-    raise n_exc.BadRequest(resource='agent',
-                           msg='OVN agent status cannot be updated')
+    return agent
 
 
 def delete_agent(self, context, id, _driver=None):
-    get_agent(self, None, id, _driver=_driver)
-    raise n_exc.BadRequest(resource='agent',
-                           msg='OVN agents cannot be deleted')
+    # raise AgentNotFound if this isn't an ml2/ovn-related agent
+    agent = get_agent(self, None, id, _driver=_driver)
+
+    # NOTE(twilson) According to the API docs, an agent must be disabled
+    # before deletion. Otherwise, behavior seems to be undefined. We could
+    # check that alive=False before allowing deletion, but depending on the
+    # agent_down_time setting, that could take quite a while.
+    # If ovn-controller is up, the Chassis will be recreated and so the agent
+    # will still show as up. The recreated Chassis will cause all kinds of
+    # events to fire. But again, undefined behavior.
+    chassis_name = agent['configurations']['chassis_name']
+    _driver.sb_ovn.chassis_del(chassis_name, if_exists=True).execute(
+        check_error=True)
+    if _driver.sb_ovn.is_table_present('Chassis_Private'):
+        # TODO(ralonsoh): implement the corresponding chassis_private
+        # commands in ovsdbapp.
+        try:
+            _driver.sb_ovn.db_destroy('Chassis_Private', chassis_name).execute(
+                check_error=True)
+        except idlutils.RowNotFound:
+            pass
+    # Send a specific event that all API workers can get to delete the agent
+    # from their caches. Ideally we could send a single transaction that both
+    # created and deleted the key, but alas python-ovs is too "smart"
+    _driver.sb_ovn.db_set(
+        'SB_Global', '.', ('external_ids', {'delete_agent': str(id)})).execute(
+            check_error=True)
+    _driver.sb_ovn.db_remove(
+        'SB_Global', '.', 'external_ids', delete_agent=str(id),
+        if_exists=True).execute(check_error=True)
 
 
-def create_default_drop_port_group(nb_idl):
-    pg_name = ovn_const.OVN_DROP_PORT_GROUP_NAME
-    if nb_idl.get_port_group(pg_name):
-        LOG.debug("Port Group %s already exists", pg_name)
+def get_availability_zones(cls, context, _driver, filters=None, fields=None,
+                           sorts=None, limit=None, marker=None,
+                           page_reverse=False):
+    return list(_driver.list_availability_zones(context, filters).values())
+
+
+def validate_availability_zones(cls, context, resource_type,
+                                availability_zones, _driver):
+    if not availability_zones or resource_type != 'network':
         return
-    with nb_idl.transaction(check_error=True) as txn:
-        # If drop Port Group doesn't exist yet, create it.
-        txn.add(nb_idl.pg_add(pg_name, acls=[], may_exist=True))
-        # Add ACLs to this Port Group so that all traffic is dropped.
-        acls = ovn_acl.add_acls_for_drop_port_group(pg_name)
-        for acl in acls:
-            txn.add(nb_idl.pg_acl_add(may_exist=True, **acl))
 
-        ports_with_pg = set()
-        for pg in nb_idl.get_port_groups().values():
-            ports_with_pg.update(pg['ports'])
+    azs = {az['name'] for az in
+           _driver.list_availability_zones(context).values()}
+    diff = set(availability_zones) - azs
+    if diff:
+        raise az_exc.AvailabilityZoneNotFound(
+            availability_zone=', '.join(diff))
 
-        if ports_with_pg:
-            # Add the ports to the default Port Group
-            txn.add(nb_idl.pg_add_ports(pg_name, list(ports_with_pg)))
+
+def get_network_availability_zones(cls, network, _driver):
+    lswitch = _driver._nb_ovn.get_lswitch(network['id'])
+    if not lswitch:
+        return []
+
+    return [az.strip() for az in lswitch.external_ids.get(
+        ovn_const.OVN_AZ_HINTS_EXT_ID_KEY, '').split(',')
+            if az.strip()]

@@ -13,14 +13,16 @@
 import webob.exc
 
 from neutron_lib.api.definitions import portbindings
+from neutron_lib.api.definitions import subnet_service_types \
+    as subnet_service_types_apidef
 
 from neutron.db import db_base_plugin_v2
 from neutron.db import subnet_service_type_mixin
 from neutron.extensions import subnet_service_types
-from neutron.tests.unit.db import test_db_base_plugin_v2
+from neutron.tests.common import test_db_base_plugin_v2
 
 
-class SubnetServiceTypesExtensionManager(object):
+class SubnetServiceTypesExtensionManager:
 
     def get_resources(self):
         return []
@@ -42,7 +44,8 @@ class SubnetServiceTypesExtensionTestPlugin(
     """Test plugin to mixin the subnet service_types extension.
     """
 
-    supported_extension_aliases = ["subnet-service-types", portbindings.ALIAS]
+    supported_extension_aliases = [subnet_service_types_apidef.ALIAS,
+                                   portbindings.ALIAS]
 
 
 class SubnetServiceTypesExtensionTestCase(
@@ -56,8 +59,7 @@ class SubnetServiceTypesExtensionTestCase(
         plugin = ('neutron.tests.unit.extensions.test_subnet_service_types.' +
                   'SubnetServiceTypesExtensionTestPlugin')
         ext_mgr = SubnetServiceTypesExtensionManager()
-        super(SubnetServiceTypesExtensionTestCase,
-              self).setUp(plugin=plugin, ext_mgr=ext_mgr)
+        super().setUp(plugin=plugin, ext_mgr=ext_mgr)
 
     def _create_service_subnet(self, service_types=None, cidr=None,
                                network=None, enable_dhcp=False):
@@ -341,13 +343,14 @@ class SubnetServiceTypesExtensionTestCase(
                                  tenant_id=network['tenant_id'],
                                  device_owner=service_type,
                                  arg_list=(portbindings.HOST_ID,),
-                                 **{portbindings.HOST_ID: 'fakehost'})
+                                 **{portbindings.HOST_ID: 'fakehost'},
+                                 is_admin=True)
         port = self.deserialize('json', port)['port']
         # Update the port's host binding.
         data = {'port': {portbindings.HOST_ID: 'fakehost2'}}
         # self._update will fail with a MismatchError if the update cannot be
         # applied
-        port = self._update('ports', port['id'], data)
+        port = self._update('ports', port['id'], data, as_admin=True)
 
 
 class SubnetServiceTypesExtensionTestCasev6(

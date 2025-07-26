@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 from unittest import mock
 
 from neutron_lib import constants as p_const
@@ -20,7 +21,6 @@ from neutron_lib import context
 from neutron_lib import exceptions as exc
 from neutron_lib.plugins.ml2 import api
 from oslo_config import cfg
-from six import moves
 import testtools
 from testtools import matchers
 
@@ -41,15 +41,15 @@ SERVICE_PLUGIN_KLASS = ('neutron.services.network_segment_range.plugin.'
                         'NetworkSegmentRangePlugin')
 
 
-class TunnelTypeTestMixin(object):
+class TunnelTypeTestMixin:
     DRIVER_CLASS = None
     TYPE = None
 
     def setUp(self):
-        super(TunnelTypeTestMixin, self).setUp()
+        super().setUp()
         self.driver = self.DRIVER_CLASS()
-        self.driver.tunnel_ranges = TUNNEL_RANGES
-        self.driver.sync_allocations()
+        self.driver._tunnel_ranges = TUNNEL_RANGES
+        self.driver._sync_allocations()
         self.context = context.Context()
 
     def test_tunnel_type(self):
@@ -83,8 +83,8 @@ class TunnelTypeTestMixin(object):
         self.assertIsNone(
             self.driver.get_allocation(self.context, (TUN_MAX + 1)))
 
-        self.driver.tunnel_ranges = UPDATED_TUNNEL_RANGES
-        self.driver.sync_allocations()
+        self.driver._tunnel_ranges = UPDATED_TUNNEL_RANGES
+        self.driver._sync_allocations()
 
         self.assertIsNone(
             self.driver.get_allocation(self.context, (TUN_MIN + 5 - 1)))
@@ -107,8 +107,8 @@ class TunnelTypeTestMixin(object):
                    api.SEGMENTATION_ID: tunnel_id}
         self.driver.reserve_provider_segment(self.context, segment)
 
-        self.driver.tunnel_ranges = UPDATED_TUNNEL_RANGES
-        self.driver.sync_allocations()
+        self.driver._tunnel_ranges = UPDATED_TUNNEL_RANGES
+        self.driver._sync_allocations()
 
         self.assertTrue(
             self.driver.get_allocation(self.context, tunnel_id).allocated)
@@ -127,8 +127,10 @@ class TunnelTypeTestMixin(object):
             return []
         with mock.patch.object(
                 type_tunnel, 'chunks', side_effect=verify_no_chunk) as chunks:
-            self.driver.sync_allocations()
-            self.assertEqual(2, len(chunks.mock_calls))
+            self.driver._sync_allocations()
+            # No writing operation is done, fast exit: current allocations
+            # already present.
+            self.assertEqual(0, len(chunks.mock_calls))
 
     def test_partial_segment_is_partial_segment(self):
         segment = {api.NETWORK_TYPE: self.TYPE,
@@ -176,7 +178,7 @@ class TunnelTypeTestMixin(object):
                  api.PHYSICAL_NETWORK: 'None',
                  api.SEGMENTATION_ID: None}
 
-        for x in moves.range(TUN_MIN, TUN_MAX + 1):
+        for x in range(TUN_MIN, TUN_MAX + 1):
             segment = self.driver.reserve_provider_segment(self.context,
                                                            specs)
             self.assertEqual(self.TYPE, segment[api.NETWORK_TYPE])
@@ -207,7 +209,7 @@ class TunnelTypeTestMixin(object):
 
     def test_allocate_tenant_segment(self):
         tunnel_ids = set()
-        for x in moves.range(TUN_MIN, TUN_MAX + 1):
+        for x in range(TUN_MIN, TUN_MAX + 1):
             segment = self.driver.allocate_tenant_segment(self.context)
             self.assertThat(segment[api.SEGMENTATION_ID],
                             matchers.GreaterThan(TUN_MIN - 1))
@@ -280,7 +282,7 @@ class TunnelTypeTestMixin(object):
         self.assertNotIn(TUNNEL_IP_ONE, endpoints)
 
 
-class TunnelTypeMultiRangeTestMixin(object):
+class TunnelTypeMultiRangeTestMixin:
     DRIVER_CLASS = None
 
     TUN_MIN0 = 100
@@ -290,10 +292,10 @@ class TunnelTypeMultiRangeTestMixin(object):
     TUNNEL_MULTI_RANGES = [(TUN_MIN0, TUN_MAX0), (TUN_MIN1, TUN_MAX1)]
 
     def setUp(self):
-        super(TunnelTypeMultiRangeTestMixin, self).setUp()
+        super().setUp()
         self.driver = self.DRIVER_CLASS()
-        self.driver.tunnel_ranges = self.TUNNEL_MULTI_RANGES
-        self.driver.sync_allocations()
+        self.driver._tunnel_ranges = self.TUNNEL_MULTI_RANGES
+        self.driver._sync_allocations()
         self.context = context.Context()
 
     def test_release_segment(self):
@@ -310,13 +312,13 @@ class TunnelTypeMultiRangeTestMixin(object):
             self.assertFalse(alloc.allocated)
 
 
-class TunnelRpcCallbackTestMixin(object):
+class TunnelRpcCallbackTestMixin:
 
     DRIVER_CLASS = None
     TYPE = None
 
     def setUp(self):
-        super(TunnelRpcCallbackTestMixin, self).setUp()
+        super().setUp()
         self.driver = self.DRIVER_CLASS()
 
     def _test_tunnel_sync(self, kwargs, delete_tunnel=False):
@@ -422,14 +424,14 @@ class TunnelRpcCallbackTestMixin(object):
         self._test_tunnel_sync_raises(kwargs)
 
 
-class TunnelTypeMTUTestMixin(object):
+class TunnelTypeMTUTestMixin:
 
     DRIVER_CLASS = None
     TYPE = None
     ENCAP_OVERHEAD = 0
 
     def setUp(self):
-        super(TunnelTypeMTUTestMixin, self).setUp()
+        super().setUp()
         self.driver = self.DRIVER_CLASS()
 
     def _test_get_mtu(self, ip_version):
@@ -467,23 +469,24 @@ class TunnelTypeMTUTestMixin(object):
         self._test_get_mtu(6)
 
 
-class TunnelTypeNetworkSegmentRangeTestMixin(object):
+class TunnelTypeNetworkSegmentRangeTestMixin:
 
     DRIVER_CLASS = None
 
     def setUp(self):
-        super(TunnelTypeNetworkSegmentRangeTestMixin, self).setUp()
+        super().setUp()
         cfg.CONF.set_override('service_plugins', [SERVICE_PLUGIN_KLASS])
         self.context = context.Context()
         self.driver = self.DRIVER_CLASS()
+        self.start_time = random.randint(10**5, 10**6)
 
     def test__populate_new_default_network_segment_ranges(self):
         # _populate_new_default_network_segment_ranges will be called when
         # the type driver initializes with `network_segment_range` loaded as
         # one of the `service_plugins`
         self.driver._initialize(RAW_TUNNEL_RANGES)
-        self.driver.initialize_network_segment_range_support()
-        self.driver.sync_allocations()
+        self.driver.initialize_network_segment_range_support(self.start_time)
+        self.driver._sync_allocations()
         ret = obj_network_segment_range.NetworkSegmentRange.get_objects(
             self.context)
         self.assertEqual(1, len(ret))
@@ -498,9 +501,10 @@ class TunnelTypeNetworkSegmentRangeTestMixin(object):
         self.assertEqual(TUN_MAX, network_segment_range.maximum)
 
     def test__delete_expired_default_network_segment_ranges(self):
-        self.driver.tunnel_ranges = TUNNEL_RANGES
-        self.driver.sync_allocations()
-        self.driver._delete_expired_default_network_segment_ranges()
+        self.driver._tunnel_ranges = TUNNEL_RANGES
+        self.driver._sync_allocations()
+        self.driver._delete_expired_default_network_segment_ranges(
+            self.context, self.start_time)
         ret = obj_network_segment_range.NetworkSegmentRange.get_objects(
-            self.context)
+            self.context, network_type=self.driver.get_type())
         self.assertEqual(0, len(ret))

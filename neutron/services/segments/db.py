@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import segment as extension
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
@@ -27,17 +28,21 @@ from oslo_concurrency import lockutils
 from oslo_config import cfg
 from oslo_db import exception as db_exc
 from oslo_log import helpers as log_helpers
+from oslo_log import log as logging
 from oslo_utils import uuidutils
 
+from neutron.db.models import agent as agent_model
+from neutron.db.models import segment as segment_model
 from neutron.db import segments_db as db
-from neutron.extensions import segment as extension
 from neutron import manager
 from neutron.objects import base as base_obj
 from neutron.objects import network
 from neutron.services.segments import exceptions
 
 
+LOG = logging.getLogger(__name__)
 _USER_CONFIGURED_SEGMENT_PLUGIN = None
+FOR_NET_DELETE = 'for_net_delete'
 
 
 def check_user_configured_segment_plugin():
@@ -57,7 +62,7 @@ def check_user_configured_segment_plugin():
     return _USER_CONFIGURED_SEGMENT_PLUGIN
 
 
-class SegmentDbMixin(object):
+class SegmentDbMixin:
     """Mixin class to add segment."""
 
     @staticmethod
@@ -89,8 +94,10 @@ class SegmentDbMixin(object):
             new_segment = self._create_segment_db(context, segment_id, segment)
         except db_exc.DBReferenceError:
             raise n_exc.NetworkNotFound(net_id=segment['network_id'])
-        registry.notify(resources.SEGMENT, events.AFTER_CREATE, self,
-                        context=context, segment=new_segment)
+        registry.publish(resources.SEGMENT, events.AFTER_CREATE, self,
+                         payload=events.DBEventPayload(
+                             context, resource_id=segment_id,
+                             states=(new_segment,)))
         return self._make_segment_dict(new_segment)
 
     def _create_segment_db(self, context, segment_id, segment):
@@ -134,9 +141,10 @@ class SegmentDbMixin(object):
             new_segment.create()
             # Do some preliminary operations before committing the segment to
             # db
-            registry.notify(
+            registry.publish(
                 resources.SEGMENT, events.PRECOMMIT_CREATE, self,
-                context=context, segment=new_segment)
+                payload=events.DBEventPayload(context, resource_id=segment_id,
+                                              states=(new_segment,)))
             # The new segment might have been updated by the callbacks
             # subscribed to the PRECOMMIT_CREATE event. So update it in the DB
             new_segment.update()
@@ -189,7 +197,7 @@ class SegmentDbMixin(object):
                          self.delete_segment,
                          payload=events.DBEventPayload(
                              context, metadata={
-                                 'for_net_delete': for_net_delete},
+                                 FOR_NET_DELETE: for_net_delete},
                              states=(segment_dict,),
                              resource_id=uuid))
 
@@ -198,14 +206,20 @@ class SegmentDbMixin(object):
             if not network.NetworkSegment.delete_objects(context, id=uuid):
                 raise exceptions.SegmentNotFound(segment_id=uuid)
             # Do some preliminary operations before deleting segment in db
-            registry.notify(resources.SEGMENT, events.PRECOMMIT_DELETE,
-                            self.delete_segment, context=context,
-                            segment=segment_dict)
+            registry.publish(resources.SEGMENT, events.PRECOMMIT_DELETE,
+                             self.delete_segment,
+                             payload=events.DBEventPayload(
+                                 context, metadata={
+                                     FOR_NET_DELETE: for_net_delete},
+                                 resource_id=uuid,
+                                 states=(segment_dict,)))
 
         registry.publish(resources.SEGMENT, events.AFTER_DELETE,
                          self.delete_segment,
                          payload=events.DBEventPayload(
-                             context, states=(segment_dict,),
+                             context, metadata={
+                                 FOR_NET_DELETE: for_net_delete},
+                             states=(segment_dict,),
                              resource_id=uuid))
 
 
@@ -217,24 +231,77 @@ def update_segment_host_mapping(context, host, current_segment_ids):
             context, host=host)
         previous_segment_ids = {
             seg_host['segment_id'] for seg_host in segment_host_mapping}
-        for segment_id in current_segment_ids - previous_segment_ids:
+        segment_ids = current_segment_ids - previous_segment_ids
+        for segment_id in segment_ids:
             network.SegmentHostMapping(
                 context, segment_id=segment_id, host=host).create()
+        if segment_ids:
+            registry.publish(
+                resources.SEGMENT_HOST_MAPPING,
+                events.AFTER_CREATE,
+                update_segment_host_mapping,
+                payload=events.DBEventPayload(
+                    context,
+                    metadata={
+                        'host': host,
+                        'current_segment_ids': segment_ids}))
+
+        LOG.debug('Segments %s mapped to the host %s', segment_ids, host)
         stale_segment_ids = previous_segment_ids - current_segment_ids
         if stale_segment_ids:
             for entry in segment_host_mapping:
                 if entry.segment_id in stale_segment_ids:
                     entry.delete()
+                    LOG.debug('Segment %s unmapped from host %s',
+                              entry.segment_id, entry.host)
+            registry.publish(
+                resources.SEGMENT_HOST_MAPPING,
+                events.AFTER_DELETE,
+                update_segment_host_mapping,
+                payload=events.DBEventPayload(
+                    context,
+                    metadata={
+                        'host': host,
+                        'deleted_segment_ids': stale_segment_ids}))
 
 
-def get_hosts_mapped_with_segments(context):
+def get_hosts_mapped_with_segments(context, include_agent_types=None,
+                                   exclude_agent_types=None):
     """Get hosts that are mapped with segments.
 
     L2 providers can use this method to get an overview of SegmentHostMapping,
     and then delete the stale SegmentHostMapping.
+
+    When using both include_agent_types and exclude_agent_types,
+    exclude_agent_types is most significant.
+    All hosts without agent are excluded when using any agent_type filter.
+
+    :param context: current running context information
+    :param include_agent_types: (set) List of agent types, include hosts
+        with matching agents.
+    :param exclude_agent_types: (set) List of agent types, exclude hosts
+        with matching agents.
     """
-    segment_host_mapping = network.SegmentHostMapping.get_objects(context)
-    return {row.host for row in segment_host_mapping}
+    def add_filter_by_agent_types(qry, include, exclude):
+        qry = qry.join(
+            agent_model.Agent,
+            segment_model.SegmentHostMapping.host == agent_model.Agent.host)
+        if include:
+            qry = qry.filter(agent_model.Agent.agent_type.in_(include))
+        if exclude:
+            qry = qry.filter(agent_model.Agent.agent_type.not_in(exclude))
+
+        return qry
+
+    with db_api.CONTEXT_READER.using(context):
+        query = context.session.query(segment_model.SegmentHostMapping)
+        if include_agent_types or exclude_agent_types:
+            query = add_filter_by_agent_types(query, include_agent_types,
+                                              exclude_agent_types)
+
+        res = query.all()
+
+    return {row.host for row in res}
 
 
 def _get_phys_nets(agent):
@@ -274,6 +341,7 @@ def map_segment_to_hosts(context, segment_id, hosts):
         for host in hosts:
             network.SegmentHostMapping(
                 context, segment_id=segment_id, host=host).create()
+    LOG.debug('Segment %s mapped to the hosts %s', segment_id, hosts)
 
 
 def _update_segment_host_mapping_for_agent(resource, event, trigger,
@@ -294,27 +362,22 @@ def _update_segment_host_mapping_for_agent(resource, event, trigger,
     if host in reported_hosts and not start_flag:
         return
     reported_hosts.add(host)
+    if (len(payload.states) > 1 and
+            payload.states[1] is not None and
+            agent.get('configurations') == payload.states[1].get(
+                'configurations')):
+        return
     segments = get_segments_with_phys_nets(context, phys_nets)
     current_segment_ids = {
         segment['id'] for segment in segments
         if check_segment_for_agent(segment, agent)}
     update_segment_host_mapping(context, host, current_segment_ids)
-    registry.publish(resources.SEGMENT_HOST_MAPPING, events.AFTER_CREATE,
-                     plugin, payload=events.DBEventPayload(
-                         context,
-                         metadata={
-                             'host': host,
-                             'current_segment_ids': current_segment_ids}))
 
 
 def _add_segment_host_mapping_for_segment(resource, event, trigger,
-                                          context, segment):
-    if not context.session.is_active:
-        # The session might be in partial rollback state, due to errors in
-        # peer callback. In that case, there is no need to add the mapping.
-        # Just return here.
-        return
-
+                                          payload=None):
+    context = payload.context
+    segment = payload.latest_state
     if not segment.physical_network:
         return
     cp = directory.get_plugin()
@@ -331,8 +394,9 @@ def _add_segment_host_mapping_for_segment(resource, event, trigger,
 
 
 def _delete_segments_for_network(resource, event, trigger,
-                                 context, network_id):
-    admin_ctx = context.elevated()
+                                 payload=None, **kwargs):
+    network_id = payload.resource_id
+    admin_ctx = payload.context.elevated()
     global segments_plugin
     if not segments_plugin:
         segments_plugin = manager.NeutronManager.load_class_for_provider(

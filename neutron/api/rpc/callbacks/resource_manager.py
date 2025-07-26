@@ -15,7 +15,6 @@ import collections
 
 from neutron_lib.callbacks import exceptions
 from oslo_log import log as logging
-import six
 
 from neutron.api.rpc.callbacks import exceptions as rpc_exc
 from neutron.api.rpc.callbacks import resources
@@ -31,8 +30,7 @@ def _validate_resource_type(resource_type):
         raise exceptions.Invalid(element='resource', value=resource_type)
 
 
-@six.add_metaclass(abc.ABCMeta)
-class ResourceCallbacksManager(object):
+class ResourceCallbacksManager(metaclass=abc.ABCMeta):
     """A callback system that allows information providers in a loose manner.
     """
 
@@ -41,10 +39,10 @@ class ResourceCallbacksManager(object):
 
     def __new__(cls, *args, **kwargs):
         if not cls._singleton:
-            return super(ResourceCallbacksManager, cls).__new__(cls)
+            return super().__new__(cls)
 
         if not hasattr(cls, '_instance'):
-            cls._instance = super(ResourceCallbacksManager, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
         return cls._instance
 
     @abc.abstractmethod

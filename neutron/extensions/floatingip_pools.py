@@ -16,7 +16,6 @@ import itertools
 from neutron_lib.api.definitions import floatingip_pools as apidef
 from neutron_lib.api import extensions as api_extensions
 from neutron_lib.plugins import constants
-import six
 
 from neutron.api.v2 import resource_helper
 
@@ -33,17 +32,16 @@ class Floatingip_pools(api_extensions.APIExtensionDescriptor):
             {}, itertools.chain(apidef.RESOURCE_ATTRIBUTE_MAP))
 
         resources = resource_helper.build_resource_info(
-                                                plural_mappings,
-                                                apidef.RESOURCE_ATTRIBUTE_MAP,
-                                                constants.L3,
-                                                translate_name=True,
-                                                allow_bulk=True)
+                        plural_mappings,
+                        apidef.RESOURCE_ATTRIBUTE_MAP,
+                        constants.L3,
+                        translate_name=True,
+                        allow_bulk=True)
 
         return resources
 
 
-@six.add_metaclass(abc.ABCMeta)
-class FloatingIPPoolPluginBase(object):
+class FloatingIPPoolPluginBase(metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     def get_floatingip_pools(self, context, filters=None, fields=None,

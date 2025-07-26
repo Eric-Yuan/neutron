@@ -46,7 +46,7 @@ class PortForwardingExtensionBaseTestCase(
         test_agent.BasicRouterOperationsFramework):
 
     def setUp(self):
-        super(PortForwardingExtensionBaseTestCase, self).setUp()
+        super().setUp()
 
         self.fip_pf_ext = pf.PortForwardingAgentExtension()
 
@@ -60,11 +60,14 @@ class PortForwardingExtensionBaseTestCase(
         self.portforwarding1 = pf_obj.PortForwarding(
             context=None, id=_uuid(), floatingip_id=self.floatingip2.id,
             external_port=1111, protocol='tcp', internal_port_id=_uuid(),
+            external_port_range='1111:1111',
+            internal_port_range='11111:11111',
             internal_ip_address='1.1.1.1', internal_port=11111,
             floating_ip_address=self.floatingip2.floating_ip_address,
             router_id=self.floatingip2.router_id)
 
         self.agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
+        self.agent.init_host()
         self.ex_gw_port = {'id': _uuid()}
         self.fip = {'id': _uuid(),
                     'floating_ip_address': TEST_FIP,
@@ -80,8 +83,8 @@ class PortForwardingExtensionBaseTestCase(
         self.router_info = l3router.RouterInfo(
             self.agent, self.floatingip2.router_id, self.router,
             **self.ri_kwargs)
-        self.centralized_port_forwarding_fip_set = set(
-            [str(self.floatingip2.floating_ip_address) + '/32'])
+        self.centralized_port_forwarding_fip_set = {
+            str(self.floatingip2.floating_ip_address) + '/32'}
         self.pf_managed_fips = [self.floatingip2.id]
         self.router_info.ex_gw_port = self.ex_gw_port
         self.router_info.fip_managed_by_port_forwardings = self.pf_managed_fips
@@ -124,7 +127,7 @@ class FipPortForwardingExtensionInitializeTestCase(
 class FipPortForwardingExtensionTestCase(PortForwardingExtensionBaseTestCase):
 
     def setUp(self):
-        super(FipPortForwardingExtensionTestCase, self).setUp()
+        super().setUp()
         self.fip_pf_ext.initialize(
             self.connection, lib_const.L3_AGENT_MODE)
         self._set_bulk_pull_mock()
@@ -148,15 +151,16 @@ class FipPortForwardingExtensionTestCase(PortForwardingExtensionBaseTestCase):
         rule_tag = 'fip_portforwarding-' + target_obj.id
         chain_name = (
             'pf-' + target_obj.id)[:lib_const.MAX_IPTABLES_CHAIN_LEN_WRAP]
+        ports = pf.PortForwardingAgentExtension.extract_ports(target_obj)
         chain_rule = (chain_name,
                       '-d %s/32 -p %s -m %s --dport %s '
                       '-j DNAT --to-destination %s:%s' % (
                           target_obj.floating_ip_address,
                           target_obj.protocol,
                           target_obj.protocol,
-                          target_obj.external_port,
+                          ports[0],
                           target_obj.internal_ip_address,
-                          target_obj.internal_port))
+                          ports[1]))
         return chain_name, chain_rule, rule_tag
 
     def _assert_called_iptables_process(self, mock_add_chain,
@@ -183,6 +187,69 @@ class FipPortForwardingExtensionTestCase(PortForwardingExtensionBaseTestCase):
                 lib_const.FLOATINGIP_STATUS_ACTIVE}
         mock_send_fip_status.assert_called_once_with(mock.ANY, fip_status)
 
+    def _test_extract_ports(self, internal_port_range, external_port_range,
+                            expected_internal_port, expected_external_port,
+                            log_called=False):
+        mock_pf = mock.Mock()
+        mock_log = mock.patch.object(pf.LOG, 'warning').start()
+        mock_pf.internal_port_range = internal_port_range
+        mock_pf.external_port_range = external_port_range
+        ports = pf.PortForwardingAgentExtension.extract_ports(mock_pf)
+        self.assertEqual(expected_internal_port, ports[1])
+        self.assertEqual(expected_external_port, ports[0])
+        if log_called:
+            mock_log.assert_called_with(
+                "Port forwarding rule with different internal "
+                "and external port ranges applied. Internal "
+                "port range: [%s], external port range: [%s].",
+                ports[1], ports[0])
+        else:
+            self.assertFalse(mock_log.called)
+
+    def test_extract_ports(self):
+        test_cases = {
+            'internal port range = external port range': {
+                'internal': '10:12',
+                'external': '13:15',
+                'expected_internal': '10-12/13',
+                'expected_external': '13:15',
+            },
+            'internal port range = external port range = 1': {
+                'internal': '10:10',
+                'external': '13:13',
+                'expected_internal': '10',
+                'expected_external': '13',
+            },
+            'internal port range < external port range': {
+                'internal': '10:12',
+                'external': '13:16',
+                'expected_internal': '10-12/13',
+                'expected_external': '13:16',
+                'log_called': True
+            },
+            'internal port range > external port range': {
+                'internal': '9:12',
+                'external': '13:15',
+                'expected_internal': '9-12/13',
+                'expected_external': '13:15',
+                'log_called': True
+            },
+            'internal port range = 1': {
+                'internal': '10:10',
+                'external': '13:15',
+                'expected_internal': '10',
+                'expected_external': '13:15',
+            },
+            'external port range = 1': {
+                'internal': '10:12',
+                'external': '13:13',
+                'expected_internal': '10-12',
+                'expected_external': '13',
+            }
+        }
+        for case in test_cases.values():
+            self._test_extract_ports(*case.values())
+
     @mock.patch.object(pf.PortForwardingAgentExtension,
                        '_sending_port_forwarding_fip_status')
     @mock.patch.object(iptables_manager.IptablesTable, 'add_rule')
@@ -208,6 +275,8 @@ class FipPortForwardingExtensionTestCase(PortForwardingExtensionBaseTestCase):
         test_portforwarding = pf_obj.PortForwarding(
             context=None, id=_uuid(), floatingip_id=self.floatingip2.id,
             external_port=2222, protocol='tcp', internal_port_id=_uuid(),
+            external_port_range='2222:2222',
+            internal_port_range='22222:22222',
             internal_ip_address='2.2.2.2', internal_port=22222,
             floating_ip_address=self.floatingip2.floating_ip_address,
             router_id=self.floatingip2.router_id)
@@ -229,8 +298,9 @@ class FipPortForwardingExtensionTestCase(PortForwardingExtensionBaseTestCase):
         update_portforwarding = pf_obj.PortForwarding(
             context=None, id=self.portforwarding1.id,
             floatingip_id=self.portforwarding1.floatingip_id,
-            external_port=2222, protocol='tcp', internal_port_id=_uuid(),
-            internal_ip_address='2.2.2.2', internal_port=22222,
+            external_port_range='2222:2223', protocol='tcp',
+            internal_port_id=_uuid(), internal_ip_address='2.2.2.2',
+            internal_port_range='22222:22223',
             floating_ip_address=self.portforwarding1.floating_ip_address,
             router_id=self.portforwarding1.router_id)
         self.port_forwardings = [update_portforwarding]
@@ -282,6 +352,38 @@ class FipPortForwardingExtensionTestCase(PortForwardingExtensionBaseTestCase):
                 lib_const.FLOATINGIP_STATUS_DOWN}
         mock_send_fip_status.assert_called_once_with(mock.ANY, fip_status)
 
+    @mock.patch.object(pf.PortForwardingAgentExtension,
+                       '_sending_port_forwarding_fip_status')
+    @mock.patch.object(iptables_manager.IptablesTable, 'add_rule')
+    @mock.patch.object(iptables_manager.IptablesTable, 'add_chain')
+    @mock.patch.object(l3router.RouterInfo, 'add_floating_ip')
+    def test_add_delete_router(self, mock_add_fip,
+                               mock_add_chain, mock_add_rule,
+                               mock_send_fip_status):
+        # simulate the router add and already there is a port forwarding
+        # resource association.
+        mock_add_fip.return_value = lib_const.FLOATINGIP_STATUS_ACTIVE
+        self.fip_pf_ext.add_router(self.context, self.router)
+        self._assert_called_iptables_process(
+            mock_add_chain, mock_add_rule, mock_add_fip, mock_send_fip_status,
+            target_obj=self.portforwarding1)
+
+        router_fip_ids = self.fip_pf_ext.mapping.router_fip_mapping.get(
+            self.router['id'])
+        self.assertIsNotNone(router_fip_ids)
+        for fip_id in router_fip_ids:
+            pf_ids = self.fip_pf_ext.mapping.fip_port_forwarding.get(fip_id)
+            self.assertIsNotNone(pf_ids)
+            for pf_id in pf_ids:
+                pf = self.fip_pf_ext.mapping.managed_port_forwardings.get(
+                    pf_id)
+                self.assertIsNotNone(pf)
+
+        self.fip_pf_ext.delete_router(self.context, self.router)
+
+        self.assertIsNone(
+            self.fip_pf_ext.mapping.router_fip_mapping.get(self.router['id']))
+
     def test_check_if_need_process_no_snat_ns(self):
         ex_gw_port = {'id': _uuid()}
         router_id = _uuid()
@@ -302,7 +404,7 @@ class FipPortForwardingExtensionTestCase(PortForwardingExtensionBaseTestCase):
 class RouterFipPortForwardingMappingTestCase(base.BaseTestCase):
 
     def setUp(self):
-        super(RouterFipPortForwardingMappingTestCase, self).setUp()
+        super().setUp()
         self.mapping = pf.RouterFipPortForwardingMapping()
         self.router1 = _uuid()
         self.router2 = _uuid()
@@ -356,10 +458,10 @@ class RouterFipPortForwardingMappingTestCase(base.BaseTestCase):
             len(pf_ids), len(self.mapping.managed_port_forwardings.keys()))
 
         fip_pf_set = {
-            self.floatingip1: set(
-                [self.portforwarding1.id, self.portforwarding2.id]),
-            self.floatingip2: set([self.portforwarding3.id]),
-            self.floatingip3: set([self.portforwarding4.id])
+            self.floatingip1: {
+                self.portforwarding1.id, self.portforwarding2.id},
+            self.floatingip2: {self.portforwarding3.id},
+            self.floatingip3: {self.portforwarding4.id}
         }
         for fip_id, pf_set in self.mapping.fip_port_forwarding.items():
             self.assertIn(
@@ -370,8 +472,8 @@ class RouterFipPortForwardingMappingTestCase(base.BaseTestCase):
             len(self.mapping.fip_port_forwarding))
 
         router_fip = {
-            self.router1: set([self.floatingip1, self.floatingip2]),
-            self.router2: set([self.floatingip3])
+            self.router1: {self.floatingip1, self.floatingip2},
+            self.router2: {self.floatingip3}
         }
         for router_id, fip_set in self.mapping.router_fip_mapping.items():
             self.assertIn(router_id, [self.router1, self.router2])
@@ -405,24 +507,24 @@ class RouterFipPortForwardingMappingTestCase(base.BaseTestCase):
         self.assertEqual(
             [self.portforwarding1.id],
             list(self.mapping.managed_port_forwardings.keys()))
-        self.assertEqual({self.floatingip1: set([self.portforwarding1.id])},
+        self.assertEqual({self.floatingip1: {self.portforwarding1.id}},
                          self.mapping.fip_port_forwarding)
-        self.assertEqual({self.router1: set([self.floatingip1])},
+        self.assertEqual({self.router1: {self.floatingip1}},
                          self.mapping.router_fip_mapping)
 
     def test_clear_by_fip(self):
         self._set_pf()
         self.mapping.clear_by_fip(self.floatingip1, self.router1)
         router_fip = {
-            self.router1: set([self.floatingip2]),
-            self.router2: set([self.floatingip3])
+            self.router1: {self.floatingip2},
+            self.router2: {self.floatingip3}
         }
         for router_id, fip_set in self.mapping.router_fip_mapping.items():
             self.assertIn(router_id, [self.router1, self.router2])
             self.assertEqual(0, len(fip_set - router_fip[router_id]))
         fip_pf_set = {
-            self.floatingip2: set([self.portforwarding3.id]),
-            self.floatingip3: set([self.portforwarding4.id])
+            self.floatingip2: {self.portforwarding3.id},
+            self.floatingip3: {self.portforwarding4.id}
         }
         for fip_id, pf_set in self.mapping.fip_port_forwarding.items():
             self.assertIn(

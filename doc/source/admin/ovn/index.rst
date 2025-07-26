@@ -14,3 +14,10 @@ OVN Driver Administration Guide
    dpdk
    troubleshooting
    sriov
+   availability_zones
+   routed_provider_networks
+   smartnic_dpu
+   baremetal
+   external_ports
+   rpc
+   l3_scheduler

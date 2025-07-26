@@ -19,7 +19,7 @@ import netaddr
 from neutron_lib import constants as lib_constants
 from oslo_log import log as logging
 from oslo_utils import excutils
-import six
+from pyroute2.netlink import exceptions as pyroute2_exc
 
 from neutron.agent.l3 import dvr_fip_ns
 from neutron.agent.l3 import dvr_router_base
@@ -38,7 +38,7 @@ Arp_entry = collections.namedtuple(
 
 class DvrLocalRouter(dvr_router_base.DvrRouterBase):
     def __init__(self, host, *args, **kwargs):
-        super(DvrLocalRouter, self).__init__(host, *args, **kwargs)
+        super().__init__(host, *args, **kwargs)
 
         self.floating_ips_dict = {}
         # Linklocal subnet for router and floating IP namespace link
@@ -46,6 +46,66 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
         self.rtr_fip_connect = False
         self.fip_ns = None
         self._pending_arp_set = set()
+
+    def initialize(self, process_monitor):
+        super().initialize(process_monitor)
+        self._load_used_fip_information()
+
+    def _load_used_fip_information(self):
+        """Load FIP from the FipRulePriorityAllocator state file.
+
+        If, for any reason, the FIP is not stored in the state file, this
+        method reads the namespace "ip rule" list and search for the
+        corresponding fixed IP of the FIP. If present, this "ip rule" is
+        (1) deleted, (2) a new rule priority is allocated and (3) the "ip rule"
+        is written again with the new assigned priority.
+
+        At the end of the method, all existing "ip rule" registers in
+        FIP_RT_TBL table (where FIP rules are stored) that don't match with
+        any register memoized in self._rule_priorities is deleted.
+        """
+        ex_gw_port = self.get_ex_gw_port()
+        if not ex_gw_port:
+            return
+
+        fip_ns = self.agent.get_fip_ns(ex_gw_port['network_id'])
+        for fip in self.get_floating_ips():
+            floating_ip = fip['floating_ip_address']
+            fixed_ip = fip['fixed_ip_address']
+            if not fixed_ip:
+                continue
+
+            rule_pr = fip_ns.lookup_rule_priority(floating_ip)
+            if rule_pr:
+                self.floating_ips_dict[floating_ip] = (fixed_ip, rule_pr)
+                continue
+
+            rule_pr = fip_ns.allocate_rule_priority(floating_ip)
+            ip_lib.add_ip_rule(self.ns_name, fixed_ip,
+                               table=dvr_fip_ns.FIP_RT_TBL,
+                               priority=rule_pr)
+            self.floating_ips_dict[floating_ip] = (fixed_ip, rule_pr)
+
+        self._cleanup_unused_fip_ip_rules()
+
+    def _cleanup_unused_fip_ip_rules(self):
+        if not self.router_namespace.exists():
+            # It could be a new router, thus the namespace is not created yet.
+            return
+
+        ip_rules = ip_lib.list_ip_rules(self.ns_name,
+                                        lib_constants.IP_VERSION_4)
+        ip_rules = [ipr for ipr in ip_rules
+                    if ipr['table'] == dvr_fip_ns.FIP_RT_TBL]
+        for ip_rule in ip_rules:
+            for fixed_ip, rule_pr in self.floating_ips_dict.values():
+                if (ip_rule['from'] == fixed_ip and
+                        ip_rule['priority'] == rule_pr):
+                    break
+            else:
+                ip_lib.delete_ip_rule(self.ns_name, ip_rule['from'],
+                                      table=dvr_fip_ns.FIP_RT_TBL,
+                                      priority=ip_rule['priority'])
 
     def migrate_centralized_floating_ip(self, fip, interface_name, device):
         # Remove the centralized fip first and then add fip to the host
@@ -72,9 +132,10 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
         floating_ip = fip['floating_ip_address']
         rtr_2_fip_name = self.fip_ns.get_rtr_ext_device_name(self.router_id)
         dnat_from_floatingip_to_fixedip = (
-            'PREROUTING', '-d %s/32 -i %s -j DNAT --to-destination %s' % (
+            'PREROUTING', '-d {}/32 -i {} -j DNAT --to-destination {}'.format(
                 floating_ip, rtr_2_fip_name, fixed_ip))
-        to_source = '-s %s/32 -j SNAT --to-source %s' % (fixed_ip, floating_ip)
+        to_source = '-s {}/32 -j SNAT --to-source {}'.format(
+            fixed_ip, floating_ip)
         if self.iptables_manager.random_fully:
             to_source += ' --random-fully'
         snat_from_fixedip_to_floatingip = ('float-snat', to_source)
@@ -87,7 +148,7 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
 
         rtr_2_fip_name = self.fip_ns.get_rtr_ext_device_name(self.router_id)
         mark_traffic_to_floating_ip = (
-            'floatingip', '-d %s/32 -i %s -j MARK --set-xmark %s' % (
+            'floatingip', '-d {}/32 -i {} -j MARK --set-xmark {}'.format(
                 floating_ip, rtr_2_fip_name, internal_mark))
         mark_traffic_from_fixed_ip = (
             'FORWARD', '-s %s/32 -j $float-snat' % fixed_ip)
@@ -160,7 +221,11 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
                                   table=dvr_fip_ns.FIP_RT_TBL,
                                   priority=int(str(rule_pr)))
             self.fip_ns.deallocate_rule_priority(floating_ip)
-            # TODO(rajeev): Handle else case - exception/log?
+        else:
+            LOG.error('Floating IP %s not stored in this agent. Because of '
+                      'the initialization method '
+                      '"_load_used_fip_information", all floating IPs should '
+                      'be memoized in the local memory.', floating_ip)
 
     def floating_ip_removed_dist(self, fip_cidr):
         """Remove floating IP from FIP namespace."""
@@ -254,6 +319,8 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
             device_exists=True):
         """Add or delete arp entry into router namespace for the subnet."""
 
+        LOG.debug("Handling ARP entry operation %s for ip: %s mac: %s "
+                  "device: %s", operation, ip, mac, device)
         try:
             if device_exists:
                 if operation == 'add':
@@ -261,15 +328,14 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
                 elif operation == 'delete':
                     device.neigh.delete(ip, mac)
                 return True
-            else:
-                if operation == 'add':
-                    LOG.warning("Device %s does not exist so ARP entry "
-                                "cannot be updated, will cache "
-                                "information to be applied later "
-                                "when the device exists",
-                                device)
-                    self._cache_arp_entry(ip, mac, subnet_id, operation)
-                return False
+            if operation == 'add':
+                LOG.warning("Device %s does not exist so ARP entry "
+                            "cannot be updated, will cache "
+                            "information to be applied later "
+                            "when the device exists",
+                            device)
+                self._cache_arp_entry(ip, mac, subnet_id, operation)
+            return False
         except Exception:
             with excutils.save_and_reraise_exception():
                 LOG.exception("DVR: Failed updating arp entry")
@@ -284,26 +350,56 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
         device_exists = device.exists()
         return device, device_exists
 
-    def _set_subnet_arp_info(self, subnet_id):
+    def _set_subnet_arp_info(self, subnet):
         """Set ARP info retrieved from Plugin for existing ports."""
         # TODO(Carl) Can we eliminate the need to make this RPC while
         # processing a router.
-        subnet_ports = self.agent.get_ports_by_subnet(subnet_id)
+        subnet_ports = self.agent.get_ports_by_subnet(subnet['id'])
         ignored_device_owners = (
             lib_constants.ROUTER_INTERFACE_OWNERS +
             tuple(common_utils.get_dvr_allowed_address_pair_device_owners()))
-        device, device_exists = self.get_arp_related_dev(subnet_id)
+        device, device_exists = self.get_arp_related_dev(subnet['id'])
 
+        subnet_ip_version = netaddr.IPNetwork(subnet['cidr']).version
         for p in subnet_ports:
             if p['device_owner'] not in ignored_device_owners:
                 for fixed_ip in p['fixed_ips']:
+                    if fixed_ip['subnet_id'] == subnet['id']:
+                        self._update_arp_entry(fixed_ip['ip_address'],
+                                               p['mac_address'],
+                                               subnet['id'],
+                                               'add',
+                                               device=device,
+                                               device_exists=device_exists)
+                for allowed_address_pair in p.get('allowed_address_pairs', []):
+                    if ('/' not in str(allowed_address_pair['ip_address']) or
+                            common_utils.is_cidr_host(
+                                allowed_address_pair['ip_address'])):
+                        ip_address = common_utils.cidr_to_ip(
+                            allowed_address_pair['ip_address'])
+                        ip_version = common_utils.get_ip_version(ip_address)
+                        if ip_version == subnet_ip_version:
+                            self._update_arp_entry(
+                                ip_address,
+                                allowed_address_pair['mac_address'],
+                                subnet['id'],
+                                'add',
+                                device=device,
+                                device_exists=device_exists)
+
+        # subnet_ports does not have snat port if the port is still unbound
+        # by the time this function is called. So ensure to add arp entry
+        # for snat port if port details are updated in router info.
+        for p in self.get_snat_interfaces():
+            for fixed_ip in p['fixed_ips']:
+                if fixed_ip['subnet_id'] == subnet['id']:
                     self._update_arp_entry(fixed_ip['ip_address'],
                                            p['mac_address'],
-                                           subnet_id,
+                                           subnet['id'],
                                            'add',
                                            device=device,
                                            device_exists=device_exists)
-        self._process_arp_cache_for_internal_port(subnet_id)
+        self._process_arp_cache_for_internal_port(subnet['id'])
 
     @staticmethod
     def _get_snat_idx(ip_cidr):
@@ -317,7 +413,7 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
         """
         net = netaddr.IPNetwork(ip_cidr)
         if net.version == 6:
-            if isinstance(ip_cidr, six.text_type):
+            if isinstance(ip_cidr, str):
                 ip_cidr = ip_cidr.encode()  # Needed for Python 3.x
             # the crc32 & 0xffffffff is for Python 2.6 and 3.0 compatibility
             snat_idx = binascii.crc32(ip_cidr) & 0xffffffff
@@ -345,8 +441,8 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
             if snat_table in ['local', 'default', 'main']:
                 continue
             if (ip_version == lib_constants.IP_VERSION_4 and
-                snat_table in range(dvr_fip_ns.FIP_PR_START,
-                                    dvr_fip_ns.FIP_PR_END)):
+                    snat_table in range(dvr_fip_ns.FIP_PR_START,
+                                        dvr_fip_ns.FIP_PR_END)):
                 continue
             gateway_cidr = ip_rule['from']
             ip_lib.delete_ip_rule(namespace, ip=gateway_cidr, table=snat_table,
@@ -398,8 +494,7 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
             if is_add:
                 exc = 'DVR: error adding redirection logic'
             else:
-                exc = ('DVR: snat remove failed to clear the rule '
-                       'and device')
+                exc = 'DVR: snat remove failed to clear the rule and device'
             LOG.exception(exc)
 
     def _snat_redirect_add(self, gateway, sn_port, sn_int):
@@ -411,7 +506,7 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
         self._snat_redirect_modify(gateway, sn_port, sn_int, is_add=False)
 
     def internal_network_added(self, port):
-        super(DvrLocalRouter, self).internal_network_added(port)
+        super().internal_network_added(port)
 
         # NOTE: The following function _set_subnet_arp_info
         # should be called to dynamically populate the arp
@@ -420,15 +515,15 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
         # external_gateway port or the agent_mode.
         ex_gw_port = self.get_ex_gw_port()
         for subnet in port['subnets']:
-            self._set_subnet_arp_info(subnet['id'])
+            self._set_subnet_arp_info(subnet)
             if ex_gw_port:
                 # Check for address_scopes here if gateway exists.
                 address_scopes_match = self._check_if_address_scopes_match(
                     port, ex_gw_port)
                 if (address_scopes_match and
-                    (self.agent_conf.agent_mode in
-                        [lib_constants.L3_AGENT_MODE_DVR,
-                         lib_constants.L3_AGENT_MODE_DVR_SNAT])):
+                        (self.agent_conf.agent_mode in
+                         [lib_constants.L3_AGENT_MODE_DVR,
+                          lib_constants.L3_AGENT_MODE_DVR_SNAT])):
                     self._add_interface_routing_rule_to_router_ns(port)
                     self._add_interface_route_to_fip_ns(port)
         self._snat_redirect_add_from_port(port)
@@ -440,9 +535,9 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
         address_scopes_match = self._check_if_address_scopes_match(
             port, ex_gw_port)
         if (address_scopes_match and
-            (self.agent_conf.agent_mode in
-                [lib_constants.L3_AGENT_MODE_DVR,
-                 lib_constants.L3_AGENT_MODE_DVR_SNAT])):
+                (self.agent_conf.agent_mode in
+                 [lib_constants.L3_AGENT_MODE_DVR,
+                  lib_constants.L3_AGENT_MODE_DVR_SNAT])):
             return
         sn_port = self.get_snat_port_for_internal_port(port)
         if not sn_port:
@@ -464,9 +559,9 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
         address_scopes_match = self._check_if_address_scopes_match(
             port, self.ex_gw_port)
         if (address_scopes_match and
-            (self.agent_conf.agent_mode in
-                [lib_constants.L3_AGENT_MODE_DVR,
-                 lib_constants.L3_AGENT_MODE_DVR_SNAT])):
+                (self.agent_conf.agent_mode in
+                 [lib_constants.L3_AGENT_MODE_DVR,
+                  lib_constants.L3_AGENT_MODE_DVR_SNAT])):
             self._delete_interface_route_in_fip_ns(port)
             self._delete_interface_routing_rule_in_router_ns(port)
             # If address scopes match there is no need to cleanup the
@@ -482,7 +577,7 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
 
     def internal_network_removed(self, port):
         self._dvr_internal_network_removed(port)
-        super(DvrLocalRouter, self).internal_network_removed(port)
+        super().internal_network_removed(port)
 
     def get_floating_agent_gw_interface(self, ext_net_id):
         """Filter Floating Agent GW port for the external network."""
@@ -507,8 +602,8 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
             address_scopes_match = self._check_if_address_scopes_match(
                 p, ex_gw_port)
             if (not address_scopes_match or
-                (self.agent_conf.agent_mode ==
-                    lib_constants.L3_AGENT_MODE_DVR_NO_EXTERNAL)):
+                    (self.agent_conf.agent_mode ==
+                     lib_constants.L3_AGENT_MODE_DVR_NO_EXTERNAL)):
                 internal_dev = self.get_internal_device_name(p['id'])
                 self._snat_redirect_add(gateway, p, internal_dev)
 
@@ -521,8 +616,8 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
             address_scopes_match = self._check_if_address_scopes_match(
                 p, ex_gw_port)
             if (not address_scopes_match or
-                (self.agent_conf.agent_mode ==
-                    lib_constants.L3_AGENT_MODE_DVR_NO_EXTERNAL)):
+                    (self.agent_conf.agent_mode ==
+                     lib_constants.L3_AGENT_MODE_DVR_NO_EXTERNAL)):
                 internal_dev = self.get_internal_device_name(p['id'])
                 self._snat_redirect_remove(gateway, p, internal_dev)
 
@@ -625,10 +720,13 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
         if not ext_device_name:
             return ports_scopemark
 
-        ext_scope = self._get_external_address_scope()
-        ext_scope_mark = self.get_address_scope_mark_mask(ext_scope)
-        ports_scopemark[lib_constants.IP_VERSION_4][ext_device_name] = (
-            ext_scope_mark)
+        ext_scope_mark = self._get_port_devicename_scopemark(
+            [ext_port], self.get_internal_device_name,
+            interface_name=ext_device_name)
+        for ip_version in (lib_constants.IP_VERSION_4,
+                           lib_constants.IP_VERSION_6):
+            ports_scopemark[ip_version].update(
+                ext_scope_mark[ip_version])
         return ports_scopemark
 
     def _check_if_floatingip_bound_to_host(self, fip):
@@ -642,7 +740,7 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
             if ex_gw_port:
                 self.create_dvr_external_gateway_on_agent(ex_gw_port)
                 self.connect_rtr_2_fip()
-        super(DvrLocalRouter, self).process_external()
+        super().process_external()
 
     def _check_rtr_2_fip_connect(self):
         """Checks if the rtr to fip connect exists, if not sets to false."""
@@ -769,19 +867,21 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
                 tbl_index = self._get_snat_idx(fip_2_rtr)
                 self._update_fip_route_table_with_next_hop_routes(
                     operation, route, fip_ns_name, tbl_index)
-        super(DvrLocalRouter, self).update_routing_table(operation, route)
+        super().update_routing_table(operation, route)
 
     def _update_fip_route_table_with_next_hop_routes(self, operation, route,
                                                      fip_ns_name, tbl_index):
-        cmd = ['ip', 'route', operation, 'to', route['destination'],
-               'via', route['nexthop'], 'table', tbl_index]
-        ip_wrapper = ip_lib.IPWrapper(namespace=fip_ns_name)
-        if ip_wrapper.netns.exists(fip_ns_name):
-            ip_wrapper.netns.execute(cmd, check_exit_code=False)
-        else:
+        cmd = (ip_lib.add_ip_route if operation == 'replace' else
+               ip_lib.delete_ip_route)
+        try:
+            cmd(fip_ns_name, route['destination'], via=route['nexthop'],
+                table=tbl_index, proto='boot')
+        except priv_ip_lib.NetworkNamespaceNotFound:
             LOG.debug("The FIP namespace %(ns)s does not exist for "
                       "router %(id)s",
                       {'ns': fip_ns_name, 'id': self.router_id})
+        except (OSError, pyroute2_exc.NetlinkError):
+            pass
 
     def _check_if_route_applicable_to_fip_namespace(self, route,
                                                     agent_gateway_port):
@@ -824,4 +924,4 @@ class DvrLocalRouter(dvr_router_base.DvrRouterBase):
             self.fip_ns = self.agent.get_fip_ns(ex_gw_port['network_id'])
             self.fip_ns.scan_fip_ports(self)
 
-        super(DvrLocalRouter, self).process()
+        super().process()

@@ -1,7 +1,7 @@
 .. _config-plugin-ml2:
 
 ===========
-ML2 plug-in
+ML2 Plug-in
 ===========
 
 Architecture
@@ -51,19 +51,23 @@ ML2 driver support matrix
      - VLAN
      - VXLAN
      - GRE
+     - Geneve
    * - Open vSwitch
      - yes
      - yes
      - yes
      - yes
-   * - Linux bridge
+     - yes
+   * - OVN
      - yes
      - yes
-     - yes
+     - yes (requires OVN 20.09+)
      - no
+     - yes
    * - SRIOV
      - yes
      - yes
+     - no
      - no
      - no
    * - MacVTap
@@ -71,9 +75,11 @@ ML2 driver support matrix
      - yes
      - no
      - no
+     - no
    * - L2 population
      - no
      - no
+     - yes
      - yes
      - yes
 
@@ -81,10 +87,9 @@ ML2 driver support matrix
 
    L2 population is a special mechanism driver that optimizes BUM (Broadcast,
    unknown destination address, multicast) traffic in the overlay networks
-   VXLAN and GRE. It needs to be used in conjunction with either the
-   Linux bridge or the Open vSwitch mechanism driver and cannot be used as
-   standalone mechanism driver. For more information, see the
-   *Mechanism drivers* section below.
+   VXLAN, GRE and Geneve. It needs to be used in conjunction with the
+   Open vSwitch mechanism driver and cannot be used as standalone mechanism
+   driver. For more information, see the *Mechanism drivers* section below.
 
 Configuration
 ~~~~~~~~~~~~~
@@ -155,10 +160,6 @@ More information about provider networks see
      VXLAN multicast group configuration is not applicable for the Open
      vSwitch agent.
 
-     As of today it is not used in the Linux bridge agent. The Linux bridge
-     agent has its own agent specific configuration option. For more details,
-     see the `Bug 1523614 <https://bugs.launchpad.net/neutron/+bug/1523614>`__.
-
 Project network types
 ^^^^^^^^^^^^^^^^^^^^^
 
@@ -215,17 +216,19 @@ To enable mechanism drivers in the ML2 plug-in, edit the
 For more details, see the
 `Configuration Reference <../configuration/ml2-conf.html#ml2>`__.
 
-* Linux bridge
-
-  No additional configurations required for the mechanism driver. Additional
-  agent configuration is required. For details, see the related *L2 agent*
-  section below.
-
 * Open vSwitch
 
   No additional configurations required for the mechanism driver. Additional
   agent configuration is required. For details, see the related *L2 agent*
   section below.
+
+* OVN
+
+  The administrator must configure some additional configuration options for
+  the mechanism driver. When this driver is used, architecture of the Neutron
+  application in the cluster is different from what it is with other drivers
+  like e.g. Open vSwitch.
+  For details, see :ref:`OVN reference architecture<refarch-refarch>`.
 
 * SRIOV
 
@@ -263,27 +266,27 @@ For more details, see the
 Supported VNIC types
 ^^^^^^^^^^^^^^^^^^^^
 
-The ``vnic_type_blacklist`` option is used to remove values from the mechanism driver's
-``supported_vnic_types`` list.
+The ``vnic_type_prohibit_list`` option is used to remove values from the
+mechanism driver's ``supported_vnic_types`` list.
 
 .. list-table:: Mechanism drivers and supported VNIC types
    :header-rows: 1
 
    * - mech driver / supported_vnic_types
      - supported VNIC types
-     - blacklisting available
-   * - Linux bridge
-     - normal
+     - prohibiting available
+   * - OVN
+     - normal, direct, direct_macvtap, direct_physical
      - no
    * - MacVTap
      - macvtap
      - no
    * - Open vSwitch
      - normal, direct
-     - yes (ovs_driver vnic_type_blacklist, see: `Configuration Reference <../configuration/ml2-conf.html#ovs_driver>`__)
+     - yes (ovs_driver vnic_type_prohibit_list, see: `Configuration Reference <../configuration/ml2-conf.html#ovs_driver>`__)
    * - SRIOV
      - direct, macvtap, direct_physical
-     - yes (sriov_driver vnic_type_blacklist, see: `Configuration Reference <../configuration/ml2-conf.html#sriov_driver>`__)
+     - yes (sriov_driver vnic_type_prohibit_list, see: `Configuration Reference <../configuration/ml2-conf.html#sriov_driver>`__)
 
 
 Extension Drivers
@@ -293,7 +296,9 @@ The ML2 plug-in also supports extension drivers that allows other pluggable
 drivers to extend the core resources implemented in the ML2 plug-in
 (``networks``, ``ports``, etc.). Examples of extension drivers include support
 for QoS, port security, etc. For more details see the ``extension_drivers``
-configuration option in the `Configuration Reference <../configuration/ml2-conf.html#ml2.extension_drivers>`__.
+configuration option in the
+`Configuration Reference
+<../configuration/ml2-conf.html#ml2.extension_drivers>`__.
 
 
 Agents
@@ -316,18 +321,6 @@ resources. It typically runs on each Network Node and on each Compute Node.
 
   For a detailed list of configuration options, see the related section in the
   `Configuration Reference <../configuration/openvswitch-agent.html>`__.
-
-* Linux bridge agent
-
-  The Linux bridge agent configures Linux bridges to realize L2 networks for
-  OpenStack resources.
-
-  Configuration for the Linux bridge agent is typically done in the
-  ``linuxbridge_agent.ini`` configuration file. Make sure that on agent start
-  you pass this configuration file as argument.
-
-  For a detailed list of configuration options, see the related section in the
-  `Configuration Reference <../configuration/linuxbridge-agent.html>`__.
 
 * SRIOV Nic Switch agent
 
@@ -440,14 +433,14 @@ implementations:
      - L2 agent
    * - Open vSwitch
      - Open vSwitch agent
-   * - Linux bridge
-     - Linux bridge agent
+   * - OVN
+     - No (there is ovn-controller running on nodes)
    * - SRIOV
      - SRIOV nic switch agent
    * - MacVTap
      - MacVTap agent
    * - L2 population
-     - Open vSwitch agent, Linux bridge agent
+     - Open vSwitch agent
 
 The following tables shows which reference implementations support which
 non-L2 neutron agents:
@@ -465,11 +458,11 @@ non-L2 neutron agents:
      - yes
      - yes
      - yes
-   * - Linux bridge & Linux bridge agent
-     - yes
-     - yes
-     - yes
-     - yes
+   * - OVN
+     - no (own L3 implementation)
+     - no (DHCP provided by OVN, fully distributed)
+     - yes (running on compute nodes, fully distributed)
+     - no
    * - SRIOV & SRIOV nic switch agent
      - no
      - no
@@ -500,17 +493,17 @@ This guide characterizes the L2 reference implementations that currently exist.
   Can be used for instance network attachments as well as for attachments of
   other network resources like routers, DHCP, and so on.
 
-* Linux bridge mechanism and Linux bridge agent
+* OVN mechanism driver
 
   Can be used for instance network attachments as well as for attachments of
-  other network resources like routers, DHCP, and so on.
+  other network resources like routers, metadata ports, and so on.
 
 * SRIOV mechanism driver and SRIOV NIC switch agent
 
   Can only be used for instance network attachments (device_owner = compute).
 
-  Is deployed besides an other mechanism driver and L2 agent such as OVS or
-  Linux bridge. It offers instances direct access to the network adapter
+  Is deployed besides an other mechanism driver and L2 agent such as OVS. It
+  offers instances direct access to the network adapter
   through a PCI Virtual Function (VF). This gives an instance direct access to
   hardware capabilities and high performance networking.
 
@@ -527,8 +520,8 @@ This guide characterizes the L2 reference implementations that currently exist.
   Can only be used for instance network attachments (device_owner = compute)
   and not for attachment of other resources like routers, DHCP, and so on.
 
-  It is positioned as alternative to Open vSwitch or Linux bridge support on
-  the compute node for internal deployments.
+  It is positioned as alternative to Open vSwitch support on the compute node
+  for internal deployments.
 
   MacVTap offers a direct connection with very little overhead between
   instances and down to the adapter. You can use MacVTap agent on the

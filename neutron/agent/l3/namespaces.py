@@ -45,7 +45,7 @@ def get_prefix_from_ns_name(ns_name):
     :returns: The prefix ending with a '-' or None if there is no '-'
     """
     dash_index = ns_name.find('-')
-    if 0 <= dash_index:
+    if dash_index >= 0:
         return ns_name[:dash_index + 1]
 
 
@@ -56,7 +56,7 @@ def get_id_from_ns_name(ns_name):
     :returns: Identifier or None if there is no - to end the prefix
     """
     dash_index = ns_name.find('-')
-    if 0 <= dash_index:
+    if dash_index >= 0:
         return ns_name[dash_index + 1:]
 
 
@@ -79,7 +79,7 @@ def check_ns_existence(f):
     return wrapped
 
 
-class Namespace(object):
+class Namespace:
 
     def __init__(self, name, agent_conf, driver, use_ipv6):
         self.name = name
@@ -89,23 +89,26 @@ class Namespace(object):
         self.use_ipv6 = use_ipv6
 
     def create(self, ipv6_forwarding=True):
+        self.ip_wrapper_root.ensure_namespace(self.name)
         # See networking (netdev) tree, file
         # Documentation/networking/ip-sysctl.txt for an explanation of
         # these sysctl values.
-        ip_wrapper = self.ip_wrapper_root.ensure_namespace(self.name)
-        cmd = ['sysctl', '-w', 'net.ipv4.ip_forward=1']
-        ip_wrapper.netns.execute(cmd)
-        # 1. Reply only if the target IP address is local address configured
-        #    on the incoming interface; and
-        # 2. Always use the best local address
-        cmd = ['sysctl', '-w', 'net.ipv4.conf.all.arp_ignore=1']
-        ip_wrapper.netns.execute(cmd)
-        cmd = ['sysctl', '-w', 'net.ipv4.conf.all.arp_announce=2']
-        ip_wrapper.netns.execute(cmd)
+        # Here's what we are setting:
+        # 1) nf_conntrack_tcp_be_liberal=1 - Be liberal in the state tracking
+        #    to avoid issues with TCP window scaling
+        # 2) ip_forward=1 - Turn on IP forwarding
+        # 3) arp_ignore=1 - Reply only if the target IP address is local
+        #    address configured on the incoming interface
+        # 4) arp_announce=2 - Always use the best local address
+        # 5) forwarding=0/1 - Turn on/off IPv6 forwarding
+        cmd = ['net.netfilter.nf_conntrack_tcp_be_liberal=1',
+               'net.ipv4.ip_forward=1',
+               'net.ipv4.conf.all.arp_ignore=1',
+               'net.ipv4.conf.all.arp_announce=2']
         if self.use_ipv6:
-            cmd = ['sysctl', '-w',
-                   'net.ipv6.conf.all.forwarding=%d' % int(ipv6_forwarding)]
-            ip_wrapper.netns.execute(cmd)
+            cmd.append(
+                'net.ipv6.conf.all.forwarding=%d' % int(ipv6_forwarding))
+        ip_lib.sysctl(cmd, namespace=self.name)
 
     def delete(self):
         try:
@@ -123,7 +126,7 @@ class RouterNamespace(Namespace):
     def __init__(self, router_id, agent_conf, driver, use_ipv6):
         self.router_id = router_id
         name = self._get_ns_name(router_id)
-        super(RouterNamespace, self).__init__(
+        super().__init__(
             name, agent_conf, driver, use_ipv6)
 
     @classmethod
@@ -146,4 +149,4 @@ class RouterNamespace(Namespace):
                     namespace=self.name,
                     prefix=EXTERNAL_DEV_PREFIX)
 
-        super(RouterNamespace, self).delete()
+        super().delete()

@@ -1,5 +1,6 @@
 # Copyright (C) 2014,2015 VA Linux Systems Japan K.K.
 # Copyright (C) 2014,2015 YAMAMOTO Takashi <yamamoto at valinux co jp>
+# Copyright (c) 2021-2022 Chinaunicom
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -21,37 +22,144 @@
 
 import netaddr
 
-from neutron_lib import constants as p_const
+from neutron_lib import constants as lib_consts
+from neutron_lib.plugins.ml2 import ovs_constants as constants
 from os_ken.lib.packet import ether_types
 from os_ken.lib.packet import icmpv6
 from os_ken.lib.packet import in_proto
 from oslo_log import log as logging
 
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants
+from neutron.plugins.ml2.common import constants as comm_consts
+from neutron.plugins.ml2.drivers.openvswitch.agent.openflow.native \
+    import br_dvr_process
 from neutron.plugins.ml2.drivers.openvswitch.agent.openflow.native \
     import ovs_bridge
 
 
 LOG = logging.getLogger(__name__)
 
+METER_FLAG_PPS = comm_consts.METER_FLAG_PPS
+METER_FLAG_BPS = comm_consts.METER_FLAG_BPS
 
-class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge):
+PACKET_RATE_LIMIT = constants.PACKET_RATE_LIMIT
+BANDWIDTH_RATE_LIMIT = constants.BANDWIDTH_RATE_LIMIT
+
+
+class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge,
+                           br_dvr_process.OVSDVRInterfaceMixin):
     """openvswitch agent br-int specific logic."""
 
     of_tables = constants.INT_BR_ALL_TABLES
 
-    def setup_default_table(self):
+    def setup_default_table(self, enable_openflow_dhcp=False,
+                            enable_dhcpv6=False):
+        (_dp, ofp, ofpp) = self._get_dp()
         self.setup_canary_table()
-        self.install_goto(dest_table_id=constants.TRANSIENT_TABLE)
-        self.install_normal(table_id=constants.TRANSIENT_TABLE, priority=3)
+        self.install_goto(dest_table_id=PACKET_RATE_LIMIT)
+        self.install_goto(dest_table_id=BANDWIDTH_RATE_LIMIT,
+                          table_id=PACKET_RATE_LIMIT)
+        self.install_goto(dest_table_id=constants.TRANSIENT_TABLE,
+                          table_id=BANDWIDTH_RATE_LIMIT)
+        self.install_normal(table_id=constants.TRANSIENT_TABLE, priority=1)
+        self.init_dhcp(enable_openflow_dhcp=enable_openflow_dhcp,
+                       enable_dhcpv6=enable_dhcpv6)
         self.install_drop(table_id=constants.ARP_SPOOF_TABLE)
-        self.install_drop(table_id=constants.LOCAL_SWITCHING,
-                          priority=constants.OPENFLOW_MAX_PRIORITY,
-                          vlan_vid=constants.DEAD_VLAN_TAG)
+        self.install_drop(
+            table_id=constants.LOCAL_SWITCHING,
+            priority=constants.OPENFLOW_MAX_PRIORITY,
+            vlan_vid=ofp.OFPVID_PRESENT | constants.DEAD_VLAN_TAG,
+        )
         # When openflow firewall is not enabled, we use this table to
         # deal with all egress flow.
         self.install_normal(table_id=constants.TRANSIENT_EGRESS_TABLE,
                             priority=3)
+
+        # Local IP defaults
+        self.install_goto(dest_table_id=PACKET_RATE_LIMIT,
+                          table_id=constants.LOCAL_EGRESS_TABLE)
+        self.install_goto(dest_table_id=PACKET_RATE_LIMIT,
+                          table_id=constants.LOCAL_IP_TABLE)
+
+    def init_dhcp(self, enable_openflow_dhcp=False, enable_dhcpv6=False):
+        if not enable_openflow_dhcp:
+            return
+        # DHCP IPv4
+        self.install_goto(dest_table_id=constants.DHCP_IPV4_TABLE,
+                          table_id=constants.TRANSIENT_TABLE,
+                          priority=101,
+                          eth_type=ether_types.ETH_TYPE_IP,
+                          ip_proto=in_proto.IPPROTO_UDP,
+                          ipv4_dst=lib_consts.IPv4_NETWORK_BROADCAST,
+                          udp_src=lib_consts.DHCP_CLIENT_PORT,
+                          udp_dst=lib_consts.DHCP_RESPONSE_PORT)
+        self.install_drop(table_id=constants.DHCP_IPV4_TABLE)
+
+        if not enable_dhcpv6:
+            return
+        # DHCP IPv6
+        self.install_goto(dest_table_id=constants.DHCP_IPV6_TABLE,
+            table_id=constants.TRANSIENT_TABLE,
+            priority=101,
+            eth_type=ether_types.ETH_TYPE_IPV6,
+            ip_proto=in_proto.IPPROTO_UDP,
+            ipv6_dst=lib_consts.IPv6_ALL_DHCP_RELAY_AGENTS_AND_SERVERS,
+            udp_src=lib_consts.DHCPV6_CLIENT_PORT,
+            udp_dst=lib_consts.DHCPV6_RESPONSE_PORT)
+        self.install_drop(table_id=constants.DHCP_IPV6_TABLE)
+
+    def add_dhcp_ipv4_flow(self, port_id, ofport, port_mac):
+        (_dp, ofp, ofpp) = self._get_dp()
+        match = ofpp.OFPMatch(eth_type=ether_types.ETH_TYPE_IP,
+                              ip_proto=in_proto.IPPROTO_UDP,
+                              in_port=ofport,
+                              eth_src=port_mac,
+                              udp_src=68,
+                              udp_dst=67)
+        actions = [
+            ofpp.OFPActionOutput(ofp.OFPP_CONTROLLER, 0),
+        ]
+        instructions = [
+            ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions),
+        ]
+        self.install_instructions(table_id=constants.DHCP_IPV4_TABLE,
+                                  priority=100,
+                                  instructions=instructions,
+                                  match=match)
+
+    def add_dhcp_ipv6_flow(self, port_id, ofport, port_mac):
+        (_dp, ofp, ofpp) = self._get_dp()
+        match = ofpp.OFPMatch(eth_type=ether_types.ETH_TYPE_IPV6,
+                              ip_proto=in_proto.IPPROTO_UDP,
+                              in_port=ofport,
+                              eth_src=port_mac,
+                              udp_src=546,
+                              udp_dst=547)
+        actions = [
+            ofpp.OFPActionOutput(ofp.OFPP_CONTROLLER, 0),
+        ]
+        instructions = [
+            ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions),
+        ]
+        self.install_instructions(table_id=constants.DHCP_IPV6_TABLE,
+                                  priority=100,
+                                  instructions=instructions,
+                                  match=match)
+
+    def del_dhcp_flow(self, ofport, port_mac):
+        self.uninstall_flows(table_id=constants.DHCP_IPV4_TABLE,
+                             eth_type=ether_types.ETH_TYPE_IP,
+                             ip_proto=in_proto.IPPROTO_UDP,
+                             in_port=ofport,
+                             eth_src=port_mac,
+                             udp_src=68,
+                             udp_dst=67)
+        self.uninstall_flows(table_id=constants.DHCP_IPV6_TABLE,
+                             eth_type=ether_types.ETH_TYPE_IPV6,
+                             ip_proto=in_proto.IPPROTO_UDP,
+                             in_port=ofport,
+                             eth_src=port_mac,
+                             udp_src=546,
+                             udp_dst=547)
 
     def setup_canary_table(self):
         self.install_drop(constants.CANARY_TABLE)
@@ -82,7 +190,8 @@ class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge):
         ]
         instructions = [
             ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions),
-            ofpp.OFPInstructionGotoTable(table_id=constants.TRANSIENT_TABLE),
+            ofpp.OFPInstructionGotoTable(
+                table_id=PACKET_RATE_LIMIT),
         ]
         self.install_instructions(
             instructions=instructions,
@@ -103,15 +212,16 @@ class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge):
     def _arp_dvr_dst_mac_match(ofp, ofpp, vlan, dvr_mac):
         # If eth_dst is equal to the dvr mac of this host, then
         # flag it as matched.
+        if not vlan:
+            return ofpp.OFPMatch(vlan_vid=ofp.OFPVID_NONE, eth_dst=dvr_mac)
         return ofpp.OFPMatch(vlan_vid=vlan | ofp.OFPVID_PRESENT,
                              eth_dst=dvr_mac)
 
     @staticmethod
     def _dvr_dst_mac_table_id(network_type):
-        if network_type == p_const.TYPE_VLAN:
-            return constants.ARP_DVR_MAC_TO_DST_MAC_VLAN
-        else:
-            return constants.ARP_DVR_MAC_TO_DST_MAC
+        if network_type in constants.DVR_PHYSICAL_NETWORK_TYPES:
+            return constants.ARP_DVR_MAC_TO_DST_MAC_PHYSICAL
+        return constants.ARP_DVR_MAC_TO_DST_MAC
 
     def install_dvr_dst_mac_for_arp(self, network_type,
                                     vlan_tag, gateway_mac, dvr_mac, rtr_port):
@@ -137,15 +247,17 @@ class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge):
 
     @staticmethod
     def _dvr_to_src_mac_match(ofp, ofpp, vlan_tag, dst_mac):
+        if not vlan_tag:
+            # When the network is flat type, the vlan_tag will be None.
+            return ofpp.OFPMatch(vlan_vid=ofp.OFPVID_NONE, eth_dst=dst_mac)
         return ofpp.OFPMatch(vlan_vid=vlan_tag | ofp.OFPVID_PRESENT,
                              eth_dst=dst_mac)
 
     @staticmethod
     def _dvr_to_src_mac_table_id(network_type):
-        if network_type == p_const.TYPE_VLAN:
-            return constants.DVR_TO_SRC_MAC_VLAN
-        else:
-            return constants.DVR_TO_SRC_MAC
+        if network_type in constants.DVR_PHYSICAL_NETWORK_TYPES:
+            return constants.DVR_TO_SRC_MAC_PHYSICAL
+        return constants.DVR_TO_SRC_MAC
 
     def install_dvr_to_src_mac(self, network_type,
                                vlan_tag, gateway_mac, dst_mac, dst_port):
@@ -158,16 +270,17 @@ class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge):
         ]
         instructions = [
             ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions),
-            ofpp.OFPInstructionGotoTable(table_id=constants.TRANSIENT_TABLE),
+            ofpp.OFPInstructionGotoTable(
+                table_id=PACKET_RATE_LIMIT),
         ]
         self.install_instructions(table_id=table_id,
                                   priority=20,
                                   match=match,
                                   instructions=instructions)
-        actions = [
-            ofpp.OFPActionPopVlan(),
-            ofpp.OFPActionOutput(dst_port, 0),
-        ]
+        actions = []
+        if vlan_tag:
+            actions.append(ofpp.OFPActionPopVlan())
+        actions.append(ofpp.OFPActionOutput(dst_port, 0))
         self.install_apply_actions(table_id=constants.TRANSIENT_TABLE,
                                    priority=20,
                                    match=match,
@@ -182,12 +295,12 @@ class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge):
             self.uninstall_flows(
                 strict=True, priority=20, table_id=table, match=match)
 
-    def add_dvr_mac_vlan(self, mac, port):
+    def add_dvr_mac_physical(self, mac, port):
         self.install_goto(table_id=constants.LOCAL_SWITCHING,
                           priority=4,
                           in_port=port,
                           eth_src=mac,
-                          dest_table_id=constants.DVR_TO_SRC_MAC_VLAN)
+                          dest_table_id=constants.DVR_TO_SRC_MAC_PHYSICAL)
 
     def remove_dvr_mac_vlan(self, mac):
         # REVISIT(yamamoto): match in_port as well?
@@ -214,11 +327,12 @@ class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge):
             strict=True, priority=5, table_id=table_id, match=match)
 
     def add_dvr_gateway_mac_arp_vlan(self, mac, port):
-        self.install_goto(table_id=constants.LOCAL_SWITCHING,
-                          priority=5,
-                          in_port=port,
-                          eth_dst=mac,
-                          dest_table_id=constants.ARP_DVR_MAC_TO_DST_MAC_VLAN)
+        self.install_goto(
+            table_id=constants.LOCAL_SWITCHING,
+            priority=5,
+            in_port=port,
+            eth_dst=mac,
+            dest_table_id=constants.ARP_DVR_MAC_TO_DST_MAC_PHYSICAL)
 
     def remove_dvr_gateway_mac_arp_vlan(self, mac, port):
         self.uninstall_flows(table_id=constants.LOCAL_SWITCHING,
@@ -258,7 +372,7 @@ class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge):
                 ip_proto=in_proto.IPPROTO_ICMPV6,
                 icmpv6_type=icmpv6.ND_NEIGHBOR_ADVERT,
                 ipv6_nd_target=masked_ip, in_port=port,
-                dest_table_id=constants.TRANSIENT_TABLE)
+                dest_table_id=PACKET_RATE_LIMIT)
 
         # Now that the rules are ready, direct icmpv6 neighbor advertisement
         # traffic from the port into the anti-spoof table.
@@ -273,16 +387,18 @@ class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge):
                                   allow_all=False):
         if allow_all:
             self.uninstall_flows(table_id=constants.LOCAL_SWITCHING,
-                                 in_port=port)
+                                 in_port=port,
+                                 strict=True, priority=9)
             self.uninstall_flows(table_id=constants.MAC_SPOOF_TABLE,
-                                 in_port=port)
+                                 in_port=port,
+                                 strict=True, priority=2)
             return
         mac_addresses = mac_addresses or []
         for address in mac_addresses:
             self.install_goto(
                 table_id=constants.MAC_SPOOF_TABLE, priority=2,
                 eth_src=address, in_port=port,
-                dest_table_id=constants.TRANSIENT_TABLE)
+                dest_table_id=constants.LOCAL_EGRESS_TABLE)
         # normalize so we can see if macs are the same
         mac_addresses = {netaddr.EUI(mac) for mac in mac_addresses}
         flows = self.dump_flows(constants.MAC_SPOOF_TABLE)
@@ -323,6 +439,142 @@ class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge):
                           match=match,
                           dest_table_id=constants.ARP_SPOOF_TABLE)
 
+    def list_meter_features(self):
+        (dp, _ofp, ofpp) = self._get_dp()
+        req = ofpp.OFPMeterFeaturesStatsRequest(dp, 0)
+
+        rep = self._send_msg(req, reply_cls=ofpp.OFPMeterFeaturesStatsReply)
+
+        features = []
+        for stat in rep.body:
+            features.append({"max_meter": stat.max_meter,
+                             "band_types": stat.band_types,
+                             "capabilities": stat.capabilities,
+                             "max_bands": stat.max_bands,
+                             "max_color": stat.max_color})
+        return features
+
+    def create_meter(self, meter_id, rate, burst=0, type_=METER_FLAG_PPS):
+        (dp, ofp, ofpp) = self._get_dp()
+
+        bands = [
+            ofpp.OFPMeterBandDrop(rate=rate, burst_size=burst)]
+
+        if type_ == METER_FLAG_PPS:
+            if burst != 0:
+                flags = ofp.OFPMF_PKTPS | ofp.OFPMF_BURST
+            else:
+                flags = ofp.OFPMF_PKTPS
+        elif type_ == METER_FLAG_BPS:
+            if burst != 0:
+                flags = ofp.OFPMF_KBPS | ofp.OFPMF_BURST
+            else:
+                flags = ofp.OFPMF_KBPS
+        else:
+            return
+
+        req = ofpp.OFPMeterMod(datapath=dp, command=ofp.OFPMC_ADD,
+                               flags=flags, meter_id=meter_id,
+                               bands=bands)
+        self._send_msg(req)
+
+    def delete_meter(self, meter_id):
+        (dp, ofp, ofpp) = self._get_dp()
+
+        req = ofpp.OFPMeterMod(datapath=dp, command=ofp.OFPMC_DELETE,
+                               flags=ofp.OFPMF_PKTPS, meter_id=meter_id)
+        self._send_msg(req)
+
+    def update_meter(self, meter_id, rate, burst=0, type_=METER_FLAG_PPS):
+        (dp, ofp, ofpp) = self._get_dp()
+
+        bands = [
+            ofpp.OFPMeterBandDrop(rate=rate, burst_size=burst)]
+
+        if type_ == METER_FLAG_PPS:
+            if burst != 0:
+                flags = ofp.OFPMF_PKTPS | ofp.OFPMF_BURST
+            else:
+                flags = ofp.OFPMF_PKTPS
+        elif type_ == METER_FLAG_BPS:
+            if burst != 0:
+                flags = ofp.OFPMF_KBPS | ofp.OFPMF_BURST
+            else:
+                flags = ofp.OFPMF_KBPS
+        else:
+            return
+
+        req = ofpp.OFPMeterMod(datapath=dp, command=ofp.OFPMC_MODIFY,
+                               flags=flags, meter_id=meter_id,
+                               bands=bands)
+        self._send_msg(req)
+
+    def apply_meter_to_port(self, meter_id, direction, mac,
+                            in_port=None, local_vlan=None,
+                            type_=METER_FLAG_PPS):
+        """Add meter flows to port.
+
+        Ingress: match dst MAC and local_vlan ID
+        Egress: match src MAC and OF in_port
+        """
+        (_dp, ofp, ofpp) = self._get_dp()
+
+        if direction == lib_consts.EGRESS_DIRECTION and in_port:
+            match = ofpp.OFPMatch(in_port=in_port, eth_src=mac)
+        elif direction == lib_consts.INGRESS_DIRECTION and local_vlan:
+            vlan_vid = local_vlan | ofp.OFPVID_PRESENT
+            match = ofpp.OFPMatch(vlan_vid=vlan_vid, eth_dst=mac)
+        else:
+            LOG.warning("Invalid inputs to add meter flows to port.")
+            return
+
+        if type_ == METER_FLAG_PPS:
+            table_id = PACKET_RATE_LIMIT
+            dest_table = BANDWIDTH_RATE_LIMIT
+        elif type_ == METER_FLAG_BPS:
+            table_id = BANDWIDTH_RATE_LIMIT
+            dest_table = constants.TRANSIENT_TABLE
+        else:
+            return
+
+        instructions = [
+            ofpp.OFPInstructionMeter(meter_id, type_=ofp.OFPIT_METER),
+            ofpp.OFPInstructionGotoTable(table_id=dest_table)]
+
+        self.install_instructions(table_id=table_id,
+                                  priority=100,
+                                  instructions=instructions,
+                                  match=match)
+
+    def remove_meter_from_port(self, direction, mac,
+                               in_port=None, local_vlan=None,
+                               type_=METER_FLAG_PPS):
+        """Remove meter flows from port.
+
+        Ingress: match dst MAC and local_vlan ID
+        Egress: match src MAC and OF in_port
+        """
+        (_dp, ofp, ofpp) = self._get_dp()
+
+        if direction == lib_consts.EGRESS_DIRECTION and in_port:
+            match = ofpp.OFPMatch(in_port=in_port, eth_src=mac)
+        elif direction == lib_consts.INGRESS_DIRECTION and local_vlan:
+            vlan_vid = local_vlan | ofp.OFPVID_PRESENT
+            match = ofpp.OFPMatch(vlan_vid=vlan_vid, eth_dst=mac)
+        else:
+            LOG.warning("Invalid inputs to remove meter flows from port.")
+            return
+
+        if type_ == METER_FLAG_PPS:
+            table_id = PACKET_RATE_LIMIT
+        elif type_ == METER_FLAG_BPS:
+            table_id = BANDWIDTH_RATE_LIMIT
+        else:
+            return
+
+        self.uninstall_flows(table_id=table_id,
+                             match=match)
+
     def delete_arp_spoofing_protection(self, port):
         (_dp, ofp, ofpp) = self._get_dp()
         match = self._arp_reply_match(ofp, ofpp, port=port)
@@ -355,3 +607,73 @@ class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge):
         self.install_instructions(instructions, table_id=0,
                                   priority=65535, in_port=port, reg2=0,
                                   eth_type=0x86DD)
+
+    def setup_local_egress_flows(self, in_port, vlan):
+        if in_port == constants.OFPORT_INVALID:
+            LOG.warning("Invalid ofport: %s, vlan: %s - "
+                        "skipping setup_local_egress_flows", in_port, vlan)
+            return
+
+        # Setting priority to 8 to give advantage to ARP/MAC spoofing rules
+        self.install_goto(table_id=constants.LOCAL_SWITCHING,
+                          priority=8,
+                          in_port=in_port,
+                          dest_table_id=constants.LOCAL_EGRESS_TABLE)
+        (dp, ofp, ofpp) = self._get_dp()
+        actions = [ofpp.OFPActionSetField(reg6=vlan),
+                   ofpp.NXActionResubmitTable(
+                       in_port=in_port, table_id=constants.LOCAL_IP_TABLE)]
+        instructions = [
+            ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions),
+        ]
+        self.install_instructions(instructions,
+                                  table_id=constants.LOCAL_EGRESS_TABLE,
+                                  priority=10, in_port=in_port)
+
+    @staticmethod
+    def _arp_responder_match(ofp, ofpp, vlan, ip):
+        return ofpp.OFPMatch(reg6=vlan,
+                             eth_type=ether_types.ETH_TYPE_ARP,
+                             arp_tpa=ip)
+
+    def _garp_blocker_match(self, vlan, ip):
+        (dp, ofp, ofpp) = self._get_dp()
+        return ofpp.OFPMatch(vlan_vid=vlan | ofp.OFPVID_PRESENT,
+                             eth_type=ether_types.ETH_TYPE_ARP,
+                             arp_spa=ip)
+
+    def install_garp_blocker(self, vlan, ip,
+                             table_id=constants.LOCAL_SWITCHING):
+        match = self._garp_blocker_match(vlan, ip)
+        self.install_drop(table_id=table_id,
+                          priority=10,
+                          match=match)
+
+    def delete_garp_blocker(self, vlan, ip,
+                            table_id=constants.LOCAL_SWITCHING):
+        match = self._garp_blocker_match(vlan, ip)
+        self.uninstall_flows(table_id=table_id,
+                             priority=10,
+                             match=match)
+
+    def _garp_blocker_exception_match(self, vlan, ip, except_ip):
+        (dp, ofp, ofpp) = self._get_dp()
+        return ofpp.OFPMatch(vlan_vid=vlan | ofp.OFPVID_PRESENT,
+                             eth_type=ether_types.ETH_TYPE_ARP,
+                             arp_spa=ip,
+                             arp_tpa=except_ip)
+
+    def install_garp_blocker_exception(self, vlan, ip, except_ip,
+                                       table_id=constants.LOCAL_SWITCHING):
+        match = self._garp_blocker_exception_match(vlan, ip, except_ip)
+        self.install_goto(dest_table_id=PACKET_RATE_LIMIT,
+                          table_id=table_id,
+                          priority=11,
+                          match=match)
+
+    def delete_garp_blocker_exception(self, vlan, ip, except_ip,
+                                      table_id=constants.LOCAL_SWITCHING):
+        match = self._garp_blocker_exception_match(vlan, ip, except_ip)
+        self.uninstall_flows(table_id=table_id,
+                             priority=11,
+                             match=match)

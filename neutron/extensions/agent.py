@@ -19,7 +19,6 @@ from neutron_lib.api.definitions import agent as apidef
 from neutron_lib.api import extensions as api_extensions
 from neutron_lib import exceptions
 from neutron_lib.plugins import directory
-import six
 
 from neutron.api import extensions
 from neutron.api.v2 import base
@@ -45,8 +44,7 @@ class Agent(api_extensions.APIExtensionDescriptor):
         return [ex]
 
 
-@six.add_metaclass(abc.ABCMeta)
-class AgentPluginBase(object):
+class AgentPluginBase(metaclass=abc.ABCMeta):
     """REST API to operate the Agent.
 
     All of method must be in an admin context.
@@ -58,7 +56,9 @@ class AgentPluginBase(object):
         This operation is not allow in REST API.
         @raise exceptions.BadRequest:
         """
-        raise exceptions.BadRequest()
+        raise exceptions.BadRequest(
+            resource='agents',
+            msg='Agent creation using API is not supported.')
 
     @abc.abstractmethod
     def delete_agent(self, context, id):

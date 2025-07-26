@@ -40,9 +40,6 @@ Limitations
   technical reasons (in this case the port is created too late for
   Neutron to affect scheduling).
 
-* Bandwidth guarantees for ports can only be requested on networks
-  backed by a physical network (physnet).
-
 * In Stein there is no support for networks with multiple physnets.
   However some simpler multi-segment networks are still supported:
 
@@ -53,13 +50,33 @@ Limitations
 * If you mix ports with and without bandwidth guarantees on the same physical
   interface then the ports without a guarantee may starve. Therefore mixing
   them is not recommended. Instead it is recommended to separate them by
-  :nova-doc:`Nova host aggregates <user/aggregates>`.
+  :nova-doc:`Nova host aggregates <admin/aggregates>`.
 
 * Changing the guarantee of a QoS policy (adding/deleting a
   ``minimum_bandwidth`` rule, or changing the ``min_kbps`` field of a
   ``minimum_bandwidth`` rule) is only possible while the policy is not in
   effect. That is ports of the QoS policy are not yet used by Nova. Requests
   to change guarantees of in-use policies are rejected.
+
+* Changing the QoS policy of the port with new ``minimum_bandwidth`` rules
+  changes placement ``allocations`` from Wallaby release.
+  If the VM was booted with port without QoS policy and ``minimum_bandwidth``
+  rules the port update succeeds but placement allocations will not change.
+  The same is true if the port has no ``binding:profile``, thus no placement
+  allocation record exists for it. But if the VM was booted with a port with
+  QoS policy and ``minimum_bandwidth`` rules the update is possible and the
+  allocations are changed in placement as well.
+
+.. note::
+
+  As it is possible to update a port to remove the QoS policy, updating it
+  back to have QoS policy with ``minimum_bandwidth`` rule will not result in
+  ``placement allocation`` record, only the dataplane enforcement will happen.
+
+.. note::
+
+  updating the ``minimum_bandwidth`` rule of a QoS policy that is attached
+  to a port which is bound to a VM is still not possible.
 
 * The first data-plane-only Guaranteed Minimum Bandwidth implementation
   (for SR-IOV egress traffic) was released in the Newton
@@ -98,6 +115,27 @@ Limitations
   an Open vSwitch bridge, and another 5 Gbps NIC whose virtual functions
   can be handed out to servers by neutron-sriov-agent.
 
+* Neutron allows physnet names to be case sensitive. So physnet0 and
+  Physnet0 are treated as different physnets. Physnets are mapped to
+  traits in Placement for scheduling purposes. However Placement traits are
+  case insensitive and normalized to full capital. Therefore the scheduling
+  treats physnet0 and Physnet0 as the same physnet. It is advised not to use
+  physnet names that are only differ by case.
+
+* There are hardware platforms (e.g.: Cavium ThunderX) where it's possible
+  to have virtual functions which are network devices that are not associated
+  to a physical function. As bandwidth resources are tracked per physical
+  function, for such hardware the placement enforcement of the QoS minimum
+  bandwidth rules cannot be supported. Creating a server with ports using such
+  QoS policy targeting such hardware backend will result in a ``NoValidHost``
+  error during scheduling.
+
+* When QoS is used with a trunk, Placement enforcement is applied only to the
+  trunk's parent port. Subports are not going to have Placement allocation.
+  As a workaround, parent port's QoS policy should take into account subports
+  needs and request enough minimum bandwidth resources to accommodate every
+  port in the trunk.
+
 Placement pre-requisites
 ------------------------
 
@@ -134,7 +172,23 @@ In release Stein the following agent-based ML2 mechanism drivers are
 supported:
 
 * Open vSwitch (``openvswitch``) vnic_types: ``normal``, ``direct``
-* SR-IOV (``sriovnicswitch``) vnic_types: ``direct``, ``macvtap``
+* SR-IOV (``sriovnicswitch``) vnic_types: ``direct``, ``macvtap``,
+  ``direct-physical``
+* OVN (``ovn``) vnic_types: ``normal``
+
+.. note::
+
+  SR-IOV (``sriovnicswitch``) agent does not handle ``direct-physical`` ports. However
+  the agent can report the bandwidth capacity of a network device that will be used
+  by a ``direct-physical`` port.
+
+
+Since 2023.1 (Antelope), Open vSwitch and OVN mechanism drivers can specify
+the available bandwidth for tunnelled networks (SR-IOV does not support these
+network types yet). The key "rp_tunnelled" is used to model those networks
+that are not backed by a physical network. This bandwidth models the limits
+of the VTEP/TEP interface used to send the tunnelled traffic (VXLAN, Geneve).
+
 
 neutron-server config
 ~~~~~~~~~~~~~~~~~~~~~
@@ -166,8 +220,8 @@ If a vnic_type is supported by default by multiple ML2 mechanism
 drivers (e.g. ``vnic_type=direct`` by both ``openvswitch`` and
 ``sriovnicswitch``) and multiple agents' resources are also meant to be
 tracked by Placement, then the admin must decide which driver to take
-ports of that vnic_type by blacklisting the vnic_type for the unwanted
-drivers. Use :oslo.config:option:`ovs_driver.vnic_type_blacklist` in this
+ports of that vnic_type by prohibiting the vnic_type for the unwanted
+drivers. Use :oslo.config:option:`ovs_driver.vnic_type_prohibit_list` in this
 case. Valid values are all the ``supported_vnic_types`` of the
 `respective mechanism drivers
 <https://docs.openstack.org/neutron/latest/admin/config-ml2.html#supported-vnic-types>`_.
@@ -177,10 +231,10 @@ case. Valid values are all the ``supported_vnic_types`` of the
 .. code-block:: ini
 
     [ovs_driver]
-    vnic_type_blacklist = direct
+    vnic_type_prohibit_list = direct
 
     [sriov_driver]
-    #vnic_type_blacklist = direct
+    #vnic_type_prohibit_list = direct
 
 neutron-openvswitch-agent config
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -211,8 +265,19 @@ Valid values are all the
 
     [ovs]
     bridge_mappings = physnet0:br-physnet0,...
-    resource_provider_bandwidths = br-physnet0:10000000:10000000,...
+    resource_provider_bandwidths = br-physnet0:10000000:10000000,rp_tunnelled:20000000:20000000,...
     #resource_provider_inventory_defaults = step_size:1000,...
+
+
+.. note::
+
+    "rp_tunnelled" is not a bridge nor an interface present in the host.
+    The ML2/OVS agent will read the host local "resource_provider_bandwidths"
+    and will assign, by default, the "rp_tunnelled" resource provider to
+    the local host where is running. In other words, it is not needed to
+    populate "resource_provider_hypervisors" with the host assigned to this
+    specific resource provider.
+
 
 neutron-sriov-agent config
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -234,6 +299,45 @@ neutron-openvswitch-agent. However look out for:
     physical_device_mappings = physnet0:ens5,physnet0:ens6,...
     resource_provider_bandwidths = ens5:40000000:40000000,ens6:40000000:40000000,...
     #resource_provider_inventory_defaults = step_size:1000,...
+
+OVN chassis config
+~~~~~~~~~~~~~~~~~~
+
+Bandwidth config values are stored in each SB chassis register, in
+"external_ids:ovn-cms-options". The configuration options are the same as in
+SR-IOV and OVS agents. This is how the values are registered:
+
+.. code-block:: bash
+
+    $ root@dev20:~# ovs-vsctl list Open_vSwitch
+      ...
+      external_ids        : {hostname=dev20.fistro.com, \
+                             ovn-cms-options="resource_provider_bandwidths=br-ex:1001:2000;br-ex2:3000:4000;rp_tunnelled:5000:6000, \
+                                              resource_provider_inventory_defaults=allocation_ratio:1.0;min_unit:10, \
+                                              resource_provider_hypervisors=br-ex:dev20.fistro.com;br-ex2:dev20.fistro.com;rp_tunnelled:dev20.fistro.com", \
+                             rundir="/var/run/openvswitch", \
+                             system-id="029e7d3d-d2ab-4f2c-bc92-ec58c94a8fc1"}
+      ...
+
+Each configuration option defined in "external_ids:ovn-cms-options" is divided
+by commas.
+
+This information is retrieved from the OVN SB database during the Neutron
+server initialization and when the "Chassis" registers are updated.
+
+The initial Placement configuration is retrieved when the Neutron API receives
+a "Chassis" create event, that happens when the IDL is connected to the
+database server. When a creation event is received, the Neutron API reads the
+configuration, builds a ``PlacementState`` instance and sends it to the
+Placement API.
+
+The second method to update the Placement information is when a "Chassis"
+registers is updated. The ``OVNClientPlacementExtension`` extension registers
+an event handler that attends the OVN SB "Chassis" bandwidth configuration
+changes. This event handler builds a ``PlacementState`` instance and sends it
+to the Placement API. If a new chassis is added or an existing one changes its
+resource provider configuration, this event updates it in the Placement
+database.
 
 Propagation of resource information
 -----------------------------------
@@ -264,7 +368,9 @@ queue periodically.
     $ openstack network agent show -f value -c configuration 5e57b85f-b017-419a-8745-9c406e149f9e
     {'bridge_mappings': {'physnet0': 'br-physnet0'},
      'resource_provider_bandwidths': {'br-physnet0': {'egress': 10000000,
-                                                      'ingress': 10000000}},
+                                                      'ingress': 10000000}
+                                      'rp_tunnelled': {'egress': 20000000,
+                                                       'ingress': 20000000}},
      'resource_provider_inventory_defaults': {'allocation_ratio': 1.0,
                                               'min_unit': 1,
                                               'reserved': 0,
@@ -339,6 +445,12 @@ For details please see `slides 13-15
 of a (pre-release) demo that was presented on the Berlin Summit in November
 2018.
 
+Since Yoga, the ``resource_request`` attribute of the port changed. With the
+extension ``port-resource-request-groups``, Neutron informs that the blob
+passed to Nova can contain several bandwidth requests. Please check
+`resource_request sanitization
+<https://docs.openstack.org/neutron/latest/admin/config-qos-min-pps.html#neutron-db-sanitization>`_.
+
 Sample usage
 ------------
 
@@ -390,7 +502,7 @@ servers with those ports:
 
     $ openstack server create server0 \
         --flavor cirros256 \
-        --image cirros-0.4.0-x86_64-disk \
+        --image cirros-0.5.1-x86_64-disk \
         --port port-normal-qos
 
 On Healing of Allocations
@@ -482,6 +594,7 @@ Please find an example in section `Propagation of resource information`_.
     | 1c7e83f0-108d-5c35-ada7-7ebebbe43aad | devstack0:NIC Switch agent:ens5          |          2 | 3b36d91e-bf60-460f-b1f8-3322dee5cdfd | 4a8a819d-61f9-5822-8c5c-3e9c7cb942d6 |
     | 89ca1421-5117-5348-acab-6d0e2054239c | devstack0:Open vSwitch agent             |          0 | 3b36d91e-bf60-460f-b1f8-3322dee5cdfd | 3b36d91e-bf60-460f-b1f8-3322dee5cdfd |
     | f9c9ce07-679d-5d72-ac5f-31720811629a | devstack0:Open vSwitch agent:br-physnet0 |          2 | 3b36d91e-bf60-460f-b1f8-3322dee5cdfd | 89ca1421-5117-5348-acab-6d0e2054239c |
+    | 521f53a6-c8c0-583c-98da-7a47f39ff887 | devstack0:Open vSwitch agent:rp_tunnelled|          2 | 3b36d91e-bf60-460f-b1f8-3322dee5cdfd | 89ca1421-5117-5348-acab-6d0e2054239c |
     +--------------------------------------+------------------------------------------+------------+--------------------------------------+--------------------------------------+
 
 * Does Placement have the expected traits?
@@ -491,6 +604,7 @@ Please find an example in section `Propagation of resource information`_.
     # as admin
     $ openstack --os-placement-api-version 1.17 trait list | awk '/CUSTOM_/ { print $2 }' | sort
     CUSTOM_PHYSNET_PHYSNET0
+    CUSTOM_TUNNELLED_NETWORKS
     CUSTOM_VNIC_TYPE_DIRECT
     CUSTOM_VNIC_TYPE_DIRECT_PHYSICAL
     CUSTOM_VNIC_TYPE_MACVTAP
@@ -569,6 +683,11 @@ Links
     <https://specs.openstack.org/openstack/nova-specs/specs/stein/approved/bandwidth-resource-provider.html>`__
   * `on review.opendev.org
     <https://review.opendev.org/502306>`__
+
+* Nova spec: QoS minimum guaranteed packet rate
+
+  * `on specs.openstack.org
+    <https://specs.openstack.org/openstack/nova-specs/specs/yoga/implemented/qos-minimum-guaranteed-packet-rate.html>`__
 
 * Relevant OpenStack Networking API references
 

@@ -13,13 +13,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import io
 import os
+import socketserver
 import threading
+import time
 
-import eventlet
 from neutron_lib import constants
 from oslo_log import log as logging
+from oslo_utils import encodeutils
 from oslo_utils import fileutils
+from oslo_utils import netutils
 import webob
 
 from neutron.agent.linux import utils as agent_utils
@@ -29,34 +33,46 @@ LOG = logging.getLogger(__name__)
 
 KEEPALIVED_STATE_CHANGE_SERVER_BACKLOG = 4096
 
-TRANSLATION_MAP = {'master': constants.HA_ROUTER_STATE_ACTIVE,
+TRANSLATION_MAP = {'primary': constants.HA_ROUTER_STATE_ACTIVE,
                    'backup': constants.HA_ROUTER_STATE_STANDBY,
                    'fault': constants.HA_ROUTER_STATE_STANDBY,
                    'unknown': constants.HA_ROUTER_STATE_UNKNOWN}
 
+REPLY = """HTTP/1.1 200 OK
+Content-Type: text/plain; charset=UTF-8
+Connection: close
+Content-Location': http://127.0.0.1/"""
 
-class KeepalivedStateChangeHandler(object):
-    def __init__(self, agent):
-        self.agent = agent
 
-    @webob.dec.wsgify(RequestClass=webob.Request)
-    def __call__(self, req):
-        router_id = req.headers['X-Neutron-Router-Id']
-        state = req.headers['X-Neutron-State']
-        self.enqueue(router_id, state)
+class KeepalivedStateChangeHandler(socketserver.StreamRequestHandler):
+    _agent = None
+
+    def handle(self):
+        try:
+            request = self.request.recv(4096)
+            f_request = io.BytesIO(request)
+            req = webob.Request.from_file(f_request)
+            router_id = req.headers.get('X-Neutron-Router-Id')
+            state = req.headers.get('X-Neutron-State')
+            self.enqueue(router_id, state)
+            reply = encodeutils.to_utf8(REPLY)
+            self.wfile.write(reply)
+        except Exception as exc:
+            LOG.exception('Error while receiving data.')
+            raise exc
 
     def enqueue(self, router_id, state):
         LOG.debug('Handling notification for router '
                   '%(router_id)s, state %(state)s', {'router_id': router_id,
                                                      'state': state})
-        self.agent.enqueue_state_change(router_id, state)
+        self._agent.enqueue_state_change(router_id, state)
 
 
-class L3AgentKeepalivedStateChangeServer(object):
+class L3AgentKeepalivedStateChangeServer:
     def __init__(self, agent, conf):
         self.agent = agent
         self.conf = conf
-
+        self._server = None
         agent_utils.ensure_directory_exists_without_file(
             self.get_keepalived_state_change_socket_path(self.conf))
 
@@ -65,25 +81,32 @@ class L3AgentKeepalivedStateChangeServer(object):
         return os.path.join(conf.state_path, 'keepalived-state-change')
 
     def run(self):
-        server = agent_utils.UnixDomainWSGIServer(
+        KeepalivedStateChangeHandler._agent = self.agent
+        self._server = agent_utils.UnixDomainWSGIThreadServer(
             'neutron-keepalived-state-change',
-            num_threads=self.conf.ha_keepalived_state_change_server_threads)
-        server.start(KeepalivedStateChangeHandler(self.agent),
-                     self.get_keepalived_state_change_socket_path(self.conf),
-                     workers=0,
-                     backlog=KEEPALIVED_STATE_CHANGE_SERVER_BACKLOG)
-        server.wait()
+            KeepalivedStateChangeHandler,
+            self.get_keepalived_state_change_socket_path(self.conf),
+        )
+        self._server.run()
+
+    def wait(self):
+        self._server.wait()
 
 
-class AgentMixin(object):
+class AgentMixin:
     def __init__(self, host):
         self._init_ha_conf_path()
-        super(AgentMixin, self).__init__(host)
+        super().__init__(host)
+
+    def init_host(self):
+        super().init_host()
         # BatchNotifier queue is needed to ensure that the HA router
         # state change sequence is under the proper order.
         self.state_change_notifier = batch_notifier.BatchNotifier(
             self._calculate_batch_duration(), self.notify_server)
-        eventlet.spawn(self._start_keepalived_notifications_server)
+        notifications_server = threading.Thread(
+            target=self._start_keepalived_notifications_server)
+        notifications_server.start()
         self._transition_states = {}
         self._transition_state_mutex = threading.Lock()
 
@@ -109,6 +132,7 @@ class AgentMixin(object):
         state_change_server = (
             L3AgentKeepalivedStateChangeServer(self, self.conf))
         state_change_server.run()
+        state_change_server.wait()
 
     def _calculate_batch_duration(self):
         # Set the BatchNotifier interval to ha_vrrp_advert_int,
@@ -127,51 +151,52 @@ class AgentMixin(object):
     def enqueue_state_change(self, router_id, state):
         """Inform the server about the new router state
 
-        This function will also update the metadata proxy, the radvd daemon,
-        process the prefix delegation and inform to the L3 extensions. If the
-        HA router changes to "master", this transition will be delayed for at
-        least "ha_vrrp_advert_int" seconds. When the "master" router
-        transitions to "backup", "keepalived" will set the rest of HA routers
-        to "master" until it decides which one should be the only "master".
-        The transition from "backup" to "master" and then to "backup" again,
-        should not be registered in the Neutron server.
+        This function will also update the metadata proxy, the radvd daemon and
+        inform to the L3 extensions. If the HA router changes to "primary",
+        this transition will be delayed for at least "ha_vrrp_advert_int"
+        seconds. When the "primary" router transitions to "backup",
+        "keepalived" will set the rest of HA routers to "primary" until it
+        decides which one should be the only "primary". The transition from
+        "backup" to "primary" and then to "backup" again, should not be
+        registered in the Neutron server.
 
         :param router_id: router ID
-        :param state: ['master', 'backup']
+        :param state: ['primary', 'backup']
         """
         if not self._update_transition_state(router_id, state):
-            eventlet.spawn_n(self._enqueue_state_change, router_id, state)
-            eventlet.sleep(0)
+            LOG.debug("Enqueueing router's %s state change to %s",
+                      router_id, state)
+            state_change = threading.Thread(target=self._enqueue_state_change,
+                                            args=(router_id, state))
+            state_change.start()
+            # TODO(ralonsoh): remove once the eventlet deprecation is finished.
+            time.sleep(0)
 
     def _enqueue_state_change(self, router_id, state):
-        # NOTE(ralonsoh): move 'master' and 'backup' constants to n-lib
-        if state == 'master':
-            eventlet.sleep(self.conf.ha_vrrp_advert_int)
-        if self._update_transition_state(router_id) != state:
+        # NOTE(ralonsoh): move 'primary' and 'backup' constants to n-lib
+        if state == 'primary':
+            time.sleep(self.conf.ha_vrrp_advert_int)
+        transition_state = self._update_transition_state(router_id)
+        if transition_state != state:
             # If the current "transition state" is not the initial "state" sent
             # to update the router, that means the actual router state is the
-            # same as the "transition state" (e.g.: backup-->master-->backup).
+            # same as the "transition state" (e.g.: backup-->primary-->backup).
+            LOG.debug("Current transition state of router %s: %s; "
+                      "Initial state was: %s",
+                      router_id, transition_state, state)
             return
 
         ri = self._get_router_info(router_id)
         if ri is None:
             return
 
-        state_change_data = {"router_id": router_id, "state": state,
-                             "host": ri.agent.host}
+        state_change_data = {
+            "router_id": router_id, "state": state, "host": ri.agent.host,
+            "enable_ndp_proxy": ri.router.get("enable_ndp_proxy", False)}
         LOG.info('Router %(router_id)s transitioned to %(state)s on '
-                 'agent %(host)s',
+                 'agent %(host)s; NDP proxy enabled: %(enable_ndp_proxy)s',
                  state_change_data)
 
-        # Set external gateway port link up or down according to state
-        if state == 'master':
-            ri.set_external_gw_port_link_status(link_up=True, set_gw=True)
-        elif state == 'backup':
-            ri.set_external_gw_port_link_status(link_up=False)
-        else:
-            LOG.warning('Router %s has status %s, '
-                        'no action to router gateway device.',
-                        router_id, state)
         # TODO(dalvarez): Fix bug 1677279 by moving the IPv6 parameters
         # configuration to keepalived-state-change in order to remove the
         # dependency that currently exists on l3-agent running for the IPv6
@@ -181,7 +206,6 @@ class AgentMixin(object):
         if self.conf.enable_metadata_proxy:
             self._update_metadata_proxy(ri, router_id, state)
         self._update_radvd_daemon(ri, state)
-        self.pd.process_ha_state(router_id, state == 'master')
         self.state_change_notifier.queue_event((router_id, state))
         self.l3_ext_manager.ha_state_change(self.context, state_change_data)
 
@@ -189,7 +213,7 @@ class AgentMixin(object):
         if not self.use_ipv6:
             return
 
-        ipv6_forwarding_enable = state == 'master'
+        ipv6_forwarding_enable = state == 'primary'
         if ri.router.get('distributed', False):
             namespace = ri.ha_namespace
         else:
@@ -202,7 +226,7 @@ class AgentMixin(object):
         # If ipv6 is enabled on the platform, ipv6_gateway config flag is
         # not set and external_network associated to the router does not
         # include any IPv6 subnet, enable the gateway interface to accept
-        # Router Advts from upstream router for default route on master
+        # Router Advts from upstream router for default route on primary
         # instances as well as ipv6 forwarding. Otherwise, disable them.
         ex_gw_port_id = ri.ex_gw_port and ri.ex_gw_port['id']
         if ex_gw_port_id:
@@ -215,27 +239,30 @@ class AgentMixin(object):
         # NOTE(slaweq): Since the metadata proxy is spawned in the qrouter
         # namespace and not in the snat namespace, even standby DVR-HA
         # routers needs to serve metadata requests to local ports.
-        if state == 'master' or ri.router.get('distributed', False):
+        if state == 'primary' or ri.router.get('distributed', False):
             LOG.debug('Spawning metadata proxy for router %s', router_id)
+            spawn_kwargs = {}
+            if netutils.is_ipv6_enabled():
+                spawn_kwargs['bind_address'] = '::'
             self.metadata_driver.spawn_monitored_metadata_proxy(
                 self.process_monitor, ri.ns_name, self.conf.metadata_port,
-                self.conf, router_id=ri.router_id)
+                self.conf, router_id=ri.router_id, **spawn_kwargs)
         else:
             LOG.debug('Closing metadata proxy for router %s', router_id)
             self.metadata_driver.destroy_monitored_metadata_proxy(
                 self.process_monitor, ri.router_id, self.conf, ri.ns_name)
 
     def _update_radvd_daemon(self, ri, state):
-        # Radvd has to be spawned only on the Master HA Router. If there are
+        # Radvd has to be spawned only on the primary HA Router. If there are
         # any state transitions, we enable/disable radvd accordingly.
-        if state == 'master':
+        if state == 'primary':
             ri.enable_radvd()
         else:
             ri.disable_radvd()
 
     def notify_server(self, batched_events):
-        translated_states = dict((router_id, TRANSLATION_MAP[state]) for
-                                 router_id, state in batched_events)
+        translated_states = {router_id: TRANSLATION_MAP[state] for
+                             router_id, state in batched_events}
         LOG.debug('Updating server with HA routers states %s',
                   translated_states)
         self.plugin_rpc.update_ha_routers_states(

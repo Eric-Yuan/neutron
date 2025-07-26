@@ -14,12 +14,14 @@
 #    under the License.
 
 import collections
-import imp
+from importlib import util as imp_util
 import os
 
+from keystoneauth1 import loading as ks_loading
 from neutron_lib.api import extensions as api_extensions
 from neutron_lib import exceptions
 from neutron_lib.plugins import directory
+from openstack import connection
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_middleware import base
@@ -28,21 +30,21 @@ import webob.dec
 import webob.exc
 
 from neutron._i18n import _
+from neutron.api import wsgi
 from neutron import extensions as core_extensions
 from neutron.plugins.common import constants as const
 from neutron.services import provider_configuration
-from neutron import wsgi
-
 
 LOG = logging.getLogger(__name__)
 
 
 EXTENSION_SUPPORTED_CHECK_MAP = {}
 _PLUGIN_AGNOSTIC_EXTENSIONS = set()
+_NOVA_CONNECTION = None
 
 
 def register_custom_supported_check(alias, f, plugin_agnostic=False):
-    '''Register a custom function to determine if extension is supported.
+    """Register a custom function to determine if extension is supported.
 
     Consequent calls for the same alias replace the registered function.
 
@@ -51,7 +53,7 @@ def register_custom_supported_check(alias, f, plugin_agnostic=False):
     :param plugin_agnostic: if False, don't require a plugin to claim support
     with supported_extension_aliases. If True, a plugin must claim the
     extension is supported.
-    '''
+    """
 
     EXTENSION_SUPPORTED_CHECK_MAP[alias] = f
     if plugin_agnostic:
@@ -155,7 +157,7 @@ class ExtensionMiddleware(base.ConfigurableMiddleware):
                       resource.collection)
             for action, method in resource.collection_actions.items():
                 conditions = dict(method=[method])
-                path = "/%s/%s" % (resource.collection, action)
+                path = f"/{resource.collection}/{action}"
                 with mapper.submapper(controller=resource.controller,
                                       action=action,
                                       path_prefix=path_prefix,
@@ -197,9 +199,14 @@ class ExtensionMiddleware(base.ConfigurableMiddleware):
             controller = req_controllers[request_ext.key]
             controller.add_handler(request_ext.handler)
 
+        # NOTE(slaweq): It seems that using singleton=True in conjunction
+        # with eventlet monkey patching of the threading library doesn't work
+        # well and there is memory leak. See
+        # https://bugs.launchpad.net/neutron/+bug/1942179 for details
         self._router = routes.middleware.RoutesMiddleware(self._dispatch,
-                                                          mapper)
-        super(ExtensionMiddleware, self).__init__(application)
+                                                          mapper,
+                                                          singleton=False)
+        super().__init__(application)
 
     @classmethod
     def factory(cls, global_config, **local_config):
@@ -275,7 +282,7 @@ def plugin_aware_extension_middleware_factory(global_config, **local_config):
     return _factory
 
 
-class ExtensionManager(object):
+class ExtensionManager:
     """Load extensions from the configured extension path.
 
     See tests/unit/extensions/foxinsocks.py for an
@@ -394,14 +401,13 @@ class ExtensionManager(object):
         if not faulty_extensions <= default_extensions:
             raise exceptions.ExtensionsNotFound(
                 extensions=list(faulty_extensions))
-        else:
-            # Remove the faulty extensions so that they do not show during
-            # ext-list
-            for ext in faulty_extensions:
-                try:
-                    del self.extensions[ext]
-                except KeyError:
-                    pass
+        # Remove the faulty extensions so that they do not show during
+        # ext-list
+        for ext in faulty_extensions:
+            try:
+                del self.extensions[ext]
+            except KeyError:
+                pass
 
     def _check_extension(self, extension):
         """Checks for required methods in extension objects."""
@@ -444,7 +450,9 @@ class ExtensionManager(object):
                 mod_name, file_ext = os.path.splitext(os.path.split(f)[-1])
                 ext_path = os.path.join(path, f)
                 if file_ext.lower() == '.py' and not mod_name.startswith('_'):
-                    mod = imp.load_source(mod_name, ext_path)
+                    spec = imp_util.spec_from_file_location(mod_name, ext_path)
+                    mod = imp_util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
                     ext_name = mod_name.capitalize()
                     new_ext_class = getattr(mod, ext_name, None)
                     if not new_ext_class:
@@ -479,13 +487,12 @@ class PluginAwareExtensionManager(ExtensionManager):
 
     def __init__(self, path, plugins):
         self.plugins = plugins
-        super(PluginAwareExtensionManager, self).__init__(path)
+        super().__init__(path)
         self.check_if_plugin_extensions_loaded()
 
     def _check_extension(self, extension):
         """Check if an extension is supported by any plugin."""
-        extension_is_valid = super(PluginAwareExtensionManager,
-                                   self)._check_extension(extension)
+        extension_is_valid = super()._check_extension(extension)
         if not extension_is_valid:
             return False
 
@@ -564,7 +571,7 @@ class PluginAwareExtensionManager(ExtensionManager):
                 extensions=list(missing_aliases))
 
 
-class RequestExtension(object):
+class RequestExtension:
     """Extend requests and responses of core Neutron OpenStack API controllers.
 
     Provide a way to add data to responses and handle custom request data
@@ -575,10 +582,10 @@ class RequestExtension(object):
         self.url_route = url_route
         self.handler = handler
         self.conditions = dict(method=[method])
-        self.key = "%s-%s" % (method, url_route)
+        self.key = f"{method}-{url_route}"
 
 
-class ActionExtension(object):
+class ActionExtension:
     """Add custom actions to core Neutron OpenStack API controllers."""
 
     def __init__(self, collection, action_name, handler):
@@ -587,7 +594,7 @@ class ActionExtension(object):
         self.handler = handler
 
 
-class ResourceExtension(object):
+class ResourceExtension:
     """Add top level resources to the OpenStack API in Neutron."""
 
     def __init__(self, collection, controller, parent=None, path_prefix="",
@@ -641,3 +648,28 @@ def append_api_extensions_path(paths):
     paths = list(set([cfg.CONF.api_extensions_path] + paths))
     cfg.CONF.set_override('api_extensions_path',
                           ':'.join([p for p in paths if p]))
+
+
+class ProjectIdMiddleware(base.ConfigurableMiddleware):
+
+    @webob.dec.wsgify
+    def __call__(self, req):
+        # NOTE(ralonsoh): this method uses Nova Keystone user to retrieve the
+        # project because (1) it is allowed to retrieve the projects and (2)
+        # Neutron avoids adding another user section in the configuration
+        # (Nova user will be always used).
+        global _NOVA_CONNECTION
+        project = req.params.get('project_id') or req.params.get('tenant_id')
+        if project:
+            if not _NOVA_CONNECTION:
+                auth = ks_loading.load_auth_from_conf_options(cfg.CONF, 'nova')
+                keystone_session = ks_loading.load_session_from_conf_options(
+                    cfg.CONF, 'nova', auth=auth)
+                _NOVA_CONNECTION = connection.Connection(
+                    session=keystone_session, oslo_conf=cfg.CONF,
+                    connect_retries=cfg.CONF.http_retries)
+            if not _NOVA_CONNECTION.get_project(project):
+                return webob.exc.HTTPNotFound(
+                    comment='Project %s does not exist' % project)
+
+        return req.get_response(self.application)

@@ -27,14 +27,16 @@ from neutron.tests.unit.plugins.ml2 import test_plugin
 _uuid = uuidutils.generate_uuid
 
 
-class SubnetpoolPrefixOpsTestBase(object):
+class SubnetpoolPrefixOpsTestBase:
 
     @contextlib.contextmanager
     def address_scope(self, ip_version, prefixes=None, shared=False,
                       admin=True, name='test-scope', is_default_pool=False,
-                      tenant_id=None, **kwargs):
+                      project_id=None, **kwargs):
+        tenant_id = project_id if project_id else kwargs.get(
+            'tenant_id', None)
         if not tenant_id:
-            tenant_id = _uuid()
+            tenant_id = self._tenant_id
 
         scope_data = {'tenant_id': tenant_id, 'ip_version': ip_version,
                       'shared': shared, 'name': name + '-scope'}
@@ -45,10 +47,12 @@ class SubnetpoolPrefixOpsTestBase(object):
 
     @contextlib.contextmanager
     def subnetpool(self, ip_version, prefixes=None, shared=False, admin=True,
-                   name='test-pool', is_default_pool=False, tenant_id=None,
+                   name='test-pool', is_default_pool=False, project_id=None,
                    address_scope_id=None, **kwargs):
+        tenant_id = project_id if project_id else kwargs.get(
+            'tenant_id', None)
         if not tenant_id:
-            tenant_id = _uuid()
+            tenant_id = self._tenant_id
         pool_data = {'tenant_id': tenant_id, 'shared': shared, 'name': name,
                      'address_scope_id': address_scope_id,
                      'prefixes': prefixes, 'is_default': is_default_pool}
@@ -102,12 +106,13 @@ class SubnetpoolPrefixOpsTestBase(object):
 
     def test_add_prefix_with_address_scope_overlapping_cidr(self):
         with self.address_scope(self.ip_version) as addr_scope:
-            with self.subnetpool(self.ip_version,
-                         prefixes=[self.subnetpool_prefixes[0]],
-                         address_scope_id=addr_scope['id']) as sp_to_augment,\
+            with self.subnetpool(
+                    self.ip_version,
+                    prefixes=[self.subnetpool_prefixes[0]],
+                    address_scope_id=addr_scope['id']) as sp_to_augment,\
                 self.subnetpool(self.ip_version,
-                             prefixes=[self.subnetpool_prefixes[1]],
-                             address_scope_id=addr_scope['id']):
+                                prefixes=[self.subnetpool_prefixes[1]],
+                                address_scope_id=addr_scope['id']):
                 prefixes_to_add = [self.cidr_to_add]
                 self.driver.add_prefixes(
                     self.context,
@@ -118,12 +123,13 @@ class SubnetpoolPrefixOpsTestBase(object):
 
     def test_add_prefix_with_address_scope(self):
         with self.address_scope(self.ip_version) as addr_scope:
-            with self.subnetpool(self.ip_version,
-                         prefixes=[self.subnetpool_prefixes[1]],
-                         address_scope_id=addr_scope['id']) as sp_to_augment,\
+            with self.subnetpool(
+                    self.ip_version,
+                    prefixes=[self.subnetpool_prefixes[1]],
+                    address_scope_id=addr_scope['id']) as sp_to_augment,\
                 self.subnetpool(self.ip_version,
-                             prefixes=[self.subnetpool_prefixes[0]],
-                             address_scope_id=addr_scope['id']):
+                                prefixes=[self.subnetpool_prefixes[0]],
+                                address_scope_id=addr_scope['id']):
                 prefixes_to_add = [self.overlapping_cidr]
                 self.assertRaises(exc.AddressScopePrefixConflict,
                                   self.driver.add_prefixes,
@@ -202,7 +208,7 @@ class SubnetpoolPrefixOpsTestBase(object):
         subnetpool = subnetpool_obj.SubnetPool.get_object(
                                                  self.context,
                                                  id=subnetpool_id)
-        current_prefix_set = netaddr.IPSet([x for x in subnetpool.prefixes])
+        current_prefix_set = netaddr.IPSet(list(subnetpool.prefixes))
         expected_prefix_set = netaddr.IPSet(expected_prefixes)
         excluded_prefix_set = netaddr.IPSet(excluded_prefixes)
         self.assertTrue(expected_prefix_set.issubset(current_prefix_set))

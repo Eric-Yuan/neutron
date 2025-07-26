@@ -11,12 +11,18 @@
 #    under the License.
 
 import contextlib
+import functools
+import socket
 import uuid
 
+from neutron_lib import constants
 from neutron_lib import exceptions as n_exc
 from neutron_lib.utils import helpers
 from oslo_log import log
+from oslo_utils import strutils
 from oslo_utils import uuidutils
+from ovs import socket_util
+from ovs import stream
 from ovsdbapp.backend import ovs_idl
 from ovsdbapp.backend.ovs_idl import connection
 from ovsdbapp.backend.ovs_idl import idlutils
@@ -30,12 +36,28 @@ from neutron._i18n import _
 from neutron.common.ovn import constants as ovn_const
 from neutron.common.ovn import exceptions as ovn_exc
 from neutron.common.ovn import utils
+from neutron.common import utils as n_utils
 from neutron.conf.plugins.ml2.drivers.ovn import ovn_conf as cfg
 from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import commands as cmd
 from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import ovsdb_monitor
+from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import worker
+from neutron.services.portforwarding import constants as pf_const
 
 
 LOG = log.getLogger(__name__)
+
+
+# Override wait_for_change to not use a timeout so we always try to reconnect
+def wait_for_change(idl_, timeout, seqno=None):
+    if seqno is None:
+        seqno = idl_.change_seqno
+    while idl_.change_seqno == seqno and not idl_.run():
+        poller = idlutils.poller.Poller()
+        idl_.wait(poller)
+        poller.block()
+
+
+idlutils.wait_for_change = wait_for_change
 
 
 class OvnNbTransaction(idl_trans.Transaction):
@@ -44,12 +66,51 @@ class OvnNbTransaction(idl_trans.Transaction):
         # NOTE(lucasagomes): The bump_nb_cfg parameter is only used by
         # the agents health status check
         self.bump_nb_cfg = kwargs.pop('bump_nb_cfg', False)
-        super(OvnNbTransaction, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def pre_commit(self, txn):
         if not self.bump_nb_cfg:
             return
         self.api.nb_global.increment('nb_cfg')
+
+
+def add_keepalives(fn):
+    @functools.wraps(fn)
+    def _open(*args, **kwargs):
+        error, sock = fn(*args, **kwargs)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError as e:
+            sock.close()
+            return socket_util.get_exception_errno(e), None
+        return error, sock
+    return _open
+
+
+class NoProbesMixin:
+    @staticmethod
+    def needs_probes():
+        # If we are using keepalives, we can force probe_interval=0
+        return False
+
+
+class TCPStream(stream.TCPStream, NoProbesMixin):
+    @classmethod
+    @add_keepalives
+    def _open(cls, suffix, dscp):
+        return super()._open(suffix, dscp)
+
+
+class SSLStream(stream.SSLStream, NoProbesMixin):
+    @classmethod
+    @add_keepalives
+    def _open(cls, suffix, dscp):
+        return super()._open(suffix, dscp)
+
+
+# Overwriting globals in a library is clearly a good idea
+stream.Stream.register_method("tcp", TCPStream)
+stream.Stream.register_method("ssl", SSLStream)
 
 
 # This version of Backend doesn't use a class variable for ovsdb_connection
@@ -60,7 +121,7 @@ class Backend(ovs_idl.Backend):
 
     def __init__(self, connection):
         self.ovsdb_connection = connection
-        super(Backend, self).__init__(connection)
+        super().__init__(connection)
 
     def start_connection(self, connection):
         try:
@@ -81,12 +142,47 @@ class Backend(ovs_idl.Backend):
 
     _tables = tables
 
+    @n_utils.classproperty
+    def connection_string(cls):
+        raise NotImplementedError()
+
+    @n_utils.classproperty
+    def schema_helper(cls):
+        # SchemaHelper.get_idl_schema() sets schema_json to None which is
+        # called in Idl.__init__(), so if we've done that return new helper
+        try:
+            if cls._schema_helper.schema_json:
+                return cls._schema_helper
+        except AttributeError:
+            pass
+
+        ovsdb_monitor._check_and_set_ssl_files(cls.schema)
+        cls._schema_helper = idlutils.get_schema_helper(cls.connection_string,
+                                                        cls.schema)
+        return cls._schema_helper
+
+    @classmethod
+    def get_schema_version(cls):
+        return cls.schema_helper.schema_json['version']
+
+    @classmethod
+    def schema_has_table(cls, table_name):
+        return table_name in cls.schema_helper.schema_json['tables']
+
     def is_table_present(self, table_name):
         return table_name in self._tables
 
     def is_col_present(self, table_name, col_name):
         return self.is_table_present(table_name) and (
             col_name in self._tables[table_name].columns)
+
+    def is_col_supports_value(self, table_name, col_name, value):
+        if not self.is_col_present(table_name, col_name):
+            return False
+        enum = self._tables[table_name].columns[col_name].type.key.enum
+        if not enum:
+            return False
+        return value in {k.value for k in enum.values}
 
     def create_transaction(self, check_error=False, log_errors=True):
         return idl_trans.Transaction(
@@ -122,50 +218,40 @@ class OvsdbConnectionUnavailable(n_exc.ServiceUnavailable):
 # Retry forever to get the OVN NB and SB IDLs. Wait 2^x * 1 seconds between
 # each retry, up to 'max_interval' seconds, then interval will be fixed
 # to 'max_interval' seconds afterwards. The default 'max_interval' is 180.
-def get_ovn_idls(driver, trigger, binding_events=False):
+def get_ovn_idls(driver, trigger):
     @tenacity.retry(
         wait=tenacity.wait_exponential(
             max=cfg.get_ovn_ovsdb_retry_max_interval()),
         reraise=True)
-    def get_ovn_idl_retry(cls):
+    def get_ovn_idl_retry(api_cls):
         trigger_class = utils.get_method_class(trigger)
         LOG.info('Getting %(cls)s for %(trigger)s with retry',
-                 {'cls': cls.__name__, 'trigger': trigger_class.__name__})
-        return cls(get_connection(cls, trigger, driver, binding_events))
+                 {'cls': api_cls.__name__, 'trigger': trigger_class.__name__})
+        return api_cls.from_worker(trigger_class, driver)
 
     vlog.use_python_logger(max_level=cfg.get_ovn_ovsdb_log_level())
     return tuple(get_ovn_idl_retry(c) for c in (OvsdbNbOvnIdl, OvsdbSbOvnIdl))
 
 
-def get_connection(db_class, trigger=None, driver=None, binding_events=False):
-    if db_class == OvsdbNbOvnIdl:
-        args = (cfg.get_ovn_nb_connection(), 'OVN_Northbound')
-    elif db_class == OvsdbSbOvnIdl:
-        args = (cfg.get_ovn_sb_connection(), 'OVN_Southbound')
+class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
+    @n_utils.classproperty
+    def connection_string(cls):
+        return cfg.get_ovn_nb_connection()
 
-    if binding_events:
-        if db_class == OvsdbNbOvnIdl:
-            idl_ = ovsdb_monitor.OvnNbIdl.from_server(*args, driver=driver)
-        else:
-            idl_ = ovsdb_monitor.OvnSbIdl.from_server(*args, driver=driver)
-    else:
-        if db_class == OvsdbNbOvnIdl:
+    @classmethod
+    def from_worker(cls, worker_class, driver=None):
+        args = (cls.connection_string, cls.schema_helper)
+        if worker_class == worker.MaintenanceWorker:
             idl_ = ovsdb_monitor.BaseOvnIdl.from_server(*args)
         else:
-            idl_ = ovsdb_monitor.BaseOvnSbIdl.from_server(*args)
-
-    return connection.Connection(idl_, timeout=cfg.get_ovn_ovsdb_timeout())
-
-
-class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
-    def __init__(self, connection):
-        super(OvsdbNbOvnIdl, self).__init__(connection)
-        self.idl._session.reconnect.set_probe_interval(
-            cfg.get_ovn_ovsdb_probe_interval())
+            idl_ = ovsdb_monitor.OvnNbIdl.from_server(*args, driver=driver)
+        conn = connection.Connection(idl_, timeout=cfg.get_ovn_ovsdb_timeout())
+        return cls(conn)
 
     @property
     def nb_global(self):
-        return next(iter(self.tables['NB_Global'].rows.values()))
+        return next(iter(self.db_list_rows('NB_Global').execute(
+            check_error=True)))
 
     def create_transaction(self, check_error=False, log_errors=True,
                            bump_nb_cfg=False):
@@ -180,29 +266,42 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
         This method is just a wrapper around the ovsdbapp transaction
         to handle revision conflicts correctly.
         """
+        revision_mismatch_raise = kwargs.pop('revision_mismatch_raise', False)
         try:
-            with super(OvsdbNbOvnIdl, self).transaction(*args, **kwargs) as t:
+            with super().transaction(*args, **kwargs) as t:
                 yield t
         except ovn_exc.RevisionConflict as e:
             LOG.info('Transaction aborted. Reason: %s', e)
+            if revision_mismatch_raise:
+                raise e
+
+    def ls_add(self, switch=None, may_exist=False, network_id=None, **columns):
+        if network_id is None:
+            return super().ls_add(switch, may_exist, **columns)
+        return cmd.AddNetworkCommand(self, network_id, may_exist=may_exist,
+                                     **columns)
 
     def create_lswitch_port(self, lport_name, lswitch_name, may_exist=True,
-                            **columns):
+                            network_id=None, **columns):
         return cmd.AddLSwitchPortCommand(self, lport_name, lswitch_name,
-                                         may_exist, **columns)
+                                         may_exist, network_id=network_id,
+                                         **columns)
 
-    def set_lswitch_port(self, lport_name, if_exists=True, **columns):
-        return cmd.SetLSwitchPortCommand(self, lport_name,
+    def set_lswitch_port(self, lport_name, external_ids_update=None,
+                         if_exists=True, **columns):
+        return cmd.SetLSwitchPortCommand(self, lport_name, external_ids_update,
                                          if_exists, **columns)
+
+    def update_lswitch_qos_options(self, port, if_exists=True, **qos):
+        return cmd.UpdateLSwitchPortQosOptionsCommand(self, port, if_exists,
+                                                      **qos)
 
     def delete_lswitch_port(self, lport_name=None, lswitch_name=None,
                             ext_id=None, if_exists=True):
         if lport_name is not None:
             return cmd.DelLSwitchPortCommand(self, lport_name,
                                              lswitch_name, if_exists)
-        else:
-            raise RuntimeError(_("Currently only supports "
-                                 "delete by lport-name"))
+        raise RuntimeError(_("Currently only supports delete by lport-name"))
 
     def get_all_logical_switches_with_ports(self):
         result = []
@@ -211,17 +310,17 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
                     lswitch.external_ids):
                 continue
             ports = []
-            provnet_port = None
+            provnet_ports = []
             for lport in getattr(lswitch, 'ports', []):
                 if ovn_const.OVN_PORT_NAME_EXT_ID_KEY in lport.external_ids:
                     ports.append(lport.name)
                 # Handle provider network port
                 elif lport.name.startswith(
                         ovn_const.OVN_PROVNET_PORT_NAME_PREFIX):
-                    provnet_port = lport.name
+                    provnet_ports.append(lport.name)
             result.append({'name': lswitch.name,
                            'ports': ports,
-                           'provnet_port': provnet_port})
+                           'provnet_ports': provnet_ports})
         return result
 
     def get_all_logical_routers_with_rports(self):
@@ -257,15 +356,37 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
                         columns['external_mac'] = nat.external_mac[0]
                     if nat.logical_port:
                         columns['logical_port'] = nat.logical_port[0]
+                    columns['external_ids'] = nat.external_ids
+                    columns['uuid'] = nat.uuid
+                    if utils.is_nat_gateway_port_supported(self):
+                        columns['gateway_port'] = nat.gateway_port
                     dnat_and_snats.append(columns)
                 elif nat.type == 'snat':
                     snat.append(columns)
 
-            result.append({'name': lrouter.name.replace('neutron-', ''),
+            result.append({'name': utils.get_neutron_name(lrouter.name),
                            'static_routes': sroutes,
                            'ports': lrports,
                            'snats': snat,
                            'dnat_and_snats': dnat_and_snats})
+        return result
+
+    def get_all_logical_routers_static_routes(self):
+        """Get static routes associated with all logical Routers
+
+        @return: list of dict, each dict has key-value:
+                 - 'name': string router_id in neutron.
+                 - 'static_routes': list of static routes rows.
+        """
+        result = []
+        for lrouter in self._tables['Logical_Router'].rows.values():
+            if (ovn_const.OVN_ROUTER_NAME_EXT_ID_KEY not in
+                    lrouter.external_ids):
+                continue
+            result.append({'name': utils.get_neutron_name(lrouter.name),
+                           'static_routes': getattr(lrouter, 'static_routes',
+                                                    [])})
+
         return result
 
     def get_acl_by_id(self, acl_id):
@@ -307,7 +428,7 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
             # Iterate over each acl in a lswitch and store the acl in
             # a key:value representation for e.g. acl_string. This
             # key:value representation can invoke the code -
-            # self._ovn.add_acl(**acl_string)
+            # self.add_acl(**acl_string)
             for acl in acls:
                 ext_ids = getattr(acl, 'external_ids', {})
                 port_id = ext_ids.get('neutron:lport')
@@ -323,20 +444,30 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
                 acl_list.append(acl_string)
         return acl_values_dict, acl_obj_dict, lswitch_ovsdb_dict
 
-    def create_lrouter(self, name, may_exist=True, **columns):
-        return cmd.AddLRouterCommand(self, name,
-                                     may_exist, **columns)
-
     def update_lrouter(self, name, if_exists=True, **columns):
         return cmd.UpdateLRouterCommand(self, name,
                                         if_exists, **columns)
 
-    def delete_lrouter(self, name, if_exists=True):
-        return cmd.DelLRouterCommand(self, name, if_exists)
+    # This method overrides the parent class ``nb_impl_idl.OvnNbApiIdlImpl``
+    # implementation.
+    def lr_del(self, router, if_exists=False):
+        return cmd.LrDelCommand(self, router, if_exists=if_exists)
 
     def add_lrouter_port(self, name, lrouter, may_exist=False, **columns):
         return cmd.AddLRouterPortCommand(self, name, lrouter,
                                          may_exist, **columns)
+
+    def schedule_unhosted_gateways(self, g_name, sb_api, plugin, port_physnets,
+                                   all_gw_chassis, chassis_with_physnets,
+                                   chassis_with_azs):
+        return cmd.ScheduleUnhostedGatewaysCommand(
+            self, g_name, sb_api, plugin, port_physnets, all_gw_chassis,
+            chassis_with_physnets, chassis_with_azs)
+
+    def schedule_new_gateway(self, g_name, sb_api, lrouter_name, plugin,
+                             physnet, az_hints):
+        return cmd.ScheduleNewGatewayCommand(
+            self, g_name, sb_api, lrouter_name, plugin, physnet, az_hints)
 
     def update_lrouter_port(self, name, if_exists=True, **columns):
         return cmd.UpdateLRouterPortCommand(self, name, if_exists, **columns)
@@ -359,48 +490,35 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
     def delete_acl(self, lswitch, lport, if_exists=True):
         return cmd.DelACLCommand(self, lswitch, lport, if_exists)
 
-    def update_acls(self, lswitch_names, port_list, acl_new_values_dict,
-                    need_compare=True, is_add_acl=True):
-        return cmd.UpdateACLsCommand(self, lswitch_names,
-                                     port_list, acl_new_values_dict,
-                                     need_compare=need_compare,
-                                     is_add_acl=is_add_acl)
+    def add_static_route(self, lrouter, maintain_bfd=False, **columns):
+        return cmd.AddStaticRouteCommand(self, lrouter, maintain_bfd,
+                                         **columns)
 
-    def add_static_route(self, lrouter, **columns):
-        return cmd.AddStaticRouteCommand(self, lrouter, **columns)
+    def delete_static_routes(self, lrouter, routes, if_exists=True):
+        return cmd.DelStaticRoutesCommand(self, lrouter, routes, if_exists)
 
-    def delete_static_route(self, lrouter, ip_prefix, nexthop, if_exists=True):
-        return cmd.DelStaticRouteCommand(self, lrouter, ip_prefix, nexthop,
-                                         if_exists)
+    def set_static_route(self, sroute, **columns):
+        return cmd.SetStaticRouteCommand(self, sroute, **columns)
 
-    def create_address_set(self, name, may_exist=True, **columns):
-        return cmd.AddAddrSetCommand(self, name, may_exist, **columns)
-
-    def delete_address_set(self, name, if_exists=True, **columns):
-        return cmd.DelAddrSetCommand(self, name, if_exists)
-
-    def update_address_set(self, name, addrs_add, addrs_remove,
-                           if_exists=True):
-        return cmd.UpdateAddrSetCommand(self, name, addrs_add, addrs_remove,
-                                        if_exists)
-
-    def update_address_set_ext_ids(self, name, external_ids, if_exists=True):
-        return cmd.UpdateAddrSetExtIdsCommand(self, name, external_ids,
-                                              if_exists)
-
-    def _get_logical_router_port_gateway_chassis(self, lrp):
+    def _get_logical_router_port_gateway_chassis(self, lrp, priorities=None):
         """Get the list of chassis hosting this gateway port.
 
         @param   lrp: logical router port
         @type    lrp: Logical_Router_Port row
-        @return: List of tuples (chassis_name, priority) sorted by priority
+        @param   priorities: a list of gateway chassis priorities to search for
+        @type    priorities: list of int
+        @return: List of tuples (chassis_name, priority) sorted by priority. If
+                 ``priorities`` is set then only chassis matching of of these
+                 priorities are returned.
         """
         # Try retrieving gateway_chassis with new schema. If new schema is not
         # supported or user is using old schema, then use old schema for
         # getting gateway_chassis
         chassis = []
         if self._tables.get('Gateway_Chassis'):
-            for gwc in lrp.gateway_chassis:
+            for gwc in getattr(lrp, 'gateway_chassis', set()):
+                if priorities is not None and gwc.priority not in priorities:
+                    continue
                 chassis.append((gwc.chassis_name, gwc.priority))
         else:
             rc = lrp.options.get(ovn_const.OVN_GATEWAY_CHASSIS_KEY)
@@ -409,15 +527,41 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
         # make sure that chassis are sorted by priority
         return sorted(chassis, reverse=True, key=lambda x: x[1])
 
+    @staticmethod
+    def _get_logical_router_port_ha_chassis_group(lrp, priorities=None):
+        """Get the list of chassis hosting this gateway port.
+
+        @param   lrp: logical router port
+        @type    lrp: Logical_Router_Port row
+        @param   priorities: a list of gateway chassis priorities to search for
+        @type    priorities: list of int
+        @return: List of tuples (chassis_name, priority) sorted by priority. If
+                 ``priorities`` is set then only chassis matching of these
+                 priorities are returned.
+        """
+        chassis = []
+        hcg = getattr(lrp, 'ha_chassis_group', None)
+        if not hcg:
+            return chassis
+
+        for hc in hcg[0].ha_chassis:
+            if priorities is not None and hc.priority not in priorities:
+                continue
+            chassis.append((hc.chassis_name, hc.priority))
+        # Make sure that chassis are sorted by priority (highest prio first)
+        return sorted(chassis, reverse=True, key=lambda x: x[1])
+
     def get_all_chassis_gateway_bindings(self,
-                                         chassis_candidate_list=None):
+                                         chassis_candidate_list=None,
+                                         priorities=None):
         chassis_bindings = {}
         for chassis_name in chassis_candidate_list or []:
             chassis_bindings.setdefault(chassis_name, [])
         for lrp in self._tables['Logical_Router_Port'].rows.values():
             if not lrp.name.startswith('lrp-'):
                 continue
-            chassis = self._get_logical_router_port_gateway_chassis(lrp)
+            chassis = self._get_logical_router_port_gateway_chassis(
+                lrp, priorities=priorities)
             for chassis_name, prio in chassis:
                 if (not chassis_candidate_list or
                         chassis_name in chassis_candidate_list):
@@ -435,24 +579,49 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
         except idlutils.RowNotFound:
             return []
 
+    def get_gateway_chassis_az_hints(self, gateway_name):
+        lrp = self.lookup('Logical_Router_Port', gateway_name,
+                          default=None)
+        if not lrp:
+            return []
+        router_name = lrp.external_ids.get(
+            ovn_const.OVN_ROUTER_NAME_EXT_ID_KEY, "")
+        lrouter = self.lookup('Logical_Router', router_name, default=None)
+        if not lrouter:
+            return []
+        az_string = lrouter.external_ids.get(
+            ovn_const.OVN_AZ_HINTS_EXT_ID_KEY, "")
+        if not az_string:
+            return []
+        return az_string.split(",")
+
     def get_chassis_gateways(self, chassis_name):
         gw_chassis = self.db_find_rows(
             'Gateway_Chassis', ('chassis_name', '=', chassis_name))
         return gw_chassis.execute(check_error=True)
 
     def get_unhosted_gateways(self, port_physnet_dict, chassis_with_physnets,
-                              all_gw_chassis):
+                              all_gw_chassis, chassis_with_azs):
+        """Return the GW LRPs with no chassis assigned
+
+        If the LRP belongs to a tunnelled network (physnet=None), it won't be
+        hosted to any chassis.
+        """
         unhosted_gateways = set()
         for port, physnet in port_physnet_dict.items():
-            lrp_name = '%s%s' % (ovn_const.LRP_PREFIX, port)
-            original_state = self.get_gateway_chassis_binding(lrp_name)
+            if not physnet:
+                continue
 
+            lrp_name = f'{ovn_const.LRP_PREFIX}{port}'
+            original_state = self.get_gateway_chassis_binding(lrp_name)
+            az_hints = self.get_gateway_chassis_az_hints(lrp_name)
             # Filter out chassis that lost physnet, the cms option,
             # or has been deleted.
             actual_gw_chassis = [
                 chassis for chassis in original_state
                 if not utils.is_gateway_chassis_invalid(
-                    chassis, all_gw_chassis, physnet, chassis_with_physnets)]
+                    chassis, all_gw_chassis, physnet, chassis_with_physnets,
+                    az_hints, chassis_with_azs)]
 
             # Check if gw ports are fully scheduled.
             if len(actual_gw_chassis) >= ovn_const.MAX_GW_CHASSIS:
@@ -464,7 +633,8 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
             available_chassis = {
                 c for c in all_gw_chassis or chassis_with_physnets.keys()
                 if not utils.is_gateway_chassis_invalid(
-                    c, all_gw_chassis, physnet, chassis_with_physnets)}
+                    c, all_gw_chassis, physnet, chassis_with_physnets,
+                    az_hints, chassis_with_azs)}
 
             if available_chassis == set(original_state):
                 # The same situation as was before. Nothing
@@ -491,7 +661,7 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
                 'external_ids': ext_ids, 'uuid': row.uuid}
 
     def get_subnet_dhcp_options(self, subnet_id, with_ports=False):
-        subnet = None
+        subnet = {}
         ports = []
         for row in self._tables['DHCP_Options'].rows.values():
             external_ids = getattr(row, 'external_ids', {})
@@ -535,21 +705,6 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
 
         return dhcp_options
 
-    def get_address_sets(self):
-        address_sets = {}
-        for row in self._tables['Address_Set'].rows.values():
-            # TODO(lucasagomes): Remove OVN_SG_NAME_EXT_ID_KEY in the
-            # Rocky release
-            if not (ovn_const.OVN_SG_EXT_ID_KEY in row.external_ids or
-               ovn_const.OVN_SG_NAME_EXT_ID_KEY in row.external_ids):
-                continue
-            name = getattr(row, 'name')
-            data = {}
-            for row_key in getattr(row, "_data", {}):
-                data[row_key] = getattr(row, row_key)
-            address_sets[name] = data
-        return address_sets
-
     def get_router_port_options(self, lsp_name):
         try:
             lsp = idlutils.row_by_value(self.idl, 'Logical_Switch_Port',
@@ -557,7 +712,7 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
             options = getattr(lsp, 'options')
             for key in list(options.keys()):
                 if key not in ovn_const.OVN_ROUTER_PORT_OPTION_KEYS:
-                    del(options[key])
+                    del options[key]
             return options
         except idlutils.RowNotFound:
             return {}
@@ -581,12 +736,7 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
 
         nat_rules = []
         for nat_rule in getattr(lrouter, 'nat', []):
-            ext_ids = {}
-            # TODO(dalvarez): remove this check once the minimum OVS required
-            # version contains the column (when OVS 2.8.2 is released).
-            if self.is_col_present('NAT', 'external_ids'):
-                ext_ids = dict(getattr(nat_rule, 'external_ids', {}))
-
+            ext_ids = dict(getattr(nat_rule, 'external_ids', {}))
             nat_rules.append({'external_ip': nat_rule.external_ip,
                               'logical_ip': nat_rule.logical_ip,
                               'type': nat_rule.type,
@@ -636,34 +786,38 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
 
         return (ls, None)
 
-    def get_floatingip(self, fip_id):
-        # TODO(dalvarez): remove this check once the minimum OVS required
-        # version contains the column (when OVS 2.8.2 is released).
-        if not self.is_col_present('NAT', 'external_ids'):
-            return
+    def get_router_floatingip_lbs(self, lrouter_name):
+        rc = self.db_find_rows('Load_Balancer', (
+            'external_ids', '=',
+            {ovn_const.OVN_DEVICE_OWNER_EXT_ID_KEY:
+             pf_const.PORT_FORWARDING_PLUGIN,
+             ovn_const.OVN_ROUTER_NAME_EXT_ID_KEY: lrouter_name}))
+        return [ovn_obj for ovn_obj in rc.execute(check_error=True)
+                if ovn_const.OVN_FIP_EXT_ID_KEY in ovn_obj.external_ids]
 
+    def get_floatingip_in_nat_or_lb(self, fip_id):
+        fip = self.get_floatingip(fip_id)
+        if fip:
+            return fip
+        result = self.db_find('Load_Balancer', (
+            'external_ids', '=',
+            {ovn_const.OVN_DEVICE_OWNER_EXT_ID_KEY:
+             pf_const.PORT_FORWARDING_PLUGIN,
+             ovn_const.OVN_FIP_EXT_ID_KEY: fip_id})).execute(check_error=True)
+        return result[0] if result else None
+
+    def get_floatingip(self, fip_id):
         fip = self.db_find('NAT', ('external_ids', '=',
                                    {ovn_const.OVN_FIP_EXT_ID_KEY: fip_id}))
         result = fip.execute(check_error=True)
         return result[0] if result else None
 
-    def get_floatingip_by_ips(self, router_id, logical_ip, external_ip):
-        if not all([router_id, logical_ip, external_ip]):
-            return
-
-        for nat in self.get_lrouter_nat_rules(utils.ovn_name(router_id)):
-            if (nat['type'] == 'dnat_and_snat' and
-               nat['logical_ip'] == logical_ip and
-               nat['external_ip'] == external_ip):
-                return nat
-
-    def get_address_set(self, addrset_id, ip_version='ip4'):
-        addr_name = utils.ovn_addrset_name(addrset_id, ip_version)
-        try:
-            return idlutils.row_by_value(self.idl, 'Address_Set',
-                                         'name', addr_name)
-        except idlutils.RowNotFound:
-            return None
+    def get_floatingips(self):
+        cmd = self.db_find('NAT',
+            ('external_ids', '!=', {ovn_const.OVN_FIP_EXT_ID_KEY: ''}),
+            ('type', '=', 'dnat_and_snat')
+        )
+        return cmd.execute(check_error=True)
 
     def check_revision_number(self, name, resource, resource_type,
                               if_exists=True):
@@ -673,12 +827,11 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
     def get_lrouter(self, lrouter_name):
         if uuidutils.is_uuid_like(lrouter_name):
             lrouter_name = utils.ovn_name(lrouter_name)
-
-        # TODO(lucasagomes): Use lr_get() once we start refactoring this
-        # API to use methods from ovsdbapp.
-        lr = self.db_find_rows('Logical_Router', ('name', '=', lrouter_name))
-        result = lr.execute(check_error=True)
-        return result[0] if result else None
+        try:
+            return self.lr_get(lrouter_name).execute(log_errors=False,
+                                                     check_error=True)
+        except idlutils.RowNotFound:
+            return None
 
     def get_lrouter_port(self, lrp_name):
         # TODO(mangelajo): Implement lrp_get() ovsdbapp and use from here
@@ -688,44 +841,81 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
         result = lrp.execute(check_error=True)
         return result[0] if result else None
 
-    def delete_lrouter_ext_gw(self, lrouter_name, if_exists=True):
-        return cmd.DeleteLRouterExtGwCommand(self, lrouter_name, if_exists)
+    def get_lrouter_gw_ports(self, lrouter_name):
+        r_name = ovn_const.OVN_ROUTER_NAME_EXT_ID_KEY
+        is_gw = ovn_const.OVN_ROUTER_IS_EXT_GW
+        lr = self.get_lrouter(lrouter_name)
+        gw_ports = []
+        for lrp in getattr(lr, 'ports', []):
+            lrp_ext_ids = getattr(lrp, 'external_ids', {})
+            if (r_name not in lrp_ext_ids or
+                    lrp_ext_ids[r_name] != lr.name or
+                    not strutils.bool_from_string(lrp_ext_ids.get(is_gw))):
+                continue
 
-    def is_port_groups_supported(self):
-        return self.is_table_present('Port_Group')
+            gw_ports.append(lrp)
+        return gw_ports
+
+    def get_lrouter_by_lrouter_port(self, lrp_name):
+        """Get LR by name of LRP.
+
+        :param lrp_name: Name of LRP.
+        :type lrp_name:  str
+        :returns:        LR associated with LRP as represented by lrp_name.
+        :rtype:          Optional[ovs_idl.rowview.RowView]
+        """
+        lrp = self.get_lrouter_port(lrp_name)
+        if not lrp:
+            return None
+
+        # NOTE(fnordahl) This could be replaced by something like:
+        #
+        #     lr = self.db_find_rows(
+        #         'Logical_Router',
+        #         ('ports', '{>}', lrp.uuid))
+        #
+        # However, ovsdbapp does not currently support the '{>}' operator.
+        for lr in self._tables['Logical_Router'].rows.values():
+            lr_ports = getattr(lr, 'ports', set())
+            if lrp in lr_ports:
+                return lr
+        return None
+
+    def delete_lrouter_ext_gw(self, lrouter_name, if_exists=True,
+                              maintain_bfd=True):
+        return cmd.DeleteLRouterExtGwCommand(self, lrouter_name, if_exists,
+                                             maintain_bfd)
 
     def get_port_group(self, pg_name):
         if uuidutils.is_uuid_like(pg_name):
             pg_name = utils.ovn_port_group_name(pg_name)
-        try:
-            for pg in self._tables['Port_Group'].rows.values():
-                if pg.name == pg_name:
-                    return pg
-        except KeyError:
-            # TODO(dalvarez): This except block is added for backwards compat
-            # with old OVN schemas (<=2.9) where Port Groups are not present.
-            # This (and other conditional code around this feature) shall be
-            # removed at some point.
-            return
+        return self.lookup('Port_Group', pg_name, default=None)
 
-    def get_port_groups(self):
+    def get_address_set(self, as_name):
+        if uuidutils.is_uuid_like(as_name):
+            as_name_v4 = utils.ovn_ag_addrset_name(as_name, 'ip4')
+            as_name_v6 = utils.ovn_ag_addrset_name(as_name, 'ip6')
+            return (self.lookup('Address_Set', as_name_v4, default=None),
+                    self.lookup('Address_Set', as_name_v6, default=None))
+        return self.lookup('Address_Set', as_name, default=None), None
+
+    def get_sg_port_groups(self):
+        """Returns OVN port groups used as Neutron Security Groups.
+
+        This method will return all port group entries in OVN that map to
+        a Security Group. Even though neutron_pg_drop is used to assist on
+        SGs, it will also not be returned.
+        """
         port_groups = {}
-        try:
-            for row in self._tables['Port_Group'].rows.values():
-                name = getattr(row, 'name')
-                if not (ovn_const.OVN_SG_EXT_ID_KEY in row.external_ids or
-                   name == ovn_const.OVN_DROP_PORT_GROUP_NAME):
-                    continue
-                data = {}
-                for row_key in getattr(row, "_data", {}):
-                    data[row_key] = getattr(row, row_key)
-                port_groups[name] = data
-        except KeyError:
-            # TODO(dalvarez): This except block is added for backwards compat
-            # with old OVN schemas (<=2.9) where Port Groups are not present.
-            # This (and other conditional code around this feature) shall be
-            # removed at some point.
-            pass
+        for row in self._tables['Port_Group'].rows.values():
+            name = getattr(row, 'name')
+            if (ovn_const.OVN_SG_EXT_ID_KEY not in row.external_ids or
+                    name == ovn_const.OVN_DROP_PORT_GROUP_NAME):
+                continue
+            data = {}
+            for row_key in getattr(row, "_data", {}):
+                data[row_key] = getattr(row, row_key)
+            port_groups[name] = data
         return port_groups
 
     def check_liveness(self):
@@ -741,19 +931,44 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
         return cmd.UnsetLSwitchPortToVirtualTypeCommand(
             self, lport_name, virtual_parent, if_exists)
 
+    def update_lb_external_ids(self, lb_name, values, if_exists=True):
+        return cmd.UpdateLbExternalIds(self, lb_name, values, if_exists)
+
+    def set_nb_global_options(self, **options):
+        LOG.debug("Setting NB_Global options: %s", options)
+        return self.db_set("NB_Global", ".", options=options)
+
+    def set_router_mac_age_limit(self, router=None):
+        # Set the MAC_Binding age limit on OVN Logical Routers
+        return cmd.SetLRouterMacAgeLimitCommand(
+            self, router, cfg.get_ovn_mac_binding_age_threshold())
+
+    def ha_chassis_group_with_hc_add(self, name, chassis_priority,
+                                     may_exist=False, **columns):
+        return cmd.HAChassisGroupWithHCAddCommand(
+            self, name, chassis_priority, may_exist=may_exist,
+            **columns)
+
 
 class OvsdbSbOvnIdl(sb_impl_idl.OvnSbApiIdlImpl, Backend):
-    def __init__(self, connection):
-        super(OvsdbSbOvnIdl, self).__init__(connection)
-        # TODO(twilson) This direct access of the idl should be removed in
-        # favor of a backend-agnostic method
-        self.idl._session.reconnect.set_probe_interval(
-            cfg.get_ovn_ovsdb_probe_interval())
+    @n_utils.classproperty
+    def connection_string(cls):
+        return cfg.get_ovn_sb_connection()
+
+    @classmethod
+    def from_worker(cls, worker_class, driver=None):
+        args = (cls.connection_string, cls.schema_helper)
+        if worker_class == worker.MaintenanceWorker:
+            idl_ = ovsdb_monitor.BaseOvnSbIdl.from_server(*args)
+        else:
+            idl_ = ovsdb_monitor.OvnSbIdl.from_server(*args, driver=driver)
+        conn = connection.Connection(idl_, timeout=cfg.get_ovn_ovsdb_timeout())
+        return cls(conn)
 
     def _get_chassis_physnets(self, chassis):
-        bridge_mappings = chassis.external_ids.get('ovn-bridge-mappings', '')
-        mapping_dict = helpers.parse_mappings(bridge_mappings.split(','),
-                                              unique_values=False)
+        other_config = utils.get_ovn_chassis_other_config(chassis)
+        bridge_mappings = other_config.get('ovn-bridge-mappings', '')
+        mapping_dict = helpers.parse_mappings(bridge_mappings.split(','))
         return list(mapping_dict.keys())
 
     def chassis_exists(self, hostname):
@@ -766,13 +981,14 @@ class OvsdbSbOvnIdl(sb_impl_idl.OvnSbApiIdlImpl, Backend):
             chassis_info_dict[ch.hostname] = self._get_chassis_physnets(ch)
         return chassis_info_dict
 
-    def get_gateway_chassis_from_cms_options(self):
-        gw_chassis = []
-        for ch in self.chassis_list().execute(check_error=True):
-            cms_options = ch.external_ids.get('ovn-cms-options', '')
-            if 'enable-chassis-as-gw' in cms_options.split(','):
-                gw_chassis.append(ch.name)
-        return gw_chassis
+    def get_gateway_chassis_from_cms_options(self, name_only=True):
+        return [ch.name if name_only else ch
+                for ch in self.chassis_list().execute(check_error=True)
+                if utils.is_gateway_chassis(ch)]
+
+    def get_extport_chassis_from_cms_options(self):
+        return [ch for ch in self.chassis_list().execute(check_error=True)
+                if utils.is_extport_host_chassis(ch)]
 
     def get_chassis_and_physnets(self):
         chassis_info_dict = {}
@@ -780,45 +996,44 @@ class OvsdbSbOvnIdl(sb_impl_idl.OvnSbApiIdlImpl, Backend):
             chassis_info_dict[ch.name] = self._get_chassis_physnets(ch)
         return chassis_info_dict
 
+    def get_chassis_and_azs(self):
+        chassis_azs = {}
+        for ch in self.chassis_list().execute(check_error=True):
+            chassis_azs[ch.name] = utils.get_chassis_availability_zones(ch)
+        return chassis_azs
+
     def get_all_chassis(self, chassis_type=None):
         # TODO(azbiswas): Use chassis_type as input once the compute type
         # preference patch (as part of external ids) merges.
         return [c.name for c in self.chassis_list().execute(check_error=True)]
 
-    def get_chassis_data_for_ml2_bind_port(self, hostname):
-        try:
-            cmd = self.db_find_rows('Chassis', ('hostname', '=', hostname))
-            chassis = next(c for c in cmd.execute(check_error=True))
-        except StopIteration:
-            msg = _('Chassis with hostname %s does not exist') % hostname
-            raise RuntimeError(msg)
-        return (chassis.external_ids.get('datapath-type', ''),
-                chassis.external_ids.get('iface-types', ''),
-                self._get_chassis_physnets(chassis))
+    def get_chassis_by_card_serial_from_cms_options(self,
+                                                    card_serial_number):
+        for ch in self.chassis_list().execute(check_error=True):
+            if ('{}={}'
+                    .format(ovn_const.CMS_OPT_CARD_SERIAL_NUMBER,
+                            card_serial_number)
+                    in utils.get_ovn_chassis_other_config(ch).get(
+                        ovn_const.OVN_CMS_OPTIONS, '').split(',')):
+                return ch
+        msg = _('Chassis with %s %s %s does not exist'
+                ) % (ovn_const.OVN_CMS_OPTIONS,
+                     ovn_const.CMS_OPT_CARD_SERIAL_NUMBER,
+                     card_serial_number)
+        raise RuntimeError(msg)
 
-    def get_metadata_port_network(self, network):
+    def get_metadata_port(self, datapath_uuid):
         # TODO(twilson) This function should really just take a Row/RowView
         try:
-            dp = self.lookup('Datapath_Binding', uuid.UUID(network))
+            dp = self.lookup('Datapath_Binding', uuid.UUID(datapath_uuid))
         except idlutils.RowNotFound:
             return None
         cmd = self.db_find_rows('Port_Binding', ('datapath', '=', dp),
-                                ('type', '=', 'localport'))
+                                ('type', '=', ovn_const.LSP_TYPE_LOCALPORT),
+                                ('external_ids', '=', {
+                                    ovn_const.OVN_DEVICE_OWNER_EXT_ID_KEY:
+                                        constants.DEVICE_OWNER_DISTRIBUTED}))
         return next(iter(cmd.execute(check_error=True)), None)
-
-    def get_chassis_metadata_networks(self, chassis_name):
-        """Return a list with the metadata networks the chassis is hosting."""
-        chassis = self.lookup('Chassis', chassis_name)
-        proxy_networks = chassis.external_ids.get(
-            'neutron-metadata-proxy-networks', None)
-        return proxy_networks.split(',') if proxy_networks else []
-
-    def set_chassis_metadata_networks(self, chassis, networks):
-        nets = ','.join(networks) if networks else ''
-        # TODO(twilson) This could just use DbSetCommand
-        return cmd.UpdateChassisExtIdsCommand(
-            self, chassis, {'neutron-metadata-proxy-networks': nets},
-            if_exists=True)
 
     def set_chassis_neutron_description(self, chassis, description,
                                         agent_type):
@@ -828,34 +1043,64 @@ class OvsdbSbOvnIdl(sb_impl_idl.OvnSbApiIdlImpl, Backend):
         return cmd.UpdateChassisExtIdsCommand(
             self, chassis, {desc_key: description}, if_exists=False)
 
-    def get_network_port_bindings_by_ip(self, network, ip_address):
+    def get_network_port_bindings_by_ip(self, network, ip_address, mac=None):
         rows = self.db_list_rows('Port_Binding').execute(check_error=True)
         # TODO(twilson) It would be useful to have a db_find that takes a
         # comparison function
-        return [r for r in rows
-                if (r.mac and str(r.datapath.uuid) == network) and
-                ip_address in r.mac[0].split(' ')]
 
-    def update_metadata_health_status(self, chassis, nb_cfg):
-        return cmd.UpdateChassisExtIdsCommand(
-            self, chassis,
-            {ovn_const.OVN_AGENT_METADATA_SB_CFG_KEY: str(nb_cfg)},
-            if_exists=True)
+        def check_net_and_ip(port):
+            # If the port is not bound to any chassis it is not relevant
+            if not port.chassis:
+                return False
+            if not port.mac:
+                return False
+            # The MAC and IP address(es) are both present in port.mac as
+            # ["MAC IP {IP2...IPN}"]. If either one is present that is a
+            # match, since for link-local clients we can only match the MAC.
+            mac_ip = port.mac[0].split(' ')
+            address_match = False
+            if mac and mac in mac_ip:
+                address_match = True
+            elif ip_address in mac_ip:
+                address_match = True
+            if not address_match:
+                return False
+
+            is_in_network = utils.get_network_name_from_datapath(
+                port.datapath) == network
+            return is_in_network
+
+        return [r for r in rows if check_net_and_ip(r)]
 
     def set_port_cidrs(self, name, cidrs):
         # TODO(twilson) add if_exists to db commands
         return self.db_set('Port_Binding', name, 'external_ids',
                            {'neutron-port-cidrs': cidrs})
 
-    def get_ports_on_chassis(self, chassis):
+    def get_ports_on_chassis(self, chassis, include_additional_chassis=False):
         # TODO(twilson) Some day it would be nice to stop passing names around
         # and just start using chassis objects so db_find_rows could be used
         rows = self.db_list_rows('Port_Binding').execute(check_error=True)
-        return [r for r in rows if r.chassis and r.chassis[0].name == chassis]
+        if (include_additional_chassis and
+                utils.is_additional_chassis_supported(self)):
+            return [r for r in rows
+                    if r.chassis and r.chassis[0].name == chassis or
+                    chassis in [ch.name for ch in r.additional_chassis]]
+        return [r for r in rows
+                if r.chassis and r.chassis[0].name == chassis]
 
-    def get_logical_port_chassis_and_datapath(self, name):
-        for port in self._tables['Port_Binding'].rows.values():
-            if port.logical_port == name:
-                datapath = str(port.datapath.uuid)
-                chassis = port.chassis[0].name if port.chassis else None
-                return chassis, datapath
+    def get_chassis_host_for_port(self, port_id):
+        chassis = set()
+        cmd = self.db_find_rows('Port_Binding', ('logical_port', '=', port_id))
+        for row in cmd.execute(check_error=True):
+            try:
+                chassis.add(row.chassis[0].name)
+            except IndexError:
+                # Do not short-circuit here. Proceed to additional
+                # chassis handling
+                pass
+
+            if utils.is_additional_chassis_supported(self):
+                for ch in row.additional_chassis:
+                    chassis.add(ch.name)
+        return chassis

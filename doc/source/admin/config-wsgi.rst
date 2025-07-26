@@ -1,9 +1,9 @@
 .. _config-wsgi:
 
-Installing Neutron API via WSGI
+WSGI Usage with the Neutron API
 ===============================
 
-This document is a guide to deploying neutron using WSGI. There are two ways to
+This document is a guide to deploying Neutron using WSGI. There are two ways to
 deploy using WSGI: ``uwsgi`` and Apache ``mod_wsgi``.
 
 Please note that if you intend to use mode uwsgi, you should install the
@@ -46,6 +46,7 @@ Create a ``/etc/neutron/neutron-api-uwsgi.ini`` file with the content below:
     master = true
     processes = 2
     wsgi-file = <path-to-neutron-bin-dir>/neutron-api
+    start-time = %t
 
 .. end
 
@@ -95,8 +96,8 @@ Create ``/etc/apache2/neutron.conf`` with content below:
 
 .. end
 
-For deb-based systems copy or symlink the file to ``/etc/apache2/sites-available``.
-Then enable the neutron site:
+For deb-based systems copy or symlink the file to
+``/etc/apache2/sites-available``. Then enable the neutron site:
 
 .. code-block:: console
 
@@ -148,4 +149,21 @@ using about 2GB of RAM in steady-state.
 For rpc_workers, there needs to be enough to keep up with incoming
 events from the various neutron agents. Signs that there are too few
 can be agent heartbeats arriving late, nova vif bindings timing out
-on the hypervisors, or rpc message timeout exceptions in agent logs.
+on the hypervisors, or rpc message timeout exceptions in agent logs
+(for example, "broken pipe" errors).
+
+There is also the rpc_state_report_workers option, which determines
+the number fo RPC worker processes dedicated to process state reports
+from the various agents. This may be increased to resolve frequent delay
+in processing agents heartbeats.
+
+.. note::
+   If OVN ML2 plugin is used without any additional agents, neutron requires
+   no worker for RPC message processing. Set both rpc_workers and
+   rpc_state_report_workers to 0, to disable RPC workers.
+
+.. note::
+   ML2/OVN uses the ``[uwsgi]start-time = %t`` parameter to create the OVN hash
+   ring registers during the initialization process. This value is populated
+   by the uWSGi process with the start time. For more information, check
+   `Configuring uWSGI <https://uwsgi-docs.readthedocs.io/en/latest/Configuration.html>_`.

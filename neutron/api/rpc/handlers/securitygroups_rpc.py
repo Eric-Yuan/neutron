@@ -23,15 +23,17 @@ from neutron_lib import rpc as n_rpc
 from neutron_lib.utils import net
 from oslo_log import log as logging
 import oslo_messaging
+from oslo_utils import versionutils
 
 from neutron.api.rpc.callbacks import resources
 from neutron.api.rpc.handlers import resources_rpc
+from neutron.common import utils
 from neutron.db import securitygroups_rpc_base as sg_rpc_base
 
 LOG = logging.getLogger(__name__)
 
 
-class SecurityGroupServerRpcApi(object):
+class SecurityGroupServerRpcApi:
     """RPC client for security group methods in the plugin.
 
     This class implements the client side of an rpc interface.  This interface
@@ -56,12 +58,14 @@ class SecurityGroupServerRpcApi(object):
     def security_group_info_for_devices(self, context, devices):
         LOG.debug("Get security group information for devices via rpc %r",
                   devices)
-        cctxt = self.client.prepare(version='1.2')
+        call_version = '1.3'
+        cctxt = self.client.prepare(version=call_version)
         return cctxt.call(context, 'security_group_info_for_devices',
-                          devices=devices)
+                          devices=devices,
+                          call_version=call_version)
 
 
-class SecurityGroupServerRpcCallback(object):
+class SecurityGroupServerRpcCallback:
     """Callback for SecurityGroup agent RPC in plugin implementations.
 
     This class implements the server side of an rpc interface.  The client side
@@ -72,10 +76,12 @@ class SecurityGroupServerRpcCallback(object):
     # API version history:
     #   1.1 - Initial version
     #   1.2 - security_group_info_for_devices introduced as an optimization
+    #   1.3 - security_group_info_for_devices returns member_ips with new
+    #         structure.
 
     # NOTE: target must not be overridden in subclasses
     # to keep RPC API version consistent across plugins.
-    target = oslo_messaging.Target(version='1.2',
+    target = oslo_messaging.Target(version='1.3',
                                    namespace=constants.RPC_NAMESPACE_SECGROUP)
 
     @property
@@ -83,11 +89,11 @@ class SecurityGroupServerRpcCallback(object):
         return directory.get_plugin()
 
     def _get_devices_info(self, context, devices):
-        return dict(
-            (port['id'], port)
+        return {
+            port['id']: port
             for port in self.plugin.get_ports_from_devices(context, devices)
             if port and not net.is_port_trusted(port)
-        )
+        }
 
     def security_group_rules_for_devices(self, context, **kwargs):
         """Callback method to return security group rules for each port.
@@ -115,12 +121,37 @@ class SecurityGroupServerRpcCallback(object):
 
         Note that sets are serialized into lists by rpc code.
         """
+        # The original client RPC version was 1.2 before this change.
+        call_version = kwargs.pop("call_version", '1.2')
+        _target_version = versionutils.convert_version_to_tuple(call_version)
         devices_info = kwargs.get('devices')
         ports = self._get_devices_info(context, devices_info)
-        return self.plugin.security_group_info_for_ports(context, ports)
+        sg_info = self.plugin.security_group_info_for_ports(context, ports)
+        if _target_version < (1, 3):
+            LOG.warning("RPC security_group_info_for_devices call has "
+                        "inconsistent version between server and agents. "
+                        "The server supports RPC version is 1.3 while "
+                        "the agent is %s.", call_version)
+            return self.make_compatible_sg_member_ips(sg_info)
+        return sg_info
+
+    def make_compatible_sg_member_ips(self, sg_info):
+        sg_member_ips = sg_info.get('sg_member_ips', {})
+        sg_ids = sg_member_ips.keys()
+        for sg_id in sg_ids:
+            member_ips = sg_member_ips.get(sg_id, {})
+            ipv4_ips = member_ips.get("IPv4", set())
+            comp_ipv4_ips = {ip for ip, _mac in ipv4_ips}
+            ipv6_ips = member_ips.get("IPv6", set())
+            comp_ipv6_ips = {ip for ip, _mac in ipv6_ips}
+            comp_ips = {"IPv4": comp_ipv4_ips,
+                        "IPv6": comp_ipv6_ips}
+            sg_member_ips[sg_id] = comp_ips
+        sg_info['sg_member_ips'] = sg_member_ips
+        return sg_info
 
 
-class SecurityGroupAgentRpcApiMixin(object):
+class SecurityGroupAgentRpcApiMixin:
     """RPC client for security group methods to the agent.
 
     This class implements the client side of an rpc interface.  This interface
@@ -139,6 +170,7 @@ class SecurityGroupAgentRpcApiMixin(object):
                                      topics.SECURITY_GROUP,
                                      topics.UPDATE)
 
+    @utils.disable_notifications
     def security_groups_rule_updated(self, context, security_groups):
         """Notify rule updated security groups."""
         if not security_groups:
@@ -149,6 +181,7 @@ class SecurityGroupAgentRpcApiMixin(object):
         cctxt.cast(context, 'security_groups_rule_updated',
                    security_groups=security_groups)
 
+    @utils.disable_notifications
     def security_groups_member_updated(self, context, security_groups):
         """Notify member updated security groups."""
         if not security_groups:
@@ -160,7 +193,7 @@ class SecurityGroupAgentRpcApiMixin(object):
                    security_groups=security_groups)
 
 
-class SecurityGroupAgentRpcCallbackMixin(object):
+class SecurityGroupAgentRpcCallbackMixin:
     """A mix-in that enable SecurityGroup support in agent implementations.
 
     This class implements the server side of an rpc interface.  The client side
@@ -228,6 +261,12 @@ class SecurityGroupServerAPIShim(sg_rpc_base.SecurityGroupInfoAPIMixin):
                            'Port', events.AFTER_DELETE)
         registry.subscribe(self._handle_sg_member_update,
                            'Port', events.AFTER_UPDATE)
+        self._register_legacy_ag_notification_callbacks(sg_agent)
+
+    def _register_legacy_ag_notification_callbacks(self, sg_agent):
+        for event in (events.AFTER_UPDATE, events.AFTER_DELETE):
+            registry.subscribe(self._handle_address_group_event,
+                               resources.ADDRESSGROUP, event)
 
     def security_group_info_for_devices(self, context, devices):
         ports = self._get_devices_info(context, devices)
@@ -240,57 +279,84 @@ class SecurityGroupServerAPIShim(sg_rpc_base.SecurityGroupInfoAPIMixin):
         # error.
         raise NotImplementedError()
 
-    def _add_child_sg_rules(self, rtype, event, trigger, context, updated,
-                            **kwargs):
+    def get_secgroup_ids_for_address_group(self, address_group_id):
+        filters = {'remote_address_group_id': (address_group_id, )}
+        return {rule.security_group_id for rule in
+                self.rcache.get_resources('SecurityGroupRule', filters)}
+
+    def _add_child_sg_rules(self, rtype, event, trigger, payload):
         # whenever we receive a full security group, add all child rules
         # because the server won't emit events for the individual rules on
         # creation.
+        context = payload.context
+        updated = payload.latest_state
         for rule in updated.rules:
             self.rcache.record_resource_update(context, 'SecurityGroupRule',
                                                rule)
 
-    def _clear_child_sg_rules(self, rtype, event, trigger, context, existing,
-                              **kwargs):
+    def _clear_child_sg_rules(self, rtype, event, trigger, payload):
+        context = payload.context
+        existing = payload.states[0]
         if not existing:
             return
         # the server can delete an entire security group without notifying
         # about the security group rules. so we need to emulate a rule deletion
         # when a security group is removed.
-        filters = {'security_group_id': (existing.id, )}
-        for rule in self.rcache.get_resources('SecurityGroupRule', filters):
+
+        rules = self.rcache.match_resources_with_func(
+            'SecurityGroupRule',
+            lambda rule: rule.security_group_id == existing.id)
+
+        for rule in rules:
+            self.rcache.record_resource_delete(context, 'SecurityGroupRule',
+                                               rule.id)
+        # If there's a rule which remote is the deleted sg, remove that also.
+        rules = self.rcache.match_resources_with_func(
+            'SecurityGroupRule',
+            lambda sg_rule: sg_rule.remote_group_id == existing.id)
+        for rule in rules:
             self.rcache.record_resource_delete(context, 'SecurityGroupRule',
                                                rule.id)
 
-    def _handle_sg_rule_delete(self, rtype, event, trigger, context, existing,
-                               **kwargs):
+    def _handle_sg_rule_delete(self, rtype, event, trigger, payload):
+        existing = payload.states[0]
         if not existing:
             return
         sg_id = existing.security_group_id
         self._sg_agent.security_groups_rule_updated([sg_id])
 
-    def _handle_sg_rule_update(self, rtype, event, trigger, context, existing,
-                               updated, **kwargs):
+    def _handle_sg_rule_update(self, rtype, event, trigger, payload):
+        updated = payload.latest_state
         sg_id = updated.security_group_id
         self._sg_agent.security_groups_rule_updated([sg_id])
 
-    def _handle_sg_member_delete(self, rtype, event, trigger, context,
-                                 existing, **kwargs):
+    def _handle_sg_member_delete(self, rtype, event, trigger, payload):
         # received on port delete
+        existing = payload.states[0]
         sgs = set(existing.security_group_ids) if existing else set()
         if sgs:
             self._sg_agent.security_groups_member_updated(sgs)
 
-    def _handle_sg_member_update(self, rtype, event, trigger, context,
-                                 existing, updated, changed_fields, **kwargs):
+    def _handle_sg_member_update(self, rtype, event, trigger, payload):
         # received on port update
+        existing = payload.states[0]
+        updated = payload.latest_state
+        changed_fields = payload.metadata['changed_fields']
         sgs = set(existing.security_group_ids) if existing else set()
         if not changed_fields.intersection({'security_group_ids', 'fixed_ips',
                                             'allowed_address_pairs'}):
             # none of the relevant fields to SG calculations changed
             return
-        sgs.update({sg_id for sg_id in updated.security_group_ids})
+        sgs.update(set(updated.security_group_ids))
         if sgs:
             self._sg_agent.security_groups_member_updated(sgs)
+
+    def _handle_address_group_event(self, rtype, event, trigger, payload):
+        resource_id = payload.resource_id
+        if event == events.AFTER_UPDATE:
+            self._sg_agent.address_group_updated(resource_id)
+        else:
+            self._sg_agent.address_group_deleted(resource_id)
 
     def _get_devices_info(self, context, devices):
         # NOTE(kevinbenton): this format is required by the sg code, it is
@@ -309,11 +375,11 @@ class SecurityGroupServerAPIShim(sg_rpc_base.SecurityGroupInfoAPIMixin):
             port['security_groups'] = list(ovo.security_group_ids)
             port['security_group_rules'] = []
             port['security_group_source_groups'] = []
+            port['security_group_remote_address_groups'] = []
             port['fixed_ips'] = [str(f['ip_address'])
                                  for f in port['fixed_ips']]
             # NOTE(kevinbenton): this id==device is only safe for OVS. a lookup
-            # will be required for linux bridge and others that don't have the
-            # full port UUID
+            # will be required for others that don't have the full port UUID
             port['device'] = port['id']
             port['port_security_enabled'] = getattr(
                 ovo.security, 'port_security_enabled', True)
@@ -336,12 +402,25 @@ class SecurityGroupServerAPIShim(sg_rpc_base.SecurityGroupInfoAPIMixin):
                     ips_by_group[sg_id].update(set(port_ips))
         return ips_by_group
 
+    def _select_ips_for_remote_address_group(self, context,
+                                             remote_address_group_ids):
+        if not remote_address_group_ids:
+            return {}
+        ips_by_group = {ag: set() for ag in remote_address_group_ids}
+        for ag_id in remote_address_group_ids:
+            ag = self.rcache.get_resource_by_id('AddressGroup', ag_id)
+            # NOTE(hangyang) Expected data structure is (ip, mac) tuple
+            ips = [(str(addr_assoc.address), None)
+                   for addr_assoc in ag.addresses]
+            ips_by_group[ag_id].update(set(ips))
+        return ips_by_group
+
     def _select_rules_for_ports(self, context, ports):
         if not ports:
             return []
         results = []
-        sg_ids = set((sg_id for p in ports.values()
-                      for sg_id in p['security_group_ids']))
+        sg_ids = {sg_id for p in ports.values()
+                  for sg_id in p['security_group_ids']}
         rules_by_sgid = collections.defaultdict(list)
         for sg_id in sg_ids:
             filters = {'security_group_id': (sg_id, )}
@@ -354,10 +433,14 @@ class SecurityGroupServerAPIShim(sg_rpc_base.SecurityGroupInfoAPIMixin):
         return results
 
     def _select_sg_ids_for_ports(self, context, ports):
-        sg_ids = set((sg_id for p in ports.values()
-                      for sg_id in p['security_group_ids']))
+        sg_ids = {sg_id for p in ports.values()
+                  for sg_id in p['security_group_ids']}
         return [(sg_id, ) for sg_id in sg_ids]
 
-    def _is_security_group_stateful(self, context, sg_id):
-        sg = self.rcache.get_resource_by_id(resources.SECURITYGROUP, sg_id)
-        return sg.stateful
+    def _get_sgs_stateful_flag(self, context, sg_ids):
+        sgs_stateful = {}
+        for sg_id in sg_ids:
+            sg = self.rcache.get_resource_by_id(resources.SECURITYGROUP, sg_id)
+            sgs_stateful[sg_id] = sg.stateful
+
+        return sgs_stateful

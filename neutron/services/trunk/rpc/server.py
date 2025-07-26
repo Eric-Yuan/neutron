@@ -55,7 +55,7 @@ def trunk_by_port_provider(resource, port_id, context, **kwargs):
     return trunk_objects.Trunk.get_object(context, port_id=port_id)
 
 
-class TrunkSkeleton(object):
+class TrunkSkeleton:
     """Skeleton proxy code for agent->server communication."""
 
     # API version history:
@@ -71,7 +71,12 @@ class TrunkSkeleton(object):
         self._connection = n_rpc.Connection()
         self._connection.create_consumer(
             constants.TRUNK_BASE_TOPIC, [self], fanout=False)
-        self._connection.consume_in_threads()
+        self._rpc_servers = self._connection.consume_in_threads()
+        LOG.debug("RPC backend initialized for trunk plugin")
+
+    @property
+    def rpc_servers(self):
+        return self._rpc_servers
 
     @property
     def core_plugin(self):
@@ -95,9 +100,7 @@ class TrunkSkeleton(object):
                 continue
 
             trunk_updated_ports = self._process_trunk_subport_bindings(
-                                                                  el,
-                                                                  trunk,
-                                                                  subport_ids)
+                el, trunk, subport_ids)
             updated_ports[trunk.id].extend(trunk_updated_ports)
 
         return updated_ports
@@ -111,9 +114,8 @@ class TrunkSkeleton(object):
                 if try_cnt < db_api.MAX_RETRIES - 1:
                     LOG.debug("Got StaleDataError exception: %s", e)
                     continue
-                else:
-                    # re-raise when all tries failed
-                    raise
+                # re-raise when all tries failed
+                raise
 
     def update_trunk_status(self, context, trunk_id, status):
         """Update the trunk status to reflect outcome of data plane wiring."""
@@ -128,6 +130,12 @@ class TrunkSkeleton(object):
         trunk_port_id = trunk.port_id
         trunk_port = self.core_plugin.get_port(context, trunk_port_id)
         trunk_host = trunk_port.get(portbindings.HOST_ID)
+        migrating_to_host = trunk_port.get(
+            portbindings.PROFILE, {}).get('migrating_to')
+        if migrating_to_host and trunk_host != migrating_to_host:
+            # Trunk is migrating now, so lets update host of the subports
+            # to the new host already
+            trunk_host = migrating_to_host
 
         # NOTE(status_police) Set the trunk in BUILD state before
         # processing subport bindings. The trunk will stay in BUILD
@@ -183,7 +191,7 @@ class TrunkSkeleton(object):
         return port
 
 
-class TrunkStub(object):
+class TrunkStub:
     """Stub proxy code for server->agent communication."""
 
     def __init__(self):

@@ -22,6 +22,7 @@ from neutron_lib.api.definitions import portbindings
 from neutron_lib import constants
 from neutron_lib import context
 from neutron_lib.db import api as db_api
+from neutron_lib.plugins import directory
 from neutron_lib.plugins.ml2 import api
 from oslo_utils import uuidutils
 from sqlalchemy.orm import exc
@@ -34,6 +35,7 @@ from neutron.objects import network as network_obj
 from neutron.objects import ports as port_obj
 from neutron.plugins.ml2 import db as ml2_db
 from neutron.plugins.ml2 import models
+from neutron.services.segments import exceptions as seg_exc
 from neutron.tests.unit import testlib_api
 
 
@@ -43,7 +45,7 @@ PLUGIN_NAME = 'ml2'
 class Ml2DBTestCase(testlib_api.SqlTestCase):
 
     def setUp(self):
-        super(Ml2DBTestCase, self).setUp()
+        super().setUp()
         self.ctx = context.get_admin_context()
         self.setup_coreplugin(PLUGIN_NAME)
 
@@ -111,7 +113,7 @@ class Ml2DBTestCase(testlib_api.SqlTestCase):
                     api.PHYSICAL_NETWORK: 'physnet1',
                     api.SEGMENTATION_ID: 1},
                     {api.NETWORK_TYPE: 'vlan',
-                     api.PHYSICAL_NETWORK: 'physnet1',
+                     api.PHYSICAL_NETWORK: 'physnet2',
                      api.SEGMENTATION_ID: 2}]
         self._create_segments(segments)
 
@@ -122,13 +124,13 @@ class Ml2DBTestCase(testlib_api.SqlTestCase):
                       api.PHYSICAL_NETWORK: 'physnet1',
                       api.SEGMENTATION_ID: 1},
                      {api.NETWORK_TYPE: 'vlan',
-                      api.PHYSICAL_NETWORK: 'physnet1',
+                      api.PHYSICAL_NETWORK: 'physnet2',
                       api.SEGMENTATION_ID: 2}]
         segments2 = [{api.NETWORK_TYPE: 'vlan',
                       api.PHYSICAL_NETWORK: 'physnet1',
                       api.SEGMENTATION_ID: 3},
                      {api.NETWORK_TYPE: 'vlan',
-                      api.PHYSICAL_NETWORK: 'physnet1',
+                      api.PHYSICAL_NETWORK: 'physnet2',
                       api.SEGMENTATION_ID: 4}]
         net1segs = self._create_segments(segments1, network_id=net_id1)
         net2segs = self._create_segments(segments2, network_id=net_id2)
@@ -278,16 +280,6 @@ class Ml2DBTestCase(testlib_api.SqlTestCase):
         port = ml2_db.get_port(self.ctx, port_id)
         self.assertIsNone(port)
 
-    def test_get_port_from_device_mac(self):
-        network_id = uuidutils.generate_uuid()
-        port_id = uuidutils.generate_uuid()
-        self._setup_neutron_network(network_id)
-        port = self._setup_neutron_port(network_id, port_id)
-
-        observed_port = ml2_db.get_port_from_device_mac(self.ctx,
-                                                        port['mac_address'])
-        self.assertEqual(port_id, observed_port.id)
-
     def test_generating_multiple_mac_addresses(self):
         mac_regex = "^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$"
 
@@ -300,11 +292,48 @@ class Ml2DBTestCase(testlib_api.SqlTestCase):
         for mac in macs:
             self.assertIsNotNone(re.search(mac_regex, mac))
 
+    def test__prevent_segment_delete_with_port_bound_raise(self):
+        payload_mock = mock.Mock()
+        payload_mock.metadata.get.return_value = False
+        payload_mock.context = self.ctx
+        with mock.patch.object(
+                 port_obj.Port,
+                 'get_auto_deletable_port_ids_and_proper_port_count_by_segment'
+             ) as mock_get:
+            mock_get.return_value = ([], 1)
+            self.assertRaises(
+                seg_exc.SegmentInUse,
+                ml2_db._prevent_segment_delete_with_port_bound,
+                resource=mock.Mock(),
+                event=mock.Mock(),
+                trigger=mock.Mock(),
+                payload=payload_mock,
+            )
+
+    def test__prevent_segment_delete_with_port_bound_auto_delete(self):
+        payload_mock = mock.Mock()
+        payload_mock.metadata.get.return_value = False
+        payload_mock.context = self.ctx
+        plugin = directory.get_plugin()
+        with mock.patch.object(
+                 port_obj.Port,
+                 'get_auto_deletable_port_ids_and_proper_port_count_by_segment'
+             ) as mock_get, \
+                mock.patch.object(plugin, 'delete_port') as mock_delete_port:
+            mock_get.return_value = (['fake-port'], 0)
+            ml2_db._prevent_segment_delete_with_port_bound(
+                resource=mock.Mock(),
+                event=mock.Mock(),
+                trigger=mock.Mock(),
+                payload=payload_mock,
+            )
+            mock_delete_port.assert_called_with(mock.ANY, 'fake-port')
+
 
 class Ml2DvrDBTestCase(testlib_api.SqlTestCase):
 
     def setUp(self):
-        super(Ml2DvrDBTestCase, self).setUp()
+        super().setUp()
         self.ctx = context.get_admin_context()
         self.setup_coreplugin(PLUGIN_NAME)
 
@@ -345,6 +374,26 @@ class Ml2DvrDBTestCase(testlib_api.SqlTestCase):
                 status='DOWN')
             self.ctx.session.add(record)
             return record
+
+    def _setup_port_binding_level(self, network_id, port_id, host_id,
+                                  level=0, driver='openvswitch'):
+        with db_api.CONTEXT_WRITER.using(self.ctx):
+            record = models.PortBindingLevel(
+                port_id=port_id,
+                host=host_id,
+                level=level,
+                driver=driver,
+                segment_id=network_id)
+            self.ctx.session.add(record)
+            return record
+
+    def _setup_neutron_network_segment(self, segment_id, network_id):
+        with db_api.CONTEXT_WRITER.using(self.ctx):
+            segment = network_obj.NetworkSegment(
+                self.ctx,
+                id=segment_id, network_id=network_id,
+                network_type=constants.TYPE_FLAT)
+            segment.create()
 
     def test_ensure_distributed_port_binding_deals_with_db_duplicate(self):
         network_id = uuidutils.generate_uuid()
@@ -389,16 +438,43 @@ class Ml2DvrDBTestCase(testlib_api.SqlTestCase):
 
     def test_delete_distributed_port_binding_if_stale(self):
         network_id = uuidutils.generate_uuid()
+        segment_id = uuidutils.generate_uuid()
         port_id = uuidutils.generate_uuid()
+        host_id = 'foo_host_id'
         self._setup_neutron_network(network_id, [port_id])
-        binding = self._setup_distributed_binding(
-            network_id, port_id, None, 'foo_host_id')
+        self._setup_neutron_network_segment(segment_id, network_id)
 
-        ml2_db.delete_distributed_port_binding_if_stale(self.ctx,
-                                                        binding)
+        binding = self._setup_distributed_binding(
+            network_id, port_id, None, host_id)
+        binding_levels = self._setup_port_binding_level(
+            segment_id, port_id, host_id)
+
+        ml2_db.delete_distributed_port_binding_if_stale(
+            self.ctx, binding)
         count = (self.ctx.session.query(models.DistributedPortBinding).
-            filter_by(port_id=binding.port_id).count())
+                 filter_by(port_id=binding.port_id, host=host_id).count())
         self.assertFalse(count)
+
+        count = (self.ctx.session.query(models.PortBindingLevel).
+                 filter_by(port_id=binding_levels.port_id,
+                           host=host_id).count())
+        self.assertFalse(count)
+
+    def test_update_distributed_port_binding_by_host(self):
+        network_id = uuidutils.generate_uuid()
+        router_id = uuidutils.generate_uuid()
+        port_id = uuidutils.generate_uuid()
+        host_id = 'foo_host_id'
+        self._setup_neutron_network(network_id, [port_id])
+
+        binding = self._setup_distributed_binding(
+            network_id, port_id, router_id, host_id)
+
+        ml2_db.update_distributed_port_binding_by_host(
+            self.ctx, binding.port_id, host_id, None)
+        binding = (self.ctx.session.query(models.DistributedPortBinding).
+                   filter_by(port_id=port_id, host=host_id).one())
+        self.assertFalse(binding.router_id)
 
     def test_get_distributed_port_binding_by_host_not_found(self):
         port = ml2_db.get_distributed_port_binding_by_host(

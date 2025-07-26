@@ -14,7 +14,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants
+from neutron_lib.plugins.ml2 import ovs_constants as constants
+
 from neutron.plugins.ml2.drivers.openvswitch.agent.openflow.native \
     import br_dvr_process
 from neutron.plugins.ml2.drivers.openvswitch.agent.openflow.native \
@@ -26,7 +27,7 @@ class OVSPhysicalBridge(ovs_bridge.OVSAgentBridge,
     """openvswitch agent physical bridge specific logic."""
 
     # Used by OVSDVRProcessMixin
-    dvr_process_table_id = constants.DVR_PROCESS_VLAN
+    dvr_process_table_id = constants.DVR_PROCESS_PHYSICAL
     dvr_process_next_table_id = constants.LOCAL_VLAN_TRANSLATION
     of_tables = constants.PHY_BR_ALL_TABLES
 
@@ -57,12 +58,12 @@ class OVSPhysicalBridge(ovs_bridge.OVSAgentBridge,
         match = self._local_vlan_match(ofp, ofpp, port, lvid)
         self.uninstall_flows(match=match)
 
-    def add_dvr_mac_vlan(self, mac, port):
-        self.install_output(table_id=constants.DVR_NOT_LEARN_VLAN,
+    def add_dvr_mac_physical(self, mac, port):
+        self.install_output(table_id=constants.DVR_NOT_LEARN_PHYSICAL,
                             priority=2, eth_src=mac, port=port)
 
     def remove_dvr_mac_vlan(self, mac):
         # REVISIT(yamamoto): match in_port as well?
         self.uninstall_flows(
-            table_id=constants.DVR_NOT_LEARN_VLAN,
+            table_id=constants.DVR_NOT_LEARN_PHYSICAL,
             eth_src=mac)

@@ -17,25 +17,22 @@ import netaddr
 
 from designateclient import exceptions as d_exc
 from designateclient.v2 import client as d_client
-from keystoneauth1.identity.generic import password
 from keystoneauth1 import loading
 from keystoneauth1 import token_endpoint
 from neutron_lib import constants
 from neutron_lib.exceptions import dns as dns_exc
 from oslo_config import cfg
+from oslo_log import log
 
 from neutron.conf.services import extdns_designate_driver
 from neutron.services.externaldns import driver
-
-IPV4_PTR_ZONE_PREFIX_MIN_SIZE = 8
-IPV4_PTR_ZONE_PREFIX_MAX_SIZE = 24
-IPV6_PTR_ZONE_PREFIX_MIN_SIZE = 4
-IPV6_PTR_ZONE_PREFIX_MAX_SIZE = 124
 
 _SESSION = None
 
 CONF = cfg.CONF
 extdns_designate_driver.register_designate_opts()
+
+LOG = log.getLogger(__name__)
 
 
 def get_clients(context):
@@ -47,43 +44,19 @@ def get_clients(context):
 
     auth = token_endpoint.Token(CONF.designate.url, context.auth_token)
     client = d_client.Client(session=_SESSION, auth=auth)
-    if CONF.designate.auth_type:
-        admin_auth = loading.load_auth_from_conf_options(
-            CONF, 'designate')
-    else:
-        admin_auth = password.Password(
-            auth_url=CONF.designate.admin_auth_url,
-            username=CONF.designate.admin_username,
-            password=CONF.designate.admin_password,
-            tenant_name=CONF.designate.admin_tenant_name,
-            tenant_id=CONF.designate.admin_tenant_id)
+    admin_auth = loading.load_auth_from_conf_options(CONF, 'designate')
     admin_client = d_client.Client(session=_SESSION, auth=admin_auth,
                                    endpoint_override=CONF.designate.url)
     return client, admin_client
 
 
+def get_all_projects_client(context):
+    auth = token_endpoint.Token(CONF.designate.url, context.auth_token)
+    return d_client.Client(session=_SESSION, auth=auth, all_projects=True)
+
+
 class Designate(driver.ExternalDNSService):
     """Driver for Designate."""
-
-    def __init__(self):
-        ipv4_ptr_zone_size = CONF.designate.ipv4_ptr_zone_prefix_size
-        ipv6_ptr_zone_size = CONF.designate.ipv6_ptr_zone_prefix_size
-
-        if (ipv4_ptr_zone_size < IPV4_PTR_ZONE_PREFIX_MIN_SIZE or
-                ipv4_ptr_zone_size > IPV4_PTR_ZONE_PREFIX_MAX_SIZE or
-                (ipv4_ptr_zone_size % 8) != 0):
-            raise dns_exc.InvalidPTRZoneConfiguration(
-                parameter='ipv4_ptr_zone_size', number='8',
-                maximum=str(IPV4_PTR_ZONE_PREFIX_MAX_SIZE),
-                minimum=str(IPV4_PTR_ZONE_PREFIX_MIN_SIZE))
-
-        if (ipv6_ptr_zone_size < IPV6_PTR_ZONE_PREFIX_MIN_SIZE or
-                ipv6_ptr_zone_size > IPV6_PTR_ZONE_PREFIX_MAX_SIZE or
-                (ipv6_ptr_zone_size % 4) != 0):
-            raise dns_exc.InvalidPTRZoneConfiguration(
-                parameter='ipv6_ptr_zone_size', number='4',
-                maximum=str(IPV6_PTR_ZONE_PREFIX_MAX_SIZE),
-                minimum=str(IPV6_PTR_ZONE_PREFIX_MIN_SIZE))
 
     def create_record_set(self, context, dns_domain, dns_name, records):
         designate, designate_admin = get_clients(context)
@@ -97,11 +70,13 @@ class Designate(driver.ExternalDNSService):
             raise dns_exc.DNSDomainNotFound(dns_domain=dns_domain)
         except d_exc.Conflict:
             raise dns_exc.DuplicateRecordSet(dns_name=dns_name)
+        except d_exc.OverQuota:
+            raise dns_exc.ExternalDNSOverQuota(resource="recordset")
 
         if not CONF.designate.allow_reverse_dns_lookup:
             return
         # Set up the PTR records
-        recordset_name = '%s.%s' % (dns_name, dns_domain)
+        recordset_name = f'{dns_name}.{dns_domain}'
         ptr_zone_email = 'admin@%s' % dns_domain[:-1]
         if CONF.designate.ptr_zone_email:
             ptr_zone_email = CONF.designate.ptr_zone_email
@@ -118,9 +93,23 @@ class Designate(driver.ExternalDNSService):
                                                   in_addr_name, 'PTR',
                                                   [recordset_name])
             except d_exc.NotFound:
-                designate_admin.zones.create(
-                    in_addr_zone_name, email=ptr_zone_email,
-                    description=in_addr_zone_description)
+                # Note(jh): If multiple PTRs get created at the same time,
+                # the creation of the zone may fail with a conflict because
+                # it has already been created by a parallel job. So we
+                # ignore that error and try to create the recordset
+                # anyway. That call will still fail in the end if something
+                # is really broken. See bug 1891309.
+                try:
+                    designate_admin.zones.create(
+                        in_addr_zone_name, email=ptr_zone_email,
+                        description=in_addr_zone_description)
+                except d_exc.Conflict:
+                    LOG.debug('Conflict when trying to create PTR zone %s,'
+                              ' assuming it exists.',
+                              in_addr_zone_name)
+                    pass
+                except d_exc.OverQuota:
+                    raise dns_exc.ExternalDNSOverQuota(resource='zone')
                 designate_admin.recordsets.create(in_addr_zone_name,
                                                   in_addr_name, 'PTR',
                                                   [recordset_name])
@@ -147,25 +136,34 @@ class Designate(driver.ExternalDNSService):
                     CONF.designate.ipv6_ptr_zone_prefix_size) / 4)
 
     def delete_record_set(self, context, dns_domain, dns_name, records):
-        designate, designate_admin = get_clients(context)
-        ids_to_delete = self._get_ids_ips_to_delete(
-            dns_domain, '%s.%s' % (dns_name, dns_domain), records, designate)
+        client, admin_client = get_clients(context)
+        try:
+            ids_to_delete = self._get_ids_ips_to_delete(
+                dns_domain, '{}.{}'.format(
+                    dns_name, dns_domain), records, client)
+        except dns_exc.DNSDomainNotFound:
+            # Try whether we have admin powers and can see all projects
+            client = get_all_projects_client(context)
+            ids_to_delete = self._get_ids_ips_to_delete(
+                dns_domain, '{}.{}'.format(
+                    dns_name, dns_domain), records, client)
+
         for _id in ids_to_delete:
-            designate.recordsets.delete(dns_domain, _id)
+            client.recordsets.delete(dns_domain, _id)
         if not CONF.designate.allow_reverse_dns_lookup:
             return
 
         for record in records:
             in_addr_name = netaddr.IPAddress(record).reverse_dns
             in_addr_zone_name = self._get_in_addr_zone_name(in_addr_name)
-            designate_admin.recordsets.delete(in_addr_zone_name, in_addr_name)
+            admin_client.recordsets.delete(in_addr_zone_name, in_addr_name)
 
     def _get_ids_ips_to_delete(self, dns_domain, name, records,
                                designate_client):
         try:
             recordsets = designate_client.recordsets.list(
                 dns_domain, criterion={"name": "%s" % name})
-        except d_exc.NotFound:
+        except (d_exc.NotFound, d_exc.Forbidden):
             raise dns_exc.DNSDomainNotFound(dns_domain=dns_domain)
         ids = [rec['id'] for rec in recordsets]
         ips = [str(ip) for rec in recordsets for ip in rec['records']]

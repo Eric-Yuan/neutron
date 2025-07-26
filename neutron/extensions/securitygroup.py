@@ -24,11 +24,11 @@ from neutron_lib.db import constants as db_const
 from neutron_lib import exceptions
 from neutron_lib.plugins import directory
 from oslo_utils import netutils
-import six
 
 from neutron._i18n import _
 from neutron.api import extensions
 from neutron.api.v2 import base
+from neutron.common import _constants
 from neutron.conf import quota
 from neutron.extensions import standardattrdescription as stdattr_ext
 from neutron.quota import resource_registry
@@ -70,7 +70,7 @@ class SecurityGroupInUse(exceptions.InUse):
     def __init__(self, **kwargs):
         if 'reason' not in kwargs:
             kwargs['reason'] = _("in use")
-        super(SecurityGroupInUse, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
 
 class SecurityGroupCannotRemoveDefault(exceptions.InUse):
@@ -96,9 +96,9 @@ class SecurityGroupRulesNotSingleTenant(exceptions.InvalidInput):
                 " not allowed")
 
 
-class SecurityGroupRemoteGroupAndRemoteIpPrefix(exceptions.InvalidInput):
-    message = _("Only remote_ip_prefix or remote_group_id may "
-                "be provided.")
+class SecurityGroupMultipleRemoteEntites(exceptions.InvalidInput):
+    message = _("Only one of remote_ip_prefix or remote_group_id or "
+                "remote_address_group_id may be provided.")
 
 
 class SecurityGroupProtocolRequiredWithPorts(exceptions.InvalidInput):
@@ -132,7 +132,7 @@ class SecurityGroupRuleInUse(exceptions.InUse):
     def __init__(self, **kwargs):
         if 'reason' not in kwargs:
             kwargs['reason'] = _("in use")
-        super(SecurityGroupRuleInUse, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
 
 class SecurityGroupRuleParameterConflict(exceptions.InvalidInput):
@@ -148,15 +148,12 @@ class SecurityGroupRuleInvalidEtherType(exceptions.InvalidInput):
                 "supported. Allowed values are %(values)s.")
 
 
-def convert_protocol(value):
-    if value is None:
-        return
+def convert_protocol(value) -> str | None:
+    if value in _constants.SG_RULE_PROTO_ANY:
+        return None
     try:
         val = int(value)
         if 0 <= val <= 255:
-            # Set value of protocol number to string due to bug 1381379,
-            # PostgreSQL fails when it tries to compare integer with string,
-            # that exists in db.
             return str(value)
         raise SecurityGroupRuleInvalidProtocol(
             protocol=value, values=sg_supported_protocols)
@@ -171,7 +168,7 @@ def convert_protocol(value):
 
 
 def convert_ethertype_to_case_insensitive(value):
-    if isinstance(value, six.string_types):
+    if isinstance(value, str):
         for ethertype in sg_supported_ethertypes:
             if ethertype.lower() == value.lower():
                 return ethertype
@@ -185,8 +182,7 @@ def convert_validate_port_value(port):
 
     if netutils.is_valid_port(port):
         return int(port)
-    else:
-        raise SecurityGroupInvalidPortValue(port=port)
+    raise SecurityGroupInvalidPortValue(port=port)
 
 
 def convert_ip_prefix_to_cidr(ip_prefix):
@@ -209,7 +205,8 @@ def _validate_name_not_default(data, max_len=db_const.NAME_FIELD_SIZE):
 
 validators.add_validator('name_not_default', _validate_name_not_default)
 
-sg_supported_protocols = ([None] + list(const.IP_PROTOCOL_MAP.keys()))
+sg_supported_protocols = (_constants.SG_RULE_PROTO_ANY +
+                          tuple(const.IP_PROTOCOL_MAP.keys()))
 sg_supported_ethertypes = ['IPv4', 'IPv6']
 SECURITYGROUPS = 'security_groups'
 SECURITYGROUPRULES = 'security_group_rules'
@@ -246,7 +243,9 @@ RESOURCE_ATTRIBUTE_MAP = {
                'primary_key': True},
         'security_group_id': {'allow_post': True, 'allow_put': False,
                               'is_visible': True, 'required_by_policy': True,
-                              'is_sort_key': True, 'is_filter': True},
+                              'is_sort_key': True, 'is_filter': True,
+                              'validate': {
+                                  'type:string': db_const.UUID_FIELD_SIZE}},
         'remote_group_id': {'allow_post': True, 'allow_put': False,
                             'default': None, 'is_visible': True,
                             'is_sort_key': True, 'is_filter': True},
@@ -341,22 +340,20 @@ class Securitygroup(api_extensions.ExtensionDescriptor):
         return exts
 
     def update_attributes_map(self, attributes):
-        super(Securitygroup, self).update_attributes_map(
+        super().update_attributes_map(
             attributes, extension_attrs_map=RESOURCE_ATTRIBUTE_MAP)
 
     def get_extended_resources(self, version):
         if version == "2.0":
             return dict(list(EXTENDED_ATTRIBUTES_2_0.items()) +
                         list(RESOURCE_ATTRIBUTE_MAP.items()))
-        else:
-            return {}
+        return {}
 
     def get_required_extensions(self):
         return [stdattr_ext.Standardattrdescription.get_alias()]
 
 
-@six.add_metaclass(abc.ABCMeta)
-class SecurityGroupPluginBase(object):
+class SecurityGroupPluginBase(metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     def create_security_group(self, context, security_group):
@@ -378,6 +375,10 @@ class SecurityGroupPluginBase(object):
 
     @abc.abstractmethod
     def get_security_group(self, context, id, fields=None):
+        pass
+
+    @abc.abstractmethod
+    def get_default_security_group(self, context, project_id):
         pass
 
     @abc.abstractmethod

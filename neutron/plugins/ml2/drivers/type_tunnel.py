@@ -29,13 +29,9 @@ from neutron_lib.plugins import utils as plugin_utils
 from oslo_config import cfg
 from oslo_db import exception as db_exc
 from oslo_log import log
-from oslo_utils import uuidutils
-import six
-from six import moves
 from sqlalchemy import or_
 
 from neutron._i18n import _
-from neutron.objects import base as base_obj
 from neutron.objects import network_segment_range as range_obj
 from neutron.plugins.ml2.drivers import helpers
 from neutron.services.network_segment_range import plugin as range_plugin
@@ -54,13 +50,12 @@ def chunks(iterable, chunk_size):
         chunk = list(itertools.islice(iterator, 0, chunk_size))
 
 
-@six.add_metaclass(abc.ABCMeta)
-class _TunnelTypeDriverBase(helpers.SegmentTypeDriver):
+class _TunnelTypeDriverBase(helpers.SegmentTypeDriver, metaclass=abc.ABCMeta):
 
     BULK_SIZE = 100
 
     def __init__(self, model):
-        super(_TunnelTypeDriverBase, self).__init__(model)
+        super().__init__(model)
         self.segmentation_key = next(iter(self.primary_keys))
 
     @abc.abstractmethod
@@ -122,8 +117,8 @@ class _TunnelTypeDriverBase(helpers.SegmentTypeDriver):
         """
 
     def _initialize(self, raw_tunnel_ranges):
-        self.tunnel_ranges = []
-        self._parse_tunnel_ranges(raw_tunnel_ranges, self.tunnel_ranges)
+        self._tunnel_ranges = []
+        self._parse_tunnel_ranges(raw_tunnel_ranges, self._tunnel_ranges)
         if not range_plugin.is_network_segment_range_enabled():
             # service plugins are initialized/loaded after the ML2 driver
             # initialization. Thus, we base on the information whether
@@ -132,7 +127,7 @@ class _TunnelTypeDriverBase(helpers.SegmentTypeDriver):
             # allocation during driver initialization, instead of using the
             # directory.get_plugin() method - the normal way used elsewhere to
             # check if a plugin is loaded.
-            self.sync_allocations()
+            self._sync_allocations()
 
     def _parse_tunnel_ranges(self, tunnel_ranges, current_range):
         for entry in tunnel_ranges:
@@ -150,39 +145,15 @@ class _TunnelTypeDriverBase(helpers.SegmentTypeDriver):
                  {'type': self.get_type(), 'range': current_range})
 
     @db_api.retry_db_errors
-    def _populate_new_default_network_segment_ranges(self):
-        ctx = context.get_admin_context()
-        for tun_min, tun_max in self.tunnel_ranges:
-            res = {
-                'id': uuidutils.generate_uuid(),
-                'name': '',
-                'default': True,
-                'shared': True,
-                'network_type': self.get_type(),
-                'minimum': tun_min,
-                'maximum': tun_max}
-            with db_api.CONTEXT_WRITER.using(ctx):
-                new_default_range_obj = (
-                    range_obj.NetworkSegmentRange(ctx, **res))
-                new_default_range_obj.create()
+    def _populate_new_default_network_segment_ranges(self, ctx, start_time):
+        for tun_min, tun_max in self._tunnel_ranges:
+            range_obj.NetworkSegmentRange.new_default(
+                ctx, self.get_type(), None, tun_min, tun_max, start_time)
 
     @db_api.retry_db_errors
-    def _delete_expired_default_network_segment_ranges(self):
-        ctx = context.get_admin_context()
-        with db_api.CONTEXT_WRITER.using(ctx):
-            filters = {
-                'default': True,
-                'network_type': self.get_type(),
-            }
-            old_default_range_objs = range_obj.NetworkSegmentRange.get_objects(
-                ctx, **filters)
-            for obj in old_default_range_objs:
-                obj.delete()
-
-    @db_api.retry_db_errors
-    def _get_network_segment_ranges_from_db(self):
+    def _get_network_segment_ranges_from_db(self, ctx=None):
         ranges = []
-        ctx = context.get_admin_context()
+        ctx = ctx or context.get_admin_context()
         with db_api.CONTEXT_READER.using(ctx):
             range_objs = (range_obj.NetworkSegmentRange.get_objects(
                 ctx, network_type=self.get_type()))
@@ -191,31 +162,48 @@ class _TunnelTypeDriverBase(helpers.SegmentTypeDriver):
 
         return ranges
 
-    def initialize_network_segment_range_support(self):
-        self._delete_expired_default_network_segment_ranges()
-        self._populate_new_default_network_segment_ranges()
-        # Override self.tunnel_ranges with the network segment range
-        # information from DB and then do a sync_allocations since the
-        # segment range service plugin has not yet been loaded at this
-        # initialization time.
-        self.tunnel_ranges = self._get_network_segment_ranges_from_db()
-        self.sync_allocations()
+    @db_api.retry_db_errors
+    def initialize_network_segment_range_support(self, start_time):
+        admin_context = context.get_admin_context()
+        with db_api.CONTEXT_WRITER.using(admin_context):
+            self._delete_expired_default_network_segment_ranges(
+                admin_context, start_time)
+            self._populate_new_default_network_segment_ranges(
+                admin_context, start_time)
+            # Override self.tunnel_ranges with the network segment range
+            # information from DB and then do a sync_allocations since the
+            # segment range service plugin has not yet been loaded at this
+            # initialization time.
+            self._tunnel_ranges = self._get_network_segment_ranges_from_db(
+                ctx=admin_context)
+            self._sync_allocations(ctx=admin_context)
 
     def update_network_segment_range_allocations(self):
-        self.sync_allocations()
+        self._sync_allocations()
 
     @db_api.retry_db_errors
-    def sync_allocations(self):
+    def _sync_allocations(self, ctx=None):
         # determine current configured allocatable tunnel ids
         tunnel_ids = set()
         ranges = self.get_network_segment_ranges()
         for tun_min, tun_max in ranges:
-            tunnel_ids |= set(moves.range(tun_min, tun_max + 1))
+            tunnel_ids |= set(range(tun_min, tun_max + 1))
 
         tunnel_id_getter = operator.attrgetter(self.segmentation_key)
         tunnel_col = getattr(self.model, self.segmentation_key)
-        ctx = context.get_admin_context()
+        ctx = ctx or context.get_admin_context()
         with db_api.CONTEXT_WRITER.using(ctx):
+            # Check if the allocations are updated: if the total number of
+            # allocations for this tunnel type matches the allocations of the
+            # specific IDs, fast exit in that case.
+            # If another worker handled that before or the table was updated
+            # in a previous Neutron API restart, this section will end here.
+            num_allocs = ctx.session.query(self.model).filter(
+                tunnel_col.in_(tunnel_ids)).count()
+            num_allocs_total = ctx.session.query(self.model).count()
+            if len(tunnel_ids) == num_allocs == num_allocs_total:
+                return
+
             # remove from table unallocated tunnels not currently allocatable
             # fetch results as list via all() because we'll be iterating
             # through them twice
@@ -257,7 +245,7 @@ class _TunnelTypeDriverBase(helpers.SegmentTypeDriver):
                 raise exc.InvalidInput(error_message=msg)
 
     def get_mtu(self, physical_network=None):
-        seg_mtu = super(_TunnelTypeDriverBase, self).get_mtu()
+        seg_mtu = super().get_mtu()
         mtu = []
         if seg_mtu > 0:
             mtu.append(seg_mtu)
@@ -274,88 +262,14 @@ class _TunnelTypeDriverBase(helpers.SegmentTypeDriver):
         ``NETWORK_SEGMENT_RANGE`` service plugin is enabled. Otherwise,
         they will be loaded from the host config file - `ml2_conf.ini`.
         """
-        ranges = self.tunnel_ranges
+        ranges = self._tunnel_ranges
         if directory.get_plugin(plugin_constants.NETWORK_SEGMENT_RANGE):
             ranges = self._get_network_segment_ranges_from_db()
 
         return ranges
 
 
-@six.add_metaclass(abc.ABCMeta)
-class TunnelTypeDriver(_TunnelTypeDriverBase):
-    """Define stable abstract interface for ML2 type drivers.
-
-    tunnel type networks rely on tunnel endpoints. This class defines abstract
-    methods to manage these endpoints.
-
-    ML2 type driver that passes session to functions:
-    - reserve_provider_segment
-    - allocate_tenant_segment
-    - release_segment
-    - get_allocation
-    """
-
-    def reserve_provider_segment(self, session, segment, filters=None):
-        if self.is_partial_segment(segment):
-            filters = filters or {}
-            alloc = self.allocate_partially_specified_segment(session,
-                                                              **filters)
-            if not alloc:
-                raise exc.NoNetworkAvailable()
-        else:
-            segmentation_id = segment.get(api.SEGMENTATION_ID)
-            alloc = self.allocate_fully_specified_segment(
-                session, **{self.segmentation_key: segmentation_id})
-            if not alloc:
-                raise exc.TunnelIdInUse(tunnel_id=segmentation_id)
-        return {api.NETWORK_TYPE: self.get_type(),
-                api.PHYSICAL_NETWORK: None,
-                api.SEGMENTATION_ID: getattr(alloc, self.segmentation_key),
-                api.MTU: self.get_mtu()}
-
-    def allocate_tenant_segment(self, session, filters=None):
-        filters = filters or {}
-        alloc = self.allocate_partially_specified_segment(session, **filters)
-        if not alloc:
-            return
-        return {api.NETWORK_TYPE: self.get_type(),
-                api.PHYSICAL_NETWORK: None,
-                api.SEGMENTATION_ID: getattr(alloc, self.segmentation_key),
-                api.MTU: self.get_mtu()}
-
-    def release_segment(self, session, segment):
-        tunnel_id = segment[api.SEGMENTATION_ID]
-
-        ranges = self.get_network_segment_ranges()
-
-        inside = any(lo <= tunnel_id <= hi for lo, hi in ranges)
-
-        info = {'type': self.get_type(), 'id': tunnel_id}
-        with session.begin(subtransactions=True):
-            query = (session.query(self.model).
-                     filter_by(**{self.segmentation_key: tunnel_id}))
-            if inside:
-                count = query.update({"allocated": False})
-                if count:
-                    LOG.debug("Releasing %(type)s tunnel %(id)s to pool",
-                              info)
-            else:
-                count = query.delete()
-                if count:
-                    LOG.debug("Releasing %(type)s tunnel %(id)s outside pool",
-                              info)
-
-        if not count:
-            LOG.warning("%(type)s tunnel %(id)s not found", info)
-
-    def get_allocation(self, session, tunnel_id):
-        return (session.query(self.model).
-                filter_by(**{self.segmentation_key: tunnel_id}).
-                first())
-
-
-@six.add_metaclass(abc.ABCMeta)
-class ML2TunnelTypeDriver(_TunnelTypeDriverBase):
+class ML2TunnelTypeDriver(_TunnelTypeDriverBase, metaclass=abc.ABCMeta):
     """Define stable abstract interface for ML2 type drivers.
 
     tunnel type networks rely on tunnel endpoints. This class defines abstract
@@ -430,57 +344,64 @@ class ML2TunnelTypeDriver(_TunnelTypeDriverBase):
 class EndpointTunnelTypeDriver(ML2TunnelTypeDriver):
 
     def __init__(self, segment_model, endpoint_model):
-        super(EndpointTunnelTypeDriver, self).__init__(segment_model)
-        if issubclass(endpoint_model, base_obj.NeutronDbObject):
-            self.endpoint_model = endpoint_model.db_model
-        else:
-            self.endpoint_model = endpoint_model
+        super().__init__(segment_model)
+        self.endpoint_model = endpoint_model.db_model
         self.segmentation_key = next(iter(self.primary_keys))
 
     def get_endpoint_by_host(self, host):
         LOG.debug("get_endpoint_by_host() called for host %s", host)
-        session = db_api.get_reader_session()
-        return (session.query(self.endpoint_model).
-                filter_by(host=host).first())
+        ctx = context.get_admin_context()
+        with db_api.CONTEXT_READER.using(ctx):
+            return (ctx.session.query(self.endpoint_model).
+                    filter_by(host=host).first())
 
     def get_endpoint_by_ip(self, ip):
         LOG.debug("get_endpoint_by_ip() called for ip %s", ip)
-        session = db_api.get_reader_session()
-        return (session.query(self.endpoint_model).
-                filter_by(ip_address=ip).first())
+        ctx = context.get_admin_context()
+        with db_api.CONTEXT_READER.using(ctx):
+            return (ctx.session.query(self.endpoint_model).
+                    filter_by(ip_address=ip).first())
 
     def delete_endpoint(self, ip):
         LOG.debug("delete_endpoint() called for ip %s", ip)
-        session = db_api.get_writer_session()
-        session.query(self.endpoint_model).filter_by(ip_address=ip).delete()
+        ctx = context.get_admin_context()
+        with db_api.CONTEXT_WRITER.using(ctx):
+            ctx.session.query(self.endpoint_model).filter_by(
+                ip_address=ip).delete()
 
     def delete_endpoint_by_host_or_ip(self, host, ip):
         LOG.debug("delete_endpoint_by_host_or_ip() called for "
                   "host %(host)s or %(ip)s", {'host': host, 'ip': ip})
-        session = db_api.get_writer_session()
-        session.query(self.endpoint_model).filter(
-            or_(self.endpoint_model.host == host,
-                self.endpoint_model.ip_address == ip)).delete()
+        ctx = context.get_admin_context()
+        with db_api.CONTEXT_WRITER.using(ctx):
+            ctx.session.query(self.endpoint_model).filter(
+                or_(self.endpoint_model.host == host,
+                    self.endpoint_model.ip_address == ip)).delete()
 
     def _get_endpoints(self):
         LOG.debug("_get_endpoints() called")
-        session = db_api.get_reader_session()
-        return session.query(self.endpoint_model)
+        ctx = context.get_admin_context()
+        with db_api.CONTEXT_READER.using(ctx):
+            return ctx.session.query(self.endpoint_model).all()
 
     def _add_endpoint(self, ip, host, **kwargs):
         LOG.debug("_add_endpoint() called for ip %s", ip)
-        session = db_api.get_writer_session()
+        ctx = context.get_admin_context()
+
         try:
-            endpoint = self.endpoint_model(ip_address=ip, host=host, **kwargs)
-            endpoint.save(session)
+            with db_api.CONTEXT_WRITER.using(ctx):
+                endpoint = self.endpoint_model(ip_address=ip, host=host,
+                                               **kwargs)
+                endpoint.save(ctx.session)
         except db_exc.DBDuplicateEntry:
-            endpoint = (session.query(self.endpoint_model).
-                        filter_by(ip_address=ip).one())
-            LOG.warning("Endpoint with ip %s already exists", ip)
+            with db_api.CONTEXT_READER.using(ctx):
+                endpoint = (ctx.session.query(self.endpoint_model).
+                            filter_by(ip_address=ip).one())
+                LOG.warning("Endpoint with ip %s already exists", ip)
         return endpoint
 
 
-class TunnelRpcCallbackMixin(object):
+class TunnelRpcCallbackMixin:
 
     def setup_tunnel_callback_mixin(self, notifier, type_manager):
         self._notifier = notifier
@@ -513,67 +434,65 @@ class TunnelRpcCallbackMixin(object):
             raise exc.InvalidInput(error_message=msg)
 
         driver = self._type_manager.drivers.get(tunnel_type)
-        if driver:
-            # The given conditional statements will verify the following
-            # things:
-            # 1. If host is not passed from an agent, it is a legacy mode.
-            # 2. If passed host and tunnel_ip are not found in the DB,
-            #    it is a new endpoint.
-            # 3. If host is passed from an agent and it is not found in DB
-            #    but the passed tunnel_ip is found, delete the endpoint
-            #    from DB and add the endpoint with (tunnel_ip, host),
-            #    it is an upgrade case.
-            # 4. If passed host is found in DB and passed tunnel ip is not
-            #    found, delete the endpoint belonging to that host and
-            #    add endpoint with latest (tunnel_ip, host), it is a case
-            #    where local_ip of an agent got changed.
-            # 5. If the passed host had another ip in the DB the host-id has
-            #    roamed to a different IP then delete any reference to the new
-            #    local_ip or the host id. Don't notify tunnel_delete for the
-            #    old IP since that one could have been taken by a different
-            #    agent host-id (neutron-ovs-cleanup should be used to clean up
-            #    the stale endpoints).
-            #    Finally create a new endpoint for the (tunnel_ip, host).
-            if host:
-                host_endpoint = driver.obj.get_endpoint_by_host(host)
-                ip_endpoint = driver.obj.get_endpoint_by_ip(tunnel_ip)
-
-                if (ip_endpoint and ip_endpoint.host is None and
-                        host_endpoint is None):
-                    driver.obj.delete_endpoint(ip_endpoint.ip_address)
-                elif (ip_endpoint and ip_endpoint.host != host):
-                    LOG.info(
-                        "Tunnel IP %(ip)s was used by host %(host)s and "
-                        "will be assigned to %(new_host)s",
-                        {'ip': ip_endpoint.ip_address,
-                         'host': ip_endpoint.host,
-                         'new_host': host})
-                    driver.obj.delete_endpoint_by_host_or_ip(
-                        host, ip_endpoint.ip_address)
-                elif (host_endpoint and host_endpoint.ip_address != tunnel_ip):
-                    # Notify all other listening agents to delete stale tunnels
-                    self._notifier.tunnel_delete(
-                        rpc_context, host_endpoint.ip_address, tunnel_type)
-                    driver.obj.delete_endpoint(host_endpoint.ip_address)
-
-            tunnel = driver.obj.add_endpoint(tunnel_ip, host)
-            tunnels = driver.obj.get_endpoints()
-            entry = {'tunnels': tunnels}
-            # Notify all other listening agents
-            self._notifier.tunnel_update(rpc_context, tunnel.ip_address,
-                                         tunnel_type)
-            # Return the list of tunnels IP's to the agent
-            return entry
-        else:
+        if not driver:
             msg = (_("Network type value %(type)s not supported, "
-                    "host: %(host)s with tunnel IP: %(ip)s") %
-                    {'type': tunnel_type,
-                     'host': host or 'legacy mode (no host provided by agent)',
-                     'ip': tunnel_ip})
+                     "host: %(host)s with tunnel IP: %(ip)s") %
+                   {'type': tunnel_type,
+                    'host': host or 'legacy mode (no host provided by agent)',
+                    'ip': tunnel_ip})
             raise exc.InvalidInput(error_message=msg)
 
+        # The given conditional statements will verify the following things:
+        # 1. If host is not passed from an agent, it is a legacy mode.
+        # 2. If passed host and tunnel_ip are not found in the DB, it is a new
+        #    endpoint.
+        # 3. If host is passed from an agent and it is not found in DB but the
+        #    passed tunnel_ip is found, delete the endpoint from DB and add the
+        #    endpoint with (tunnel_ip, host), it is an upgrade case.
+        # 4. If passed host is found in DB and passed tunnel ip is not found,
+        #    delete the endpoint belonging to that host and add endpoint with
+        #    latest (tunnel_ip, host), it is a case where local_ip of an agent
+        #    got changed.
+        # 5. If the passed host had another ip in the DB the host-id has roamed
+        #    to a different IP then delete any reference to the new local_ip or
+        #    the host id. Don't notify tunnel_delete for the old IP since that
+        #    one could have been taken by a different agent host-id
+        #    (neutron-ovs-cleanup should be used to clean up the stale
+        #    endpoints). Finally create a new endpoint for the (tunnel_ip,
+        #    host).
+        if host:
+            host_endpoint = driver.obj.get_endpoint_by_host(host)
+            ip_endpoint = driver.obj.get_endpoint_by_ip(tunnel_ip)
 
-class TunnelAgentRpcApiMixin(object):
+            if (ip_endpoint and ip_endpoint.host is None and
+                    host_endpoint is None):
+                driver.obj.delete_endpoint(ip_endpoint.ip_address)
+            elif (ip_endpoint and ip_endpoint.host != host):
+                LOG.info(
+                    "Tunnel IP %(ip)s was used by host %(host)s and "
+                    "will be assigned to %(new_host)s",
+                    {'ip': ip_endpoint.ip_address,
+                     'host': ip_endpoint.host,
+                     'new_host': host})
+                driver.obj.delete_endpoint_by_host_or_ip(
+                    host, ip_endpoint.ip_address)
+            elif (host_endpoint and host_endpoint.ip_address != tunnel_ip):
+                # Notify all other listening agents to delete stale tunnels
+                self._notifier.tunnel_delete(
+                    rpc_context, host_endpoint.ip_address, tunnel_type)
+                driver.obj.delete_endpoint(host_endpoint.ip_address)
+
+        tunnel = driver.obj.add_endpoint(tunnel_ip, host)
+        tunnels = driver.obj.get_endpoints()
+        entry = {'tunnels': tunnels}
+        # Notify all other listening agents
+        self._notifier.tunnel_update(rpc_context, tunnel.ip_address,
+                                     tunnel_type)
+        # Return the list of tunnels IP's to the agent
+        return entry
+
+
+class TunnelAgentRpcApiMixin:
 
     def _get_tunnel_update_topic(self):
         return topics.get_topic_name(self.topic,

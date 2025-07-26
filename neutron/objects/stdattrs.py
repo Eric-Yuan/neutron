@@ -10,10 +10,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.db import standard_attr
 from neutron_lib.objects.extensions import standardattributes as stdattr_obj
 from oslo_versionedobjects import fields as obj_fields
 
-from neutron.db import standard_attr
 from neutron.objects import base
 
 
@@ -23,8 +23,6 @@ class StandardAttribute(base.NeutronDbObject):
 
     # Version 1.0: Initial version
     VERSION = '1.0'
-
-    new_facade = True
 
     db_model = standard_attr.StandardAttribute
 

@@ -15,13 +15,11 @@
 import abc
 
 from ovsdbapp import api
-import six
 
 from neutron.common.ovn import constants as ovn_const
 
 
-@six.add_metaclass(abc.ABCMeta)
-class API(api.API):
+class API(api.API, metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     def create_lswitch_port(self, lport_name, lswitch_name, may_exist=True,
@@ -42,16 +40,23 @@ class API(api.API):
         """
 
     @abc.abstractmethod
-    def set_lswitch_port(self, lport_name, if_exists=True, **columns):
+    def set_lswitch_port(self, lport_name, external_ids_update=None,
+                         if_exists=True, **columns):
         """Create a command to set OVN logical switch port fields
 
         :param lport_name:    The name of the lport
         :type lport_name:     string
+        :param external_ids_update: Dictionary of keys to be updated
+                              individually in the external IDs dictionary.
+                              If "external_ids" is defined in "columns",
+                              "external_ids" will override any
+                              "external_ids_update" value.
+        :type external_ids_update: dictionary
+        :param if_exists:     Do not fail if lport does not exist
+        :type if_exists:      bool
         :param columns:       Dictionary of port columns
                               Supported columns: macs, external_ids,
                                                  parent_name, tag, enabled
-        :param if_exists:     Do not fail if lport does not exist
-        :type if_exists:      bool
         :type columns:        dictionary
         :returns:             :class:`Command` with no result
         """
@@ -73,20 +78,6 @@ class API(api.API):
         """
 
     @abc.abstractmethod
-    def create_lrouter(self, name, may_exist=True, **columns):
-        """Create a command to add an OVN lrouter
-
-        :param name:         The id of the lrouter
-        :type name:          string
-        :param may_exist:    Do not fail if lrouter already exists
-        :type may_exist:     bool
-        :param columns:      Dictionary of lrouter columns
-                             Supported columns: external_ids, default_gw, ip
-        :type columns:       dictionary
-        :returns:            :class:`Command` with no result
-        """
-
-    @abc.abstractmethod
     def update_lrouter(self, name, if_exists=True, **columns):
         """Update a command to add an OVN lrouter
 
@@ -97,17 +88,6 @@ class API(api.API):
         :param columns:      Dictionary of lrouter columns
                              Supported columns: external_ids, default_gw, ip
         :type columns:       dictionary
-        :returns:            :class:`Command` with no result
-        """
-
-    @abc.abstractmethod
-    def delete_lrouter(self, name, if_exists=True):
-        """Create a command to delete an OVN lrouter
-
-        :param name:         The id of the lrouter
-        :type name:          string
-        :param if_exists:    Do not fail if the lrouter does not exist
-        :type if_exists:     bool
         :returns:            :class:`Command` with no result
         """
 
@@ -146,6 +126,47 @@ class API(api.API):
         """
 
     @abc.abstractmethod
+    def schedule_unhosted_gateways(self, g_name, sb_api, plugin, port_physnets,
+                                   all_gw_chassis, chassis_with_physnets,
+                                   chassis_with_azs):
+        """Schedule unhosted gateways
+
+        :param g_name:                The unique name of the lrouter port
+        :type g_name:                 string
+        :param sb_api:                IDL for the OVN SB API
+        :type class:                  :class:`OvsdbSbOvnIdl`
+        :param plugin:                The L3 plugin to call back to for lookups
+        :type plugin:                 :class:`OVNL3RouterPlugin`
+        :param port_physnets:         Map of lrouter ports and their physnets
+        :type port_physnets:          Dict[string,string]
+        :param all_gw_chassis:        List of gateway chassis
+        :type all_gw_chassis:         List[Option[string,:class:`RowView`]]
+        :param chassis_with_physnets: Map of chassis and their physnets
+        :type chassis_with_physnets:  Dict[string,Set[string]]
+        :param chassis_with_azs:      Map of chassis and their AZs
+        :type chassis_with_azs:       Dict[string,Set[string]]
+        """
+
+    @abc.abstractmethod
+    def schedule_new_gateway(self, g_name, sb_api, lrouter_name, plugin,
+                             physnet, az_hints):
+        """Schedule new gateway
+
+        :param g_name:       The unique name of the lrouter port
+        :type g_name:        string
+        :param sb_api:       IDL for the OVN SB API
+        :type class:         :class:`OvsdbSbOvnIdl`
+        :param lrouter_name: The unique name of the lrouter
+        :type lrouter_name:  string
+        :param plugin:       The L3 plugin to call back to for lookups
+        :type plugin:        :class:`OVNL3RouterPlugin`
+        :param physnet:      Physnet for lrouter port
+        :type physnet:       string
+        :param az_hints:     Availability zone hints for router resource
+        :type az_hints:      List[string]
+        """
+
+    @abc.abstractmethod
     def delete_lrouter_port(self, name, lrouter, if_exists=True):
         """Create a command to delete an OVN lrouter port
 
@@ -175,6 +196,15 @@ class API(api.API):
         :param lsp_address:  logical switch port's addresses to set
         :type lsp_address:   string or list of strings
         :returns:            :class:`Command` with no result
+        """
+
+    @abc.abstractmethod
+    def set_router_mac_age_limit(self, router=None):
+        """Set the OVN MAC_Binding age threshold
+
+        :param router: The name or UUID of a router, or None for all routers
+        :type router:  uuid.UUID or string or None
+        :returns:      :class:`Command` with no result
         """
 
     @abc.abstractmethod
@@ -231,11 +261,13 @@ class API(api.API):
         """
 
     @abc.abstractmethod
-    def add_static_route(self, lrouter, **columns):
+    def add_static_route(self, lrouter, maintain_bfd=False, **columns):
         """Add static route to logical router.
 
         :param lrouter:      The unique name of the lrouter
         :type lrouter:       string
+        :param maintain_bfd: Ensure a BFD record exists for the static route.
+        :type maintain_bfd:  bool
         :param columns:      Dictionary of static columns
                              Supported columns: prefix, nexthop, valid
         :type columns:       dictionary
@@ -243,72 +275,15 @@ class API(api.API):
         """
 
     @abc.abstractmethod
-    def delete_static_route(self, lrouter, ip_prefix, nexthop, if_exists=True):
-        """Delete static route from logical router.
+    def set_static_route(self, sroute, **columns):
+        """Update static route columns in a logical router.
 
-        :param lrouter:      The unique name of the lrouter
-        :type lrouter:       string
-        :param ip_prefix:    The prefix of the static route
-        :type ip_prefix:     string
-        :param nexthop:      The nexthop of the static route
-        :type nexthop:       string
-        :param if_exists:    Do not fail if router does not exist
-        :type if_exists:     bool
+        :param sroute:       The unique identifier of the LRSR
+        :type sroute:        string
+        :param columns:      Dictionary of static columns
+                             Supported columns: prefix, nexthop, external_ids
+        :type columns:       dictionary
         :returns:            :class:`Command` with no result
-        """
-
-    @abc.abstractmethod
-    def create_address_set(self, name, may_exist=True, **columns):
-        """Create an address set
-
-        :param name:        The name of the address set
-        :type name:         string
-        :param may_exist:   Do not fail if address set already exists
-        :type may_exist:    bool
-        :param columns:     Dictionary of address set columns
-                            Supported columns: external_ids, addresses
-        :type columns:      dictionary
-        :returns:           :class:`Command` with no result
-        """
-
-    @abc.abstractmethod
-    def delete_address_set(self, name, if_exists=True):
-        """Delete an address set
-
-        :param name:        The name of the address set
-        :type name:         string
-        :param if_exists:   Do not fail if the address set does not exist
-        :type if_exists:    bool
-        :returns:           :class:`Command` with no result
-        """
-
-    @abc.abstractmethod
-    def update_address_set(self, name, addrs_add, addrs_remove,
-                           if_exists=True):
-        """Updates addresses in an address set
-
-        :param name:            The name of the address set
-        :type name:             string
-        :param addrs_add:       The addresses to be added
-        :type addrs_add:        []
-        :param addrs_remove:    The addresses to be removed
-        :type addrs_remove:     []
-        :param if_exists:       Do not fail if the address set does not exist
-        :type if_exists:        bool
-        :returns:               :class:`Command` with no result
-        """
-
-    @abc.abstractmethod
-    def update_address_set_ext_ids(self, name, external_ids, if_exists=True):
-        """Update external IDs for an address set
-
-        :param name:          The name of the address set
-        :type name:           string
-        :param external_ids:  The external IDs for the address set
-        :type external_ids:   dict
-        :param if_exists:     Do not fail if the address set does not exist
-        :type if_exists:      bool
-        :returns:             :class:`Command` with no result
         """
 
     @abc.abstractmethod
@@ -337,14 +312,24 @@ class API(api.API):
         """
 
     @abc.abstractmethod
+    def get_gateway_chassis_az_hints(self, gateway_id):
+        """Return the list of availability zone hints
+
+        :param gateway_id:     The gateway id
+        :type gateway_id:      string
+        :returns:              a list of strings with the availability zones
+        """
+
+    @abc.abstractmethod
     def get_unhosted_gateways(self, port_physnet_dict, chassis_physnets,
-                              gw_chassis):
+                              gw_chassis, chassis_with_azs):
         """Return a list of gateways not hosted on chassis
 
         :param port_physnet_dict: Dictionary of gateway ports and their physnet
         :param chassis_physnets:  Dictionary of chassis and physnets
         :param gw_chassis:        List of gateway chassis provided by admin
                                   through ovn-cms-options
+        :param chassis_with_azs:  Dictionary of chassis and available zones
         :returns:                 List of gateways not hosted on a valid
                                   chassis
         """
@@ -410,15 +395,8 @@ class API(api.API):
         """
 
     @abc.abstractmethod
-    def get_address_sets(self):
-        """Gets all address sets in the OVN_Northbound DB
-
-        :returns: dictionary indexed by name, DB columns as values
-        """
-
-    @abc.abstractmethod
-    def get_port_groups(self):
-        """Gets all port groups in the OVN_Northbound DB
+    def get_sg_port_groups(self):
+        """Gets port groups in the OVN_Northbound DB that map to SGs.
 
         :returns: dictionary indexed by name, DB columns as values
         """
@@ -514,23 +492,6 @@ class API(api.API):
         :returns: The NAT rule row or None
         """
 
-    @abc.abstractmethod
-    def get_floatingip_by_ips(self, router_id, logical_ip, external_ip):
-        """Get a Floating IP based on it's logical and external IPs.
-
-        DEPRECATED. In the Rocky release of OpenStack this method can be
-        removed and get_floatingip() should be used instead. This method
-        is a backward compatibility layer for the Pike -> Queens release.
-
-        :param router_id: The ID of the router to which the FIP belongs to.
-        :type lrouter:  string
-        :param logical_ip: The FIP's logical IP address
-        :type logical_ip: string
-        :param external_ip: The FIP's external IP address
-        :type external_ip: string
-        :returns: The NAT rule row or None
-        """
-
     def check_revision_number(self, name, resource, resource_type,
                               if_exists=True):
         """Compare the revision number from Neutron and OVN.
@@ -571,23 +532,14 @@ class API(api.API):
         """
 
     @abc.abstractmethod
-    def delete_lrouter_ext_gw(self, lrouter_name):
+    def delete_lrouter_ext_gw(self, lrouter_name, maintain_bfd=True):
         """Delete Logical Router external gateway.
 
         :param lrouter_name: The name of the logical router
         :type lrouter_name: string
+        :param maintain_bfd: Ensure any existing BFD record is removed.
+        :type maintain_bfd:  bool
         :returns: :class:`Command` with no result
-        """
-
-    @abc.abstractmethod
-    def get_address_set(self, addrset_id, ip_version='ip4'):
-        """Get a Address Set by its ID.
-
-        :param addrset_id: The Address Set ID
-        :type addrset_id: string
-        :param ip_version: Either "ip4" or "ip6". Defaults to "ip4"
-        :type addr_name: string
-        :returns: The Address Set row or None
         """
 
     @abc.abstractmethod
@@ -626,9 +578,48 @@ class API(api.API):
         :returns:               :class:`Command` with no result
         """
 
+    @abc.abstractmethod
+    def update_lb_external_ids(self, lb_name, values, if_exists=True):
+        """Set the external_ids field of a given Load Balancer.
 
-@six.add_metaclass(abc.ABCMeta)
-class SbAPI(api.API):
+        :param lb_name:         The name of the load_balancer
+        :type lb_name:          string
+        :param values:          Values to be set in external_ids
+        :type values:           dict
+        :param if_exists:       Do not fail if lb_name does not exist
+        :type if_exists:        bool
+        :returns:               :class:`Command` with no result
+        """
+
+    @abc.abstractmethod
+    def get_router_floatingip_lbs(self, lrouter_name):
+        """Get Load Balancers used as port forwarding by a Logical Router.
+
+        :param lrouter_name: The name of the logical router
+        :type lrouter_name: string
+        :returns: a list of Load_Balancer rows matched
+        """
+
+    @abc.abstractmethod
+    def get_floatingip_in_nat_or_lb(self, fip_id):
+        """Get a Floating IP from either NAT or Load Balancer table by its ID
+
+        NAT rows in OVN are mapped for floating IPs, except for port
+        forwarding. In such cases, Load Balancer table is used . This function
+        returns a row from NAT, if there is one. Otherwise, it will lookup
+        for the FIP ID in the LB table and return the first match.
+
+        :param fip_id: The floating IP id
+        :type fip_id: string
+        :returns: The NAT rule row or Load_Balancer row or None
+        """
+
+    @abc.abstractmethod
+    def set_nb_global_options(self, key, value):
+        """Set NB_Global options configuration"""
+
+
+class SbAPI(api.API, metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     def chassis_exists(self, hostname):
@@ -647,7 +638,8 @@ class SbAPI(api.API):
         value. And hostname and physnets are related to the same host.
         """
 
-    def get_gateway_chassis_from_cms_options(self):
+    @abc.abstractmethod
+    def get_gateway_chassis_from_cms_options(self, name_only=True):
         """Get chassis eligible for external connectivity from CMS options.
 
         When admin wants to enable router gateway on few chassis,
@@ -656,7 +648,24 @@ class SbAPI(api.API):
         ovs-vsctl set open .
            external_ids:ovn-cms-options="enable-chassis-as-gw"
         In this function, we parse ovn-cms-options and return these chassis
-        :returns:              List with chassis names.
+
+        :param name_only: Return only the chassis names instead of
+                          objects. Defaults to True.
+        :returns: List with chassis.
+        """
+
+    @abc.abstractmethod
+    def get_extport_chassis_from_cms_options(self):
+        """Get chassis eligible for hosting external ports from CMS options.
+
+        When admin wants to enable hosting external ports on different
+        chassis than gateway chassis as
+
+        ovs-vsctl set open .
+           external_ids:ovn-cms-options="enable-chassis-as-extport-host"
+        In this function, we parse ovn-cms-options and return these chassis
+
+        :returns: List with chassis
         """
 
     @abc.abstractmethod
@@ -676,14 +685,9 @@ class SbAPI(api.API):
         """
 
     @abc.abstractmethod
-    def get_chassis_data_for_ml2_bind_port(self, hostname):
-        """Return chassis data for ML2 port binding.
+    def get_chassis_host_for_port(self, port_id):
+        """Return a list of Chassis name hosting the port
 
-        @param hostname:       The hostname of the chassis
-        @type hostname:        string
-        :returns:              Tuple containing the chassis datapath type,
-                               iface types and physical networks for the
-                               OVN bridge mappings.
-        :raises:               RuntimeError exception if an OVN chassis
-                               does not exist.
+        :param port_id: The port ID
+        :type port_id:  string
         """

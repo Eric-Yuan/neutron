@@ -22,9 +22,9 @@ class PortUplinkStatusPropagation(model_base.BASEV2):
 
     port_id = sa.Column(sa.String(36),
                         sa.ForeignKey('ports.id', ondelete="CASCADE"),
-                        primary_key=True, index=True)
+                        primary_key=True)
     propagate_uplink_status = sa.Column(sa.Boolean(), nullable=False,
-                                        server_default=sa.sql.false())
+                                        server_default=sa.sql.true())
     port = orm.relationship(
         models_v2.Port, load_on_pending=True,
         backref=orm.backref("propagate_uplink_status",

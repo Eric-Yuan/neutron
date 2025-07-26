@@ -12,6 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.db import api as db_api
 from neutron_lib.objects import common_types
 from oslo_versionedobjects import fields as obj_fields
 
@@ -27,7 +28,8 @@ from neutron.objects import subnetpool
 @base.NeutronObjectRegistry.register
 class AddressScopeRBAC(rbac.RBACBaseObject):
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Changed 'target_tenant' to 'target_project'
+    VERSION = '1.1'
 
     db_model = rbac_db_models.AddressScopeRBAC
 
@@ -52,6 +54,7 @@ class AddressScope(rbac_db.NeutronRbacObject):
     }
 
     @classmethod
+    @db_api.CONTEXT_READER
     def get_network_address_scope(cls, context, network_id, ip_version):
         query = context.session.query(cls.db_model)
         query = query.join(
@@ -69,8 +72,7 @@ class AddressScope(rbac_db.NeutronRbacObject):
         return None
 
     @classmethod
-    def get_bound_tenant_ids(cls, context, obj_id):
+    def get_bound_project_ids(cls, context, obj_id):
         snp_objs = subnetpool.SubnetPool.get_objects(
-            context, address_scope_id=obj_id
-        )
-        return {snp.project_id for snp in snp_objs}
+            context, address_scope_id=obj_id, fields=['project_id'])
+        return {snp['project_id'] for snp in snp_objs}

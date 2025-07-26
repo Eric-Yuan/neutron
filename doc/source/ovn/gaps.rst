@@ -8,65 +8,92 @@ It is not a complete list, but is enough to be used as a starting point for
 implementors working on closing these gaps. A TODO list for OVN is located
 at [1]_.
 
-* Port forwarding
+* QoS minimum bandwidth allocation in Placement API
 
-  Currently ML2/OVS supports Port Forwarding in the North/South plane.
-  Specific L4 Ports of the Floating IP can be directed to a specific
-  FixedIP:PortNumber of a VM, so that different services running in a VM
-  can be isolated, and can communicate with external networks easily.
+  ML2/OVN integration with the Nova placement API to provide guaranteed
+  minimum bandwidth for ports [2]_. Work in progress, see [3]_
 
-  This is a relatively new extension, support would need to be added to OVN.
+* DHCP service for instances
 
-  One possible way would be to use the OVN native load balancing feature.
-  An OVN load balancer is expressed in the OVN northbound load_balancer
-  table. Normally the VIP and its members are expressed as [2]_:
+  ML2/OVS adds packet filtering rules to every instance that allow DHCP queries
+  from instances to reach the DHCP agent. For OVN this traffic has to be
+  explicitly allowed by security group rules attached to the instance. Note
+  that the default security group does allow all outgoing traffic, so this only
+  becomes relevant when using custom security groups [4]_. Proposed patch is
+  [5]_ but it needs to be revived and updated.
 
-  .. code-block:: console
+* DNS resolution for instances
 
-     VIP:PORT = MEMBER1:MPORT1, MEMBER2:MPORT2
+  OVN cannot use the host's networking for DNS resolution, so Case 2b in [6]_
+  can only be used when additional DHCP agents are deployed. For Case 2a a
+  different configuration option has to be used in ``ml2_conf.ini``::
 
-     The same could be extended for port forwarding as:
+    [ovn]
+    dns_servers = 203.0.113.8, 198.51.100.53
 
-     FIP:PORT = PRIVATE_IP:PRIV_PORT
+  OVN answers queries for hosts and IP addresses in tenant networks by spoofing
+  responses from the configured DNS servers. This may lead to confusion in
+  debugging.
 
-* Security Groups logging API
+  OVN can only answer queries that are sent via UDP, queries that use TCP will
+  be ignored by OVN and forwarded to the configured resolvers.
 
-  Currently ML2/OVS, with the OpenvSwitch firewall, supports a log file where
-  security groups events are logged to be consumed by a security entity. This
-  allows users to have a way to check if an instance is trying to execute
-  restricted operations, or access restricted ports in remote servers.
+  OVN can only answer queries with no additional options being set (EDNS). Such
+  queries depending on the OVN version will either get broken responses or will
+  also be forwarded to the configured resolvers.
 
-  This is a relatively new extension, support would need to be added to OVN.
+* IPv6 NDP proxy
 
-* QoS DSCP support
+  The NDP proxy functionality for IPv6 addresses is not supported by OVN.
 
-  Currently ML2/OVS supports QoS DSCP tagging and egress bandwidth limiting.
-  Those are basic QoS features that while integrated in the OVS/OVN C core
-  are not integrated (or fully tested) in the neutron OVN mechanism driver.
+* East/West Fragmentation
 
-* QoS for Layer 3 IPs
+  The core OVN implementation does not support fragmentation of East/West
+  traffic using an OVN router between two private networks. This is being
+  tracked in [7]_ and [8]_.
 
-  Currently the Neutron L3-agent supports floating IP and gateway IP bandwidth
-  limiting based on Linux TC. Networking-ovn L3 had a prototype
-  implementation [3]_ based on the meter of openvswitch [4]_ utility that
-  has been abandoned. This is supported in user space datapath only, or
-  kernel versions 4.15+ [5]_.
+* North/South Fragmentation and path MTU discovery
 
-* QoS Minimum Bandwidth support
+  OVN does not correctly fragment IPv4 packets when the MTU of the target
+  network is smaller than the MTU of the source network. Instead, affected
+  packets could be silently dropped depending on the direction. OVN will
+  also not generate ICMP "packet too big" responses for packets that have
+  the DF bit set, even when the necessary configuration option is used
+  in ``ml2_conf.ini``::
 
-  Currently ML2/OVS supports QoS Minimum Bandwidth limiting, but it is
-  not supported in OVN.
+    [ovn]
+    ovn_emit_need_to_frag = true
 
-* BGP support
+  This makes path MTU discovery fail, and is being tracked in [7]_ and [9]_.
 
-  Currently ML2/OVS supports making a tenant subnet routable via BGP, and
-  can announce host routes for both floating and fixed IP addresses.
+* Traffic metering
+
+  Currently ``neutron-metering-agent`` can only work with the Neutron L3 agent.
+  It is not supported by the ``ovn-router`` service plugin nor by the
+  ``neutron-ovn-agent``. This is being reported and tracked in [10]_.
+
+* Floating IP Port Forwarding in provider networks and with distributed routing
+
+  Currently, when provider network types like ``vlan`` or ``flat`` are plugged
+  to a router as internal networks while the ``enable_distributed_floating_ip``
+  configuration option is enabled, Floating IP port forwardings
+  which are using such router will not work properly.
+  Due to an incompatible setting of the router to make traffic in the vlan/flat
+  networks to be distributed but port forwardings are always centralized in
+  ML2/OVN backend.
+  This is being reported in [11]_.
 
 References
 ----------
 
 .. [1] https://github.com/ovn-org/ovn/blob/master/TODO.rst
-.. [2] https://github.com/ovn-org/ovn/blob/master/ovn-nb.ovsschema#L160
-.. [3] https://review.opendev.org/#/c/539826/
-.. [4] https://github.com/openvswitch/ovs/commit/66d89287269ca7e2f7593af0920e910d7f9bcc38
-.. [5] https://github.com/torvalds/linux/blob/master/net/openvswitch/meter.h
+.. [2] https://specs.openstack.org/openstack/neutron-specs/specs/rocky/minimum-bandwidth-allocation-placement-api.html
+.. [3] https://review.opendev.org/c/openstack/neutron/+/786478
+.. [4] https://bugs.launchpad.net/neutron/+bug/1926515
+.. [5] https://review.opendev.org/c/openstack/neutron/+/788594
+.. [6] https://docs.openstack.org/neutron/latest/admin/config-dns-res.html
+.. [7] https://bugs.launchpad.net/neutron/+bug/2032817
+.. [8] https://bugzilla.redhat.com/show_bug.cgi?id=2238494
+.. [9] https://bugzilla.redhat.com/show_bug.cgi?id=2238969
+.. [10] https://bugs.launchpad.net/neutron/+bug/2048773
+.. [11] https://bugs.launchpad.net/neutron/+bug/2028846

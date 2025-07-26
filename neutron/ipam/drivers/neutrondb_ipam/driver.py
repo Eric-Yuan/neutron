@@ -17,6 +17,7 @@ import itertools
 import random
 
 import netaddr
+from neutron_lib.db import api as db_api
 from neutron_lib import exceptions as n_exc
 from neutron_lib.plugins import directory
 from oslo_db import exception as db_exc
@@ -209,14 +210,13 @@ class NeutronDbSubnet(ipam_base.Subnet):
 
             if window < allocated_num_addresses:
                 continue
-            else:
-                # Maximize randomness by using the random module's built in
-                # sampling function
-                av_ips = list(itertools.islice(av_set, 0, window))
-                allocated_ip_pool = random.sample(av_ips,
-                                                  allocated_num_addresses)
-                allocated_ips.extend([str(allocated_ip)
-                                      for allocated_ip in allocated_ip_pool])
+            # Maximize randomness by using the random module's built in
+            # sampling function
+            av_ips = list(itertools.islice(av_set, 0, window))
+            allocated_ip_pool = random.sample(av_ips,
+                                              allocated_num_addresses)
+            allocated_ips.extend([str(allocated_ip)
+                                  for allocated_ip in allocated_ip_pool])
 
             requested_num_addresses -= allocated_num_addresses
             if requested_num_addresses:
@@ -226,7 +226,7 @@ class NeutronDbSubnet(ipam_base.Subnet):
             return allocated_ips
 
         raise ipam_exc.IpAddressGenerationFailure(
-                  subnet_id=self.subnet_manager.neutron_id)
+            subnet_id=self.subnet_manager.neutron_id)
 
     def allocate(self, address_request):
         # NOTE(pbondar): Ipam driver is always called in context of already
@@ -250,13 +250,7 @@ class NeutronDbSubnet(ipam_base.Subnet):
         # The only defined status at this stage is 'ALLOCATED'.
         # More states will be available in the future - e.g.: RECYCLABLE
         try:
-            # TODO(ataraday): revisit this after objects switched to
-            # new enginefacade
-            with self._context.session.begin(subtransactions=True):
-                # NOTE(kevinbenton): we use a subtransaction to force
-                # a flush here so we can capture DBReferenceErrors due
-                # to concurrent subnet deletions. (galera would deadlock
-                # later on final commit)
+            with db_api.CONTEXT_WRITER.using(self._context):
                 self.subnet_manager.create_allocation(self._context,
                                                       ip_address)
         except db_exc.DBReferenceError:
@@ -275,7 +269,7 @@ class NeutronDbSubnet(ipam_base.Subnet):
                                                num_addrs)
         # Create IP allocation request objects
         try:
-            with self._context.session.begin(subtransactions=True):
+            with db_api.CONTEXT_WRITER.using(self._context):
                 for ip_address in allocated_ip_pool:
                     self.subnet_manager.create_allocation(self._context,
                                                           ip_address)
@@ -287,14 +281,8 @@ class NeutronDbSubnet(ipam_base.Subnet):
     def deallocate(self, address):
         # This is almost a no-op because the Neutron DB IPAM driver does not
         # delete IPAllocation objects at every deallocation. The only
-        # operation it performs is to delete an IPRequest entry.
-        count = self.subnet_manager.delete_allocation(
-            self._context, address)
-        # count can hardly be greater than 1, but it can be 0...
-        if not count:
-            raise ipam_exc.IpAddressAllocationNotFound(
-                subnet_id=self.subnet_manager.neutron_id,
-                ip_address=address)
+        # operation it performs is to delete an IPAMAllocation entry.
+        self.subnet_manager.delete_allocation(self._context, address)
 
     def _no_pool_changes(self, context, pools):
         """Check if pool updates in db are required."""
@@ -346,7 +334,7 @@ class NeutronDbPool(subnet_alloc.SubnetAllocator):
         :returns: a NeutronDbSubnet instance
         """
         if self._subnetpool:
-            subnet = super(NeutronDbPool, self).allocate_subnet(subnet_request)
+            subnet = super().allocate_subnet(subnet_request)
             subnet_request = subnet.get_details()
 
         # SubnetRequest must be an instance of SpecificSubnet

@@ -21,7 +21,7 @@
       (Avoid deeper levels because they do not render well.)
 
 
-Services and agents
+Services and Agents
 ===================
 
 A usual Neutron setup consists of multiple services and agents running on one
@@ -31,8 +31,8 @@ services. Among those of special interest:
 
 #. neutron-server that provides API endpoints and serves as a single point of
    access to the database. It usually runs on nodes called Controllers.
-#. Layer2 agent that can utilize Open vSwitch, Linuxbridge or other vendor
-   specific technology to provide network segmentation and isolation for project
+#. Layer2 agent that can utilize Open vSwitch or other vendor specific
+   technology to provide network segmentation and isolation for project
    networks. The L2 agent should run on every node where it is deemed
    responsible for wiring and securing virtual interfaces (usually both Compute
    and Network nodes).
@@ -67,7 +67,7 @@ eventlet.monkey_patch() directly but instead maintain its entry point main()
 function under neutron/cmd/eventlet/... If that is the case, the standard
 Python library will be automatically patched for the service on entry point
 import (monkey patching is done inside `python package file
-<http://opendev.org/openstack/neutron/tree/neutron/cmd/eventlet/__init__.py>`_).
+<http://opendev.org/openstack/neutron/src/neutron/cmd/eventlet/__init__.py>`_).
 
 Note: an entry point 'main()' function may just be an indirection to a real
 callable located elsewhere, as is done for reference services such as DHCP, L3

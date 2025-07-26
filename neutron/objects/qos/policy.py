@@ -15,6 +15,8 @@
 
 import itertools
 
+from neutron_lib.api.definitions import qos as qos_def
+from neutron_lib.db import resource_extend
 from neutron_lib.exceptions import qos as qos_exc
 from neutron_lib.objects import common_types
 from oslo_db import exception as db_exc
@@ -40,8 +42,8 @@ class QosPolicyRBAC(rbac.RBACBaseObject):
     # Version 1.1: Inherit from rbac_db.RBACBaseObject; added 'id' and
     #              'project_id'; changed 'object_id' from StringField to
     #              UUIDField
-
-    VERSION = '1.1'
+    # Version 1.2: Changed 'target_tenant' to 'target_project'
+    VERSION = '1.2'
 
     db_model = rbac_db_models.QosPolicyRBAC
 
@@ -64,7 +66,9 @@ class QosPolicy(rbac_db.NeutronRbacObject):
     # Version 1.6: Added "is_default" field
     # Version 1.7: Added floating IP bindings
     # Version 1.8: Added router gateway QoS policy bindings
-    VERSION = '1.8'
+    # Version 1.9: Added QosPacketRateLimitRule
+    # Version 1.10: Added QosMinimumPacketRateRule
+    VERSION = '1.10'
 
     # required by RbacNeutronMetaclass
     rbac_db_cls = QosPolicyRBAC
@@ -93,9 +97,9 @@ class QosPolicy(rbac_db.NeutronRbacObject):
     def obj_load_attr(self, attrname):
         if attrname == 'rules':
             return self._reload_rules()
-        elif attrname == 'is_default':
+        if attrname == 'is_default':
             return self._reload_is_default()
-        return super(QosPolicy, self).obj_load_attr(attrname)
+        return super().obj_load_attr(attrname)
 
     def _reload_rules(self):
         rules = rule_obj_impl.get_rules(self, self.obj_context, self.id)
@@ -121,15 +125,9 @@ class QosPolicy(rbac_db.NeutronRbacObject):
         raise qos_exc.QosRuleNotFound(policy_id=self.id,
                                       rule_id=rule_id)
 
-    # TODO(hichihara): For tag mechanism. This will be removed in bug/1704137
     def to_dict(self):
-        _dict = super(QosPolicy, self).to_dict()
-        try:
-            _dict['tags'] = [t.tag for t in self.db_obj.standard_attr.tags]
-        except AttributeError:
-            # AttrtibuteError can be raised when accessing self.db_obj
-            # or self.db_obj.standard_attr
-            pass
+        _dict = super().to_dict()
+        resource_extend.apply_funcs(qos_def.POLICIES, _dict, self.db_obj)
         return _dict
 
     @classmethod
@@ -152,7 +150,7 @@ class QosPolicy(rbac_db.NeutronRbacObject):
 
     @classmethod
     def get_object(cls, context, **kwargs):
-        policy_obj = super(QosPolicy, cls).get_object(context, **kwargs)
+        policy_obj = super().get_object(context, **kwargs)
         if not policy_obj:
             return
 
@@ -163,9 +161,9 @@ class QosPolicy(rbac_db.NeutronRbacObject):
     @classmethod
     def get_objects(cls, context, _pager=None, validate_filters=True,
                     **kwargs):
-        objs = super(QosPolicy, cls).get_objects(context, _pager,
-                                                 validate_filters,
-                                                 **kwargs)
+        objs = super().get_objects(context, _pager,
+                                   validate_filters,
+                                   **kwargs)
         result = []
         for obj in objs:
             obj.obj_load_attr('rules')
@@ -205,7 +203,7 @@ class QosPolicy(rbac_db.NeutronRbacObject):
     # TODO(QoS): Consider extending base to trigger registered methods for us
     def create(self):
         with self.db_context_writer(self.obj_context):
-            super(QosPolicy, self).create()
+            super().create()
             if self.is_default:
                 self.set_default()
             self.obj_load_attr('rules')
@@ -217,7 +215,7 @@ class QosPolicy(rbac_db.NeutronRbacObject):
                     self.set_default()
                 else:
                     self.unset_default()
-            super(QosPolicy, self).update()
+            super().update()
 
     def delete(self):
         with self.db_context_writer(self.obj_context):
@@ -232,7 +230,7 @@ class QosPolicy(rbac_db.NeutronRbacObject):
                         object_type=object_type,
                         object_id=binding_obj[0]['%s_id' % object_type])
 
-            super(QosPolicy, self).delete()
+            super().delete()
 
     def attach_network(self, network_id):
         network_binding = {'policy_id': self.id,
@@ -297,10 +295,10 @@ class QosPolicy(rbac_db.NeutronRbacObject):
             raise qos_exc.FloatingIPQosBindingNotFound(fip_id=fip_id,
                                                        policy_id=self.id)
 
-    def detach_router(self, router_id):
+    def detach_router(self, router_id, if_exists=False):
         deleted = binding.QosPolicyRouterGatewayIPBinding.delete_objects(
             self.obj_context, router_id=router_id)
-        if not deleted:
+        if not deleted and not if_exists:
             raise qos_exc.RouterQosBindingNotFound(router_id=router_id,
                                                    policy_id=self.id)
 
@@ -335,26 +333,26 @@ class QosPolicy(rbac_db.NeutronRbacObject):
                                                           self.id)
 
     def get_bound_floatingips(self):
-        return binding.QosPolicyFloatingIPBinding.get_objects(self.obj_context,
-                                                              self.id)
-
-    def get_bound_routers(self):
-        return binding.QosPolicyRouterGatewayIPBinding.get_objects(
+        return binding.QosPolicyFloatingIPBinding.get_bound_ids(
             self.obj_context, self.id)
 
+    def get_bound_routers(self):
+        return binding.QosPolicyRouterGatewayIPBinding.get_bound_ids(
+            self.obj_context, policy_id=self.id)
+
     @classmethod
-    def _get_bound_tenant_ids(cls, session, binding_db, bound_db,
-                              binding_db_id_column, policy_id):
+    def _get_bound_project_ids(cls, session, binding_db, bound_db,
+                               binding_db_id_column, policy_id):
         return list(itertools.chain.from_iterable(
-            session.query(bound_db.tenant_id).join(
+            session.query(bound_db.project_id).join(
                 binding_db, bound_db.id == binding_db_id_column).filter(
-                binding_db.policy_id == policy_id).all()))
+                    binding_db.policy_id == policy_id).all()))
 
     @classmethod
-    def get_bound_tenant_ids(cls, context, policy_id):
-        """Implements RbacNeutronObject.get_bound_tenant_ids.
+    def get_bound_project_ids(cls, context, policy_id):
+        """Implements RbacNeutronObject.get_bound_project_ids.
 
-        :returns: set -- a set of tenants' ids dependent on QosPolicy.
+        :returns: set -- a set of projects' ids dependent on QosPolicy.
         """
         net = models_v2.Network
         qosnet = qos_db_model.QosNetworkPolicyBinding
@@ -364,26 +362,40 @@ class QosPolicy(rbac_db.NeutronRbacObject):
         qosfip = qos_db_model.QosFIPPolicyBinding
         router = l3.Router
         qosrouter = qos_db_model.QosRouterGatewayIPPolicyBinding
-        bound_tenants = []
+        bound_projects = []
         with cls.db_context_reader(context):
-            bound_tenants.extend(cls._get_bound_tenant_ids(
+            bound_projects.extend(cls._get_bound_project_ids(
                 context.session, qosnet, net, qosnet.network_id, policy_id))
-            bound_tenants.extend(
-                cls._get_bound_tenant_ids(context.session, qosport, port,
-                                          qosport.port_id, policy_id))
-            bound_tenants.extend(
-                cls._get_bound_tenant_ids(context.session, qosfip, fip,
-                                          qosfip.fip_id, policy_id))
-            bound_tenants.extend(
-                cls._get_bound_tenant_ids(context.session, qosrouter, router,
-                                          qosrouter.router_id, policy_id))
-        return set(bound_tenants)
+            bound_projects.extend(
+                cls._get_bound_project_ids(context.session, qosport, port,
+                                           qosport.port_id, policy_id))
+            bound_projects.extend(
+                cls._get_bound_project_ids(context.session, qosfip, fip,
+                                           qosfip.fip_id, policy_id))
+            bound_projects.extend(
+                cls._get_bound_project_ids(context.session, qosrouter, router,
+                                           qosrouter.router_id, policy_id))
+        return set(bound_projects)
 
     def obj_make_compatible(self, primitive, target_version):
+        def filter_rules(obj_names, rules):
+            return [rule for rule in rules if
+                    rule['versioned_object.name'] in obj_names]
         _target_version = versionutils.convert_version_to_tuple(target_version)
         if _target_version < (1, 8):
             raise exception.IncompatibleObjectVersion(
                 objver=target_version, objname=self.__class__.__name__)
+        names = [
+            rule_obj_impl.QosBandwidthLimitRule.obj_name(),
+            rule_obj_impl.QosDscpMarkingRule.obj_name(),
+            rule_obj_impl.QosMinimumBandwidthRule.obj_name(),
+        ]
+        if _target_version >= (1, 9):
+            names.append(rule_obj_impl.QosPacketRateLimitRule.obj_name())
+        if _target_version >= (1, 10):
+            names.append(rule_obj_impl.QosMinimumPacketRuleRule.obj_name())
+        if 'rules' in primitive and names:
+            primitive['rules'] = filter_rules(names, primitive['rules'])
 
 
 @base_db.NeutronObjectRegistry.register

@@ -64,22 +64,14 @@ The following manufacturers are known to work:
 - QLogic
 - Broadcom
 
-For information on **Mellanox SR-IOV Ethernet ConnectX cards**, see:
+For information on **Mellanox SR-IOV Ethernet ConnectX cards**, see the
+`Mellanox: How To Configure SR-IOV VFs on ConnectX-4 or newer <https://support.mellanox.com/s/article/HowTo-Configure-SR-IOV-for-ConnectX-4-ConnectX-5-ConnectX-6-with-KVM-Ethernet>`_.
 
-- `Mellanox: How To Configure SR-IOV VFs on ConnectX-4 or newer <https://community.mellanox.com/s/article/howto-configure-sr-iov-for-connectx-4-connectx-5-with-kvm--ethernet-x>`_.
-- `Mellanox: How To Configure SR-IOV VFs on ConnectX-3/ConnectX-3 Pro <https://community.mellanox.com/docs/DOC-1484>`_.
+For information on **QLogic SR-IOV Ethernet cards**, see the
+`User's Guide OpenStack Deployment with SR-IOV Configuration <http://www.qlogic.com/solutions/Documents/UsersGuide_OpenStack_SR-IOV.pdf>`_.
 
-For information on **QLogic SR-IOV Ethernet cards**, see:
-
-- `User's Guide OpenStack Deployment with SR-IOV Configuration <http://www.qlogic.com/solutions/Documents/UsersGuide_OpenStack_SR-IOV.pdf>`_.
-
-For information on **Broadcom NetXtreme-E Series Ethernet cards**, see the
-`Broadcom NetXtreme-C/NetXtreme-E User Guide
-<https://docs.broadcom.com/docs/NetXtreme-UG>`_.
-
-For information on **Broadcom NetXtreme-S Series Ethernet cards**, see the
-`Broadcom NetXtreme-S Product Page
-<https://www.broadcom.com/products/ethernet-connectivity/smartnic/bcm58800>`_.
+For information on **Broadcom NetXtreme Series Ethernet cards**, see the
+`Broadcom NetXtreme Product Page <https://www.broadcom.com/products/ethernet-connectivity/network-adapters>`_.
 
 Using SR-IOV interfaces
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -87,7 +79,7 @@ Using SR-IOV interfaces
 In order to enable SR-IOV, the following steps are required:
 
 #. Create Virtual Functions (Compute)
-#. Whitelist PCI devices in nova-compute (Compute)
+#. Configure allow list for PCI devices in nova-compute (Compute)
 #. Configure neutron-server (Controller)
 #. Configure nova-scheduler (Controller)
 #. Enable neutron sriov-agent (Compute)
@@ -223,8 +215,8 @@ network and has access to the private networks of all machines.
       the ``sysfsutils`` tool. However, this is not available by default on
       many major distributions.
 
-Whitelist PCI devices nova-compute (Compute)
---------------------------------------------
+Configuring allow list for PCI devices nova-compute (Compute)
+-------------------------------------------------------------
 
 #. Configure which PCI devices the ``nova-compute`` service may use. Edit
    the ``nova.conf`` file:
@@ -239,7 +231,7 @@ Whitelist PCI devices nova-compute (Compute)
    ``physnet2``.
 
    Alternatively the ``[pci] passthrough_whitelist`` parameter also supports
-   whitelisting by:
+   allowing devices by:
 
    - PCI address: The address uses the same syntax as in ``lspci`` and an
      asterisk (``*``) can be used to match anything.
@@ -304,6 +296,12 @@ Whitelist PCI devices nova-compute (Compute)
 Configure neutron-server (Controller)
 -------------------------------------
 
+   .. note::
+
+      This section does not apply to remote-managed ports of SmartNIC DPU
+      devices which also use SR-IOV at the host side but do not rely on the
+      ``sriovnicswitch`` mechanism driver.
+
 #. Add ``sriovnicswitch`` as mechanism driver. Edit the ``ml2_conf.ini`` file
    on each controller:
 
@@ -342,7 +340,7 @@ Configure nova-scheduler (Controller)
    .. code-block:: ini
 
       [filter_scheduler]
-      enabled_filters = AvailabilityZoneFilter, ComputeFilter, ComputeCapabilitiesFilter, ImagePropertiesFilter, ServerGroupAntiAffinityFilter, ServerGroupAffinityFilter, PciPassthroughFilter
+      enabled_filters = ComputeFilter, ComputeCapabilitiesFilter, ImagePropertiesFilter, ServerGroupAntiAffinityFilter, ServerGroupAffinityFilter, PciPassthroughFilter
       available_filters = nova.scheduler.filters.all_filters
 
 #. Restart the ``nova-scheduler`` service.
@@ -357,7 +355,7 @@ Enable neutron-sriov-nic-agent (Compute)
    .. code-block:: ini
 
       [securitygroup]
-      firewall_driver = neutron.agent.firewall.NoopFirewallDriver
+      firewall_driver = noop
 
       [sriov_nic]
       physical_device_mappings = physnet2:eth3
@@ -395,8 +393,8 @@ Enable neutron-sriov-nic-agent (Compute)
 (Optional) FDB L2 agent extension
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Forwarding DataBase (FDB) population is an L2 agent extension to OVS agent or
-Linux bridge. Its objective is to update the FDB table for existing instance
+Forwarding DataBase (FDB) population is an L2 agent extension to OVS agent. Its
+objective is to update the FDB table for existing instance
 using normal port. This enables communication between SR-IOV instances and
 normal instances. The use cases of the FDB population extension are:
 
@@ -409,8 +407,7 @@ For additional information describing the problem, refer to:
 `Virtual switching technologies and Linux bridge.
 <https://events.static.linuxfound.org/sites/events/files/slides/LinuxConJapan2014_makita_0.pdf>`_
 
-#. Edit the ``ovs_agent.ini`` or ``linuxbridge_agent.ini`` file on each compute
-   node. For example:
+#. Edit the ``ovs_agent.ini`` file on each compute node. For example:
 
    .. code-block:: console
 
@@ -495,17 +492,17 @@ Once configuration is complete, you can launch instances with SR-IOV ports.
 SR-IOV with ConnectX-3/ConnectX-3 Pro Dual Port Ethernet
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-In contrast to Mellanox newer generation NICs, ConnectX-3 family network adapters expose a single
-PCI device (PF) in the system regardless of the number of physical ports.
-When the device is **dual port** and SR-IOV is enabled and configured we can observe some inconsistencies
-in linux networking subsystem.
+In contrast to Mellanox newer generation NICs, ConnectX-3 family network
+adapters expose a single PCI device (PF) in the system regardless of the number
+of physical ports. When the device is **dual port** and SR-IOV is enabled and
+configured we can observe some inconsistencies in linux networking subsystem.
 
 .. note::
     In the example below ``enp4s0`` represents PF net device associated with physical port 1 and
     ``enp4s0d1`` represents PF net device associated with physical port 2.
 
-**Example:** A system with ConnectX-3 dual port device and a total of four VFs configured,
-two VFs assigned to port one and two VFs assigned to port two.
+**Example:** A system with ConnectX-3 dual port device and a total of four VFs
+configured, two VFs assigned to port one and two VFs assigned to port two.
 
 .. code-block:: console
 
@@ -534,18 +531,20 @@ Four VFs are available in the system, however,
         vf 2 MAC 00:00:00:00:00:00, vlan 4095, spoof checking off, link-state auto
         vf 3 MAC 00:00:00:00:00:00, vlan 4095, spoof checking off, link-state auto
 
-**ip** command identifies each PF associated net device as having four VFs *each*.
+**ip** command identifies each PF associated net device as having four VFs
+*each*.
 
 .. note::
 
      Mellanox ``mlx4`` driver allows *ip* commands to perform configuration of *all*
      VFs from either PF associated network devices.
 
-To allow neutron SR-IOV agent to properly identify the VFs that belong to the correct PF network device
-(thus to the correct network port) Admin is required to provide the ``exclude_devices`` configuration option
-in ``sriov_agent.ini``
+To allow neutron SR-IOV agent to properly identify the VFs that belong to the
+correct PF network device (thus to the correct network port) Admin is required
+to provide the ``exclude_devices`` configuration option in ``sriov_agent.ini``
 
-**Step 1**: derive the VF to Port mapping from mlx4 driver configuration file: ``/etc/modprobe.d/mlnx.conf``  or ``/etc/modprobe.d/mlx4.conf``
+**Step 1**: derive the VF to Port mapping from mlx4 driver configuration file:
+``/etc/modprobe.d/mlnx.conf``  or ``/etc/modprobe.d/mlx4.conf``
 
 .. code-block:: console
 
@@ -556,12 +555,15 @@ Where:
 
 ``num_vfs=n1,n2,n3`` - The driver will enable ``n1`` VFs on physical port 1,
 ``n2`` VFs on physical port 2 and
-``n3`` dual port VFs (applies only to dual port HCA when all ports are Ethernet ports).
+``n3`` dual port VFs (applies only to dual port HCA when all ports are
+Ethernet ports).
 
 
-``probe_vfs=m1,m2,m3`` - the driver probes ``m1`` single port VFs on physical port 1,
+``probe_vfs=m1,m2,m3`` - the driver probes ``m1`` single port VFs on
+physical port 1,
 ``m2`` single port VFs on physical port 2 (applies only if such a port exist)
-``m3`` dual port VFs. Those VFs are attached to the hypervisor. (applies only if all ports are configured as Ethernet).
+``m3`` dual port VFs. Those VFs are attached to the hypervisor. (applies only
+if all ports are configured as Ethernet).
 
 The VFs will be enumerated in the following order:
 
@@ -577,7 +579,8 @@ In our example:
 | 04:00.3 : VF associated to port **2**
 | 04:00.4 : VF associated to port **2**
 
-**Step 2:** Update ``exclude_devices`` configuration option in ``sriov_agent.ini`` with the correct mapping
+**Step 2:** Update ``exclude_devices`` configuration option in
+``sriov_agent.ini`` with the correct mapping
 
 Each PF associated net device shall exclude the **other** port's VFs
 
@@ -604,8 +607,8 @@ you must:
    machines with no switch and the cards are plugged in back-to-back. A
    subnet manager is required for the link on the cards to come up.
    It is possible to have more than one subnet manager. In this case, one
-   of them will act as the master, and any other will act as a slave that
-   will take over when the master subnet manager fails.
+   of them will act as the primary, and any other will act as a backup that
+   will take over when the primary subnet manager fails.
 
 #. Install the ``ebrctl`` utility on the compute nodes.
 
@@ -635,23 +638,24 @@ Known limitations
   .. code-block:: ini
 
      [securitygroup]
-     firewall_driver = neutron.agent.firewall.NoopFirewallDriver
+     firewall_driver = noop
 
 * SR-IOV is not integrated into the OpenStack Dashboard (horizon). Users must
   use the CLI or API to configure SR-IOV interfaces.
-* Live migration support has been added to the Libvirt Nova virt-driver in the Train
-  release for instances with neutron SR-IOV ports. Indirect mode SR-IOV interfaces
-  (vnic-type: macvtap or virtio-forwarder) can now be migrated transparently to
-  the guest. Direct mode SR-IOV interfaces (vnic-type: direct or direct-physical)
-  are detached before the migration and reattached after the migration so this is not
-  transparent to the guest. To avoid loss of network connectivy when live migrating
-  with direct mode sriov the user should create a failover bond in the guest with a
-  transparently live migration port type e.g. vnic-type normal or indirect mode SR-IOV.
+* Live migration support has been added to the Libvirt Nova virt-driver in the
+  Train release for instances with neutron SR-IOV ports. Indirect mode SR-IOV
+  interfaces (vnic-type: macvtap or virtio-forwarder) can now be migrated
+  transparently to the guest. Direct mode SR-IOV interfaces (vnic-type: direct
+  or direct-physical) are detached before the migration and reattached after
+  the migration so this is not transparent to the guest. To avoid loss of
+  network connectivy when live migrating with direct mode sriov the user should
+  create a failover bond in the guest with a transparently live migration port
+  type e.g. vnic-type normal or indirect mode SR-IOV.
 
   .. note::
 
      SR-IOV features may require a specific NIC driver version, depending on the vendor.
      Intel NICs, for example, require ixgbe version 4.4.6 or greater, and ixgbevf version
      3.2.2 or greater.
-* Attaching SR-IOV ports to existing servers is not currently supported, see
-  `bug 1708433 <https://bugs.launchpad.net/nova/+bug/1708433>`_ for details.
+* Attaching SR-IOV ports to existing servers is supported starting with the
+  Victoria release.

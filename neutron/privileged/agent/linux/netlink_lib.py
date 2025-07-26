@@ -43,7 +43,6 @@ from neutron_lib import constants
 from neutron_lib import exceptions
 from oslo_log import log as logging
 
-from neutron._i18n import _
 from neutron import privileged
 from neutron.privileged.agent.linux import netlink_constants as nl_constants
 
@@ -126,7 +125,7 @@ NFCT_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int,
                                  ctypes.c_void_p, ctypes.c_void_p)
 
 
-class ConntrackManager(object):
+class ConntrackManager:
     def __init__(self, family_socket=None):
         self.family_socket = family_socket
         self.set_functions = {
@@ -192,8 +191,7 @@ class ConntrackManager(object):
                 self._set_attributes(conntrack, entry)
                 self._query(nl_constants.NFCT_Q_DESTROY, conntrack)
         except Exception as e:
-            msg = _("Failed to delete conntrack entries %s") % e
-            LOG.critical(msg)
+            LOG.critical("Failed to delete conntrack entries %s", e)
             raise exceptions.CTZoneExhaustedError()
         finally:
             nfct.nfct_destroy(conntrack)
@@ -234,8 +232,7 @@ class ConntrackManager(object):
             nl_constants.NFNL_SUBSYS_CTNETLINK,
             nl_constants.CONNTRACK)
         if not self.conntrack_handler:
-            msg = _("Failed to open new conntrack handler")
-            LOG.critical(msg)
+            LOG.critical("Failed to open new conntrack handler")
             raise exceptions.CTZoneExhaustedError()
         return self
 
@@ -266,7 +263,7 @@ def _parse_entry(entry, ipversion, zone):
     return tuple(parsed_entry)
 
 
-@privileged.default.entrypoint
+@privileged.conntrack_cmd.entrypoint
 def list_entries(zone):
     """List and parse all conntrack entries in zone
 
@@ -281,7 +278,7 @@ def list_entries(zone):
         with ConntrackManager(nl_constants.IPVERSION_SOCKET[ipversion]) \
                 as conntrack:
             raw_entries = [entry for entry in conntrack.list_entries() if
-                           re.search(r'\bzone={}\b'.format(zone), entry) is
+                           re.search(fr'\bzone={zone}\b', entry) is
                            not None]
 
         for raw_entry in raw_entries:
@@ -292,7 +289,7 @@ def list_entries(zone):
     return sorted(parsed_entries, key=lambda x: x[3])
 
 
-@privileged.default.entrypoint
+@privileged.conntrack_cmd.entrypoint
 def delete_entries(entries):
     """Delete selected entries
 

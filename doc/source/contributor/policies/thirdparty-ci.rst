@@ -1,5 +1,6 @@
-Neutron Third-party CI
-======================
+
+Third-party CI
+==============
 
 What Is Expected of Third Party CI System for Neutron
 -----------------------------------------------------
@@ -38,7 +39,7 @@ What Tests To Run
 Network API tests (git link).
 Network scenario tests (The test_network_* tests here).
 Any tests written specifically for your setup.
-http://opendev.org/openstack/tempest/tree/tempest/api/network
+http://opendev.org/openstack/tempest/src/tempest/api/network
 
 Run with the test filter: 'network'. This will include all neutron specific
 tests as well as any other tests that are tagged as requiring networking. An
@@ -80,11 +81,11 @@ systems.
 A third party system can have it's voting rights removed as well. If the
 system becomes unstable (stops running, voting, or start providing inaccurate
 results), the Neutron PTL or any core reviewer will make an attempt to contact
-the owner and copy the openstack-discuss mailing list. If no response is received
-within 2 days, the Neutron PTL will remove voting rights for the third party
-CI system. If a response is received, the owner will work to correct the
-issue. If the issue cannot be addressed in a reasonable amount of time, the
-voting rights will be temporarily removed.
+the owner and copy the openstack-discuss mailing list. If no response is
+received within 2 days, the Neutron PTL will remove voting rights for the
+third party CI system. If a response is received, the owner will work to
+correct the issue. If the issue cannot be addressed in a reasonable amount of
+time, the voting rights will be temporarily removed.
 
 Log & Test Results Filesystem Layout
 ------------------------------------

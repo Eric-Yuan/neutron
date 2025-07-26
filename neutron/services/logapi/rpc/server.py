@@ -22,6 +22,7 @@ import oslo_messaging
 
 from neutron.api.rpc.callbacks import events
 from neutron.api.rpc.handlers import resources_rpc
+from neutron.services.logapi import api_base
 from neutron.services.logapi.common import db_api
 
 LOG = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ def get_sg_log_info_for_log_resources(context, log_resources):
     return db_api.get_sg_log_info_for_log_resources(context, log_resources)
 
 
-class LoggingApiSkeleton(object):
+class LoggingApiSkeleton:
     """Skeleton proxy code for agent->server communication."""
 
     # History
@@ -99,7 +100,7 @@ class LoggingApiSkeleton(object):
         return rpc_method(context, log_resources)
 
 
-class LoggingApiNotification(object):
+class LoggingApiNotification(api_base.LoggingApiBase):
 
     def __init__(self):
         self.notification_api = resources_rpc.ResourcesPushRpcApi()
@@ -108,13 +109,22 @@ class LoggingApiNotification(object):
     def create_log(self, context, log_obj):
         self.notification_api.push(context, [log_obj], events.CREATED)
 
+    def create_log_precommit(self, context, log_obj):
+        pass
+
     @log_helpers.log_method_call
     def update_log(self, context, log_obj):
         self.notification_api.push(context, [log_obj], events.UPDATED)
 
+    def update_log_precommit(self, context, log_obj):
+        pass
+
     @log_helpers.log_method_call
     def delete_log(self, context, log_obj):
         self.notification_api.push(context, [log_obj], events.DELETED)
+
+    def delete_log_precommit(self, context, log_obj):
+        pass
 
     @log_helpers.log_method_call
     def resource_update(self, context, log_objs):

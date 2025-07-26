@@ -23,15 +23,14 @@ def check_subnet_ip(cidr, ip_address, port_owner=''):
     net = netaddr.IPNetwork(cidr)
     # Check that the IP is valid on subnet. In IPv4 this cannot be the
     # network or the broadcast address
-    if net.version == constants.IP_VERSION_6:
-        # NOTE(njohnston): In some cases the code cannot know the owner of the
-        # port. In these cases port_owner should an empty string, and we pass
-        # it through here.
-        return ((port_owner in (constants.ROUTER_PORT_OWNERS + ('', )) or
-                 ip != net.network) and
-                ip in net)
-    else:
+    if net.version == constants.IP_VERSION_4:
         return ip != net.network and ip != net.broadcast and ip in net
+    # NOTE(njohnston): In some cases the code cannot know the owner of the
+    # port. In these cases port_owner should an empty string, and we pass it
+    # through here.
+    return (
+        (port_owner in (constants.ROUTER_PORT_OWNERS + ('', )) or
+         ip != net.network) and ip in net)
 
 
 def check_gateway_invalid_in_subnet(cidr, gateway):
@@ -45,7 +44,7 @@ def check_gateway_invalid_in_subnet(cidr, gateway):
     # check since we don't have gateway's subnet cidr.
     return (ip in net and
             (net.version == constants.IP_VERSION_4 and
-            ip in (net.network, net[-1])))
+             ip in (net.network, net[-1])))
 
 
 def generate_pools(cidr, gateway_ip):
@@ -62,12 +61,17 @@ def generate_pools(cidr, gateway_ip):
     if first == last:
         # handle single address subnet case
         return [netaddr.IPRange(first, last)]
-    first_ip = first + 1
-    # last address is broadcast in v4
-    last_ip = last - (ip_version == 4)
-    if first_ip >= last_ip:
-        # /31 lands here
-        return []
+    if ip_version == constants.IP_VERSION_4:
+        if net.prefixlen <= 30:
+            first_ip = first + 1
+            # last address is broadcast in v4
+            last_ip = last - (ip_version == 4)
+        else:
+            first_ip = first
+            last_ip = last
+    else:  # IPv6 case
+        first_ip = first + 1
+        last_ip = last
     ipset = netaddr.IPSet(netaddr.IPRange(first_ip, last_ip))
     if gateway_ip:
         ipset.remove(netaddr.IPAddress(gateway_ip, ip_version))

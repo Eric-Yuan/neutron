@@ -13,6 +13,7 @@
 # TODO(ihrachys): cover the module with functional tests targeting supported
 # backends
 
+from neutron_lib.db import api as db_api
 from neutron_lib.db import model_query
 from neutron_lib import exceptions as n_exc
 from neutron_lib.objects import utils as obj_utils
@@ -20,20 +21,28 @@ from oslo_utils import uuidutils
 
 
 # Common database operation implementations
-def _get_filter_query(obj_cls, context, **kwargs):
-    with obj_cls.db_context_reader(context):
-        filters = _kwargs_to_filters(**kwargs)
-        query = model_query.get_collection_query(
-            context, obj_cls.db_model, filters)
-        return query
+def _get_filter_query(obj_cls, context, query_field=None, query_limit=None,
+                      **kwargs):
+    filters = _kwargs_to_filters(**kwargs)
+    query = model_query.get_collection_query(
+        context, obj_cls.db_model, filters, limit=query_limit,
+        field=query_field)
+    return query
 
 
 def get_object(obj_cls, context, **kwargs):
-    return _get_filter_query(obj_cls, context, **kwargs).first()
+    with db_api.CONTEXT_READER.using(context):
+        return _get_filter_query(obj_cls, context, **kwargs).first()
 
 
-def count(obj_cls, context, **kwargs):
-    return _get_filter_query(obj_cls, context, **kwargs).count()
+def count(obj_cls, context, query_field=None, query_limit=None, **kwargs):
+    with db_api.CONTEXT_READER.using(context):
+        if not query_field and obj_cls.primary_keys:
+            query_field = obj_cls.primary_keys[0]
+            if query_field in obj_cls.fields_need_translation:
+                query_field = obj_cls.fields_need_translation[query_field]
+        return _get_filter_query(obj_cls, context, query_field=query_field,
+                                 query_limit=query_limit, **kwargs).count()
 
 
 def _kwargs_to_filters(**kwargs):
@@ -74,10 +83,10 @@ def _safe_get_object(obj_cls, context, **kwargs):
     db_obj = get_object(obj_cls, context, **kwargs)
 
     if db_obj is None:
-        key = ", ".join(['%s=%s' % (key, value) for (key, value)
+        key = ", ".join([f'{key}={value}' for (key, value)
                          in kwargs.items()])
         raise n_exc.ObjectNotFound(
-            id="%s(%s)" % (obj_cls.db_model.__name__, key))
+            id=f"{obj_cls.db_model.__name__}({key})")
     return db_obj
 
 

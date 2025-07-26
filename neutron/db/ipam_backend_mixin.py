@@ -20,6 +20,7 @@ import itertools
 import netaddr
 from neutron_lib.api.definitions import ip_allocation as ipalloc_apidef
 from neutron_lib.api.definitions import portbindings
+from neutron_lib.api.definitions import segment
 from neutron_lib.api import validators
 from neutron_lib import constants as const
 from neutron_lib.db import api as db_api
@@ -27,7 +28,6 @@ from neutron_lib.db import utils as db_utils
 from neutron_lib import exceptions as exc
 from neutron_lib.exceptions import address_scope as addr_scope_exc
 from neutron_lib.utils import net as net_utils
-from oslo_config import cfg
 from oslo_log import log as logging
 from sqlalchemy.orm import exc as orm_exc
 
@@ -35,7 +35,6 @@ from neutron._i18n import _
 from neutron.common import ipv6_utils
 from neutron.db import db_base_plugin_common
 from neutron.db import models_v2
-from neutron.extensions import segment
 from neutron.ipam import exceptions as ipam_exceptions
 from neutron.ipam import utils as ipam_utils
 from neutron.objects import address_scope as addr_scope_obj
@@ -58,9 +57,6 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
         if subnet.get('gateway_ip') is const.ATTR_NOT_SPECIFIED:
             if subnet.get('ip_version') == const.IP_VERSION_6:
                 gateway_ip = netaddr.IPNetwork(cidr_net).network
-                pd_net = netaddr.IPNetwork(const.PROVISIONAL_IPV6_PD_PREFIX)
-                if gateway_ip == pd_net.network:
-                    return
             else:
                 gateway_ip = netaddr.IPNetwork(cidr_net).network + 1
             return str(gateway_ip)
@@ -80,6 +76,10 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
                           'end': ip_pool['end']})
                 raise exc.InvalidAllocationPool(pool=ip_pool)
         return ip_range_pools
+
+    @staticmethod
+    def _is_distributed_service(port):
+        return port.get('device_owner') == const.DEVICE_OWNER_DISTRIBUTED
 
     def delete_subnet(self, context, subnet_id):
         pass
@@ -123,11 +123,11 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
 
         old_route_list = self._get_route_by_subnet(context, id)
 
-        new_route_set = set([_combine(route)
-                             for route in s['host_routes']])
+        new_route_set = {_combine(route)
+                         for route in s['host_routes']}
 
-        old_route_set = set([_combine(route)
-                             for route in old_route_list])
+        old_route_set = {_combine(route)
+                         for route in old_route_list}
 
         for route_str in old_route_set - new_route_set:
             for route in old_route_list:
@@ -195,7 +195,8 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
             new_type.create()
         return updated_types
 
-    def update_db_subnet(self, context, subnet_id, s, oldpools):
+    def update_db_subnet(self, context, subnet_id, s, oldpools,
+                         subnet_obj=None):
         changes = {}
         if "dns_nameservers" in s:
             changes['dns_nameservers'] = (
@@ -213,7 +214,7 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
             changes['service_types'] = (
                 self._update_subnet_service_types(context, subnet_id, s))
 
-        subnet_obj = self._get_subnet_object(context, subnet_id)
+        subnet_obj = subnet_obj or self._get_subnet_object(context, subnet_id)
         subnet_obj.update_fields(s)
         subnet_obj.update()
         return subnet_obj, changes
@@ -236,18 +237,14 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
             if cidr.prefixlen == 0:
                 err_msg = _("0 is not allowed as CIDR prefix length")
                 raise exc.InvalidInput(error_message=err_msg)
-        if cfg.CONF.allow_overlapping_ips:
-            subnet_list = [{'id': s.id, 'cidr': s.cidr}
-                           for s in network.subnets]
-        else:
-            subnet_list = subnet_obj.Subnet.get_subnet_cidrs(context)
+        subnet_list = [{'id': s.id, 'cidr': s.cidr} for s in network.subnets]
         for subnet in subnet_list:
             if ((netaddr.IPSet([subnet['cidr']]) & new_subnet_ipset) and
                     str(subnet['cidr']) != const.PROVISIONAL_IPV6_PD_PREFIX):
                 # don't give out details of the overlapping subnet
-                err_msg = ("Requested subnet with cidr: %(cidr)s for "
-                           "network: %(network_id)s overlaps with another "
-                           "subnet" %
+                err_msg = (_("Requested subnet with cidr: %(cidr)s for "
+                             "network: %(network_id)s overlaps with another "
+                             "subnet") %
                            {'cidr': new_subnet_cidr,
                             'network_id': network.id})
                 LOG.info("Validation for CIDR: %(new_cidr)s failed - "
@@ -305,9 +302,17 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
         Finally, verify that each range fall within the subnet's CIDR.
         """
         subnet = netaddr.IPNetwork(subnet_cidr)
-        subnet_first_ip = netaddr.IPAddress(subnet.first + 1)
-        # last address is broadcast in v4
-        subnet_last_ip = netaddr.IPAddress(subnet.last - (subnet.version == 4))
+        if subnet.version == const.IP_VERSION_4:
+            if subnet.prefixlen <= 30:
+                subnet_first_ip = netaddr.IPAddress(subnet.first + 1)
+                # last address is broadcast in v4
+                subnet_last_ip = netaddr.IPAddress(subnet.last - 1)
+            else:
+                subnet_first_ip = netaddr.IPAddress(subnet.first)
+                subnet_last_ip = netaddr.IPAddress(subnet.last)
+        else:  # IPv6 case
+            subnet_first_ip = netaddr.IPAddress(subnet.first + 1)
+            subnet_last_ip = netaddr.IPAddress(subnet.last)
 
         LOG.debug("Performing IP validity checks on allocation pools")
         ip_sets = []
@@ -350,9 +355,24 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
                         subnet_cidr=subnet_cidr)
 
     def _validate_segment(self, context, network_id, segment_id, action=None,
-                          old_segment_id=None):
-        segments = subnet_obj.Subnet.get_values(
-            context, 'segment_id', network_id=network_id)
+                          old_segment_id=None, requested_service_types=None,
+                          subnet_id=None):
+        # NOTE(zigo): If we're creating a network:routed subnet (here written
+        # as: const.DEVICE_OWNER_ROUTED), then the created subnet must be
+        # removed from the segment list, otherwise its segment ID will be
+        # returned as None, and SubnetsNotAllAssociatedWithSegments will be
+        # raised.
+        if (action == 'create' and requested_service_types and
+                const.DEVICE_OWNER_ROUTED in requested_service_types):
+            to_create_subnet_id = subnet_id
+        else:
+            to_create_subnet_id = None
+
+        segments = subnet_obj.Subnet.get_subnet_segment_ids(
+            context, network_id,
+            ignored_service_type=const.DEVICE_OWNER_ROUTED,
+            subnet_id=to_create_subnet_id)
+
         associated_segments = set(segments)
         if None in associated_segments and len(associated_segments) > 1:
             raise segment_exc.SubnetsNotAllAssociatedWithSegments(
@@ -383,7 +403,7 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
             if segment.is_dynamic:
                 raise segment_exc.SubnetCantAssociateToDynamicSegment()
 
-    def _get_subnet_for_fixed_ip(self, context, fixed, subnets):
+    def _get_subnet_for_fixed_ip(self, context, fixed, subnets, network_id):
         # Subnets are all the subnets belonging to the same network.
         if not subnets:
             msg = _('IP allocation requires subnets for network')
@@ -396,19 +416,20 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
                         return subnet
             subnet = get_matching_subnet()
             if not subnet:
-                subnet_obj = self._get_subnet_object(context,
-                                                     fixed['subnet_id'])
+                # Call this method to keep original status code
+                # in case subnet is not found
+                self._get_subnet_object(context, fixed['subnet_id'])
                 msg = (_("Failed to create port on network %(network_id)s"
                          ", because fixed_ips included invalid subnet "
                          "%(subnet_id)s") %
-                       {'network_id': subnet_obj.network_id,
+                       {'network_id': network_id,
                         'subnet_id': fixed['subnet_id']})
                 raise exc.InvalidInput(error_message=msg)
             # Ensure that the IP is valid on the subnet
             if ('ip_address' in fixed and
-                not ipam_utils.check_subnet_ip(subnet['cidr'],
-                                               fixed['ip_address'],
-                                               fixed['device_owner'])):
+                    not ipam_utils.check_subnet_ip(subnet['cidr'],
+                                                   fixed['ip_address'],
+                                                   fixed['device_owner'])):
                 raise exc.InvalidIpForSubnet(ip_address=fixed['ip_address'])
             return subnet
 
@@ -452,16 +473,16 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
         if device_owner in const.ROUTER_INTERFACE_OWNERS_SNAT:
             return True
 
-        subnet_obj = self._get_subnet_object(context, subnet_id)
-        return not (ipv6_utils.is_auto_address_subnet(subnet_obj) and
-                    not ipv6_utils.is_ipv6_pd_enabled(subnet_obj))
+        _subnet_obj = self._get_subnet_object(context, subnet_id)
+        return not (ipv6_utils.is_auto_address_subnet(_subnet_obj) and
+                    not ipv6_utils.is_ipv6_pd_enabled(_subnet_obj))
 
     def _get_changed_ips_for_port(self, context, original_ips,
                                   new_ips, device_owner):
         """Calculate changes in IPs for the port."""
         # Collect auto addressed subnet ids that has to be removed on update
-        delete_subnet_ids = set(ip['subnet_id'] for ip in new_ips
-                                if ip.get('delete_subnet'))
+        delete_subnet_ids = {ip['subnet_id'] for ip in new_ips
+                             if ip.get('delete_subnet')}
         ips = [ip for ip in new_ips
                if ip.get('subnet_id') not in delete_subnet_ids]
 
@@ -570,9 +591,8 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
         if segment_id:
             # TODO(slaweq): integrate check if segment exists in
             # self._validate_segment() method
-            segment = network_obj.NetworkSegment.get_object(context,
-                                                            id=segment_id)
-            if not segment:
+            if not network_obj.NetworkSegment.get_object(context,
+                                                         id=segment_id):
                 raise segment_exc.SegmentNotFound(segment_id=segment_id)
 
         subnet = subnet_obj.Subnet(context, **subnet_args)
@@ -580,7 +600,10 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
         # TODO(slaweq): when check is segment exists will be integrated in
         # self._validate_segment() method, it should be moved to be done before
         # subnet object is created
-        self._validate_segment(context, network['id'], segment_id)
+        self._validate_segment(context, network['id'], segment_id,
+                               action='create',
+                               requested_service_types=service_types,
+                               subnet_id=subnet.id)
 
         # NOTE(changzhi) Store DNS nameservers with order into DB one
         # by one when create subnet with DNS nameservers
@@ -646,7 +669,8 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
         return fixed_ip_list
 
     def _ipam_get_subnets(self, context, network_id, host, service_type=None,
-                          fixed_configured=False, fixed_ips=None):
+                          fixed_configured=False, fixed_ips=None,
+                          distributed_service=False):
         """Return eligible subnets
 
         If no eligible subnets are found, determine why and potentially raise
@@ -654,12 +678,12 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
         """
         subnets = subnet_obj.Subnet.find_candidate_subnets(
             context, network_id, host, service_type, fixed_configured,
-            fixed_ips)
+            fixed_ips, distributed_service=distributed_service)
         if subnets:
             msg = ('This subnet is being modified by another concurrent '
                    'operation')
             for subnet in subnets:
-                subnet.lock_register(
+                subnet.read_lock_register(
                     context, exc.SubnetInUse(subnet_id=subnet.id, reason=msg),
                     id=subnet.id)
             subnet_dicts = [self._make_subnet_dict(subnet, context=context)
@@ -677,7 +701,7 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
             network_id=network_id, service_type=service_type)
 
     def _make_subnet_args(self, detail, subnet, subnetpool_id):
-        args = super(IpamBackendMixin, self)._make_subnet_args(
+        args = super()._make_subnet_args(
             detail, subnet, subnetpool_id)
         if validators.is_attr_set(subnet.get(segment.SEGMENT_ID)):
             args['segment_id'] = subnet[segment.SEGMENT_ID]
@@ -722,7 +746,8 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
             if old_ips and new_host_requested and not fixed_ips_requested:
                 valid_subnets = self._ipam_get_subnets(
                     context, old_port['network_id'], host,
-                    service_type=old_port.get('device_owner'))
+                    service_type=old_port.get('device_owner'),
+                    distributed_service=self._is_distributed_service(old_port))
                 valid_subnet_ids = {s['id'] for s in valid_subnets}
                 for fixed_ip in old_ips:
                     if fixed_ip['subnet_id'] not in valid_subnet_ids:

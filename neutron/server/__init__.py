@@ -16,6 +16,7 @@
 # If ../neutron/__init__.py exists, add ../ to Python search path, so that
 # it will override what happens to be installed in /usr/(local/)lib/python...
 
+import logging as sys_logging
 import os
 import sys
 
@@ -23,7 +24,6 @@ from oslo_config import cfg
 
 from neutron._i18n import _
 from neutron.common import config
-from neutron.common import profiler
 
 # NOTE(annp): These environment variables are required for deploying
 # neutron-api under mod_wsgi. Currently, these variables are set as DevStack's
@@ -52,7 +52,7 @@ def _get_config_files(env=None):
 def _init_configuration():
     # the configuration will be read into the cfg.CONF global data structure
     conf_files = _get_config_files()
-
+    config.register_common_config_options()
     config.init(sys.argv[1:], default_config_files=conf_files)
     config.setup_logging()
     config.set_config_defaults()
@@ -63,16 +63,22 @@ def _init_configuration():
 
 
 def boot_server(server_func):
+    # During the call to gmr.TextGuruMeditation.setup_autorun(), Guru
+    # Meditation Report tries to start logging.
+    # Set a handler here to accommodate this.
+    # NOTE(amorin) This was introduced to mitigate bug #1532053 which seems
+    # not triggered anymore.
+    # But, while fixing bug #2021814 we decided to be conservative and keep
+    # this to avoid any further side effect.
+    logger = sys_logging.getLogger(None)
+    if not logger.handlers:
+        logger.addHandler(sys_logging.StreamHandler())
+
     _init_configuration()
+    config.setup_gmr()
     try:
-        server_func()
+        return server_func()
     except KeyboardInterrupt:
         pass
     except RuntimeError as e:
         sys.exit(_("ERROR: %s") % e)
-
-
-def get_application():
-    _init_configuration()
-    profiler.setup('neutron-server', cfg.CONF.host)
-    return config.load_paste_app('neutron')

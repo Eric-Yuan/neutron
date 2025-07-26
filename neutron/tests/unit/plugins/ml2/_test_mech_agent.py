@@ -163,8 +163,7 @@ class FakePortContext(api.PortContext):
     def host_agents(self, agent_type):
         if agent_type == self._agent_type:
             return self._agents
-        else:
-            return []
+        return []
 
     def set_binding(self, segment_id, vif_type, vif_details):
         self._bound_segment_id = segment_id
@@ -183,26 +182,26 @@ class FakePortContext(api.PortContext):
 
 class MechDriverConfFixture(config_fixture.Config):
 
-    def __init__(self, conf=cfg.CONF, blacklist_cfg=None,
+    def __init__(self, conf=cfg.CONF, prohibit_list_cfg=None,
                  registration_func=None):
-        """ConfigFixture for vnic_type_blacklist
+        """ConfigFixture for vnic_type_prohibit_list
 
         :param conf: The driver configuration object
-        :param blacklist_cfg: A dictionary in the form
+        :param prohibit_list_cfg: A dictionary in the form
                               {'group': {'opt': 'value'}}, i.e.:
-                              {'OVS_DRIVER': {'vnic_type_blacklist':
+                              {'OVS_DRIVER': {'vnic_type_prohibit_list':
                                               ['foo']}}
         :param registration_func: The method which do the config group's
                                   registration.
         """
-        super(MechDriverConfFixture, self).__init__(conf)
-        self.blacklist_cfg = blacklist_cfg
+        super().__init__(conf)
+        self.prohibit_list_cfg = prohibit_list_cfg
         self.registration_func = registration_func
 
     def setUp(self):
-        super(MechDriverConfFixture, self).setUp()
+        super().setUp()
         self.registration_func(self.conf)
-        for group, option in self.blacklist_cfg.items():
+        for group, option in self.prohibit_list_cfg.items():
             self.config(group=group, **option)
 
 
@@ -246,17 +245,19 @@ class AgentMechanismGenericTestCase(AgentMechanismBaseTestCase):
                               api.NETWORK_ID: 'fake_network_id'}]
 
     def test_unknown_type(self):
-        context = FakePortContext(self.AGENT_TYPE,
-                                  self.AGENTS,
-                                  self.UNKNOWN_TYPE_SEGMENTS,
-                                  vnic_type=self.VNIC_TYPE)
+        self.context = FakePortContext(self.AGENT_TYPE, self.AGENTS,
+                                       self.UNKNOWN_TYPE_SEGMENTS,
+                                       vnic_type=self.VNIC_TYPE)
+        context = self.context
         self.driver.bind_port(context)
         self._check_unbound(context)
 
     def test_driver_not_responsible_for_ports_allocation(self):
         agents = [
             {'configurations': {'rp_bandwidths': {'eth0': {}}},
-             'host': 'host'},
+             'host': 'host',
+             'agent_type': self.AGENT_TYPE,
+             },
         ]
         profile = {}
         segments = []

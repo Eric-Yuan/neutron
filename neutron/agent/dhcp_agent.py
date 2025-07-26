@@ -17,6 +17,7 @@
 import sys
 
 from neutron_lib.agent import topics
+from neutron_lib import constants
 from oslo_config import cfg
 from oslo_service import service
 
@@ -29,6 +30,7 @@ from neutron import service as neutron_service
 
 
 def register_options(conf):
+    common_config.register_common_config_options()
     config.register_interface_driver_opts_helper(conf)
     config.register_agent_state_opts_helper(conf)
     config.register_availability_zone_opts_helper(conf)
@@ -43,9 +45,10 @@ def main():
     register_options(cfg.CONF)
     common_config.init(sys.argv[1:])
     config.setup_logging()
+    common_config.setup_gmr()
     config.setup_privsep()
     server = neutron_service.Service.create(
-        binary='neutron-dhcp-agent',
+        binary=constants.AGENT_PROCESS_DHCP,
         topic=topics.DHCP_AGENT,
         report_interval=cfg.CONF.AGENT.report_interval,
         manager='neutron.agent.dhcp.agent.DhcpAgentWithStateReport')

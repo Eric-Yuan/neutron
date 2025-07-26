@@ -17,49 +17,62 @@ import datetime
 
 from oslo_log import log
 from oslo_utils import timeutils
-import six
 from tooz import hashring
 
 from neutron.common.ovn import constants
 from neutron.common.ovn import exceptions
 from neutron.db import ovn_hash_ring_db as db_hash_ring
+from neutron import service
 from neutron_lib import context
 
 LOG = log.getLogger(__name__)
 
 
-class HashRingManager(object):
+class HashRingManager:
 
     def __init__(self, group_name):
         self._hash_ring = None
+        self._node_last_touch = {}
         self._last_time_loaded = None
-        self._cache_startup_timeout = True
+        self._check_hashring_startup = True
         self._group = group_name
+        # Flag to rate limit the caching log
+        self._prev_num_nodes = -1
         self.admin_ctx = context.get_admin_context()
+        self._offline_node_count = 0
 
     @property
     def _wait_startup_before_caching(self):
         # NOTE(lucasagomes): Some events are processed at the service's
         # startup time and since many services may be started concurrently
         # we do not want to use a cached hash ring at that point. This
-        # method checks if the created_at and updated_at columns from the
-        # nodes in the ring from this host is equal, and if so it means
-        # that the service just started.
+        # method ensures that we start allowing the use of cached HashRings
+        # once the number of HashRing nodes >= the number of api workers.
 
         # If the startup timeout already expired, there's no reason to
         # keep reading from the DB. At this point this will always
         # return False
-        if not self._cache_startup_timeout:
+        if not self._check_hashring_startup:
             return False
 
+        api_workers = service._get_api_workers()
         nodes = db_hash_ring.get_active_nodes(
             self.admin_ctx,
             constants.HASH_RING_CACHE_TIMEOUT, self._group, from_host=True)
-        dont_cache = nodes and nodes[0].created_at == nodes[0].updated_at
-        if not dont_cache:
-            self._cache_startup_timeout = False
 
-        return dont_cache
+        num_nodes = len(nodes)
+        if num_nodes >= api_workers:
+            LOG.debug("Allow caching, nodes %s>=%s", num_nodes, api_workers)
+            self._check_hashring_startup = False
+            return False
+
+        # NOTE(lucasagomes): We only log when the number of connected
+        # nodes are different to prevent this message from being spammed
+        if self._prev_num_nodes != num_nodes:
+            LOG.debug("Disallow caching, nodes %s<%s", num_nodes, api_workers)
+            self._prev_num_nodes = num_nodes
+
+        return True
 
     def _load_hash_ring(self, refresh=False):
         cache_timeout = timeutils.utcnow() - datetime.timedelta(
@@ -80,7 +93,14 @@ class HashRingManager(object):
                 constants.HASH_RING_NODES_TIMEOUT, self._group)
             self._hash_ring = hashring.HashRing({node.node_uuid
                                                  for node in nodes})
+            self._node_last_touch = {node.node_uuid: node.updated_at
+                                     for node in nodes}
             self._last_time_loaded = timeutils.utcnow()
+            self._offline_node_count = db_hash_ring.count_offline_nodes(
+                self.admin_ctx, constants.HASH_RING_NODES_TIMEOUT,
+                self._group)
+            LOG.debug("Hash Ring loaded. %d active nodes. %d offline nodes",
+                      len(nodes), self._offline_node_count)
 
     def refresh(self):
         self._load_hash_ring(refresh=True)
@@ -89,12 +109,14 @@ class HashRingManager(object):
         self._load_hash_ring()
 
         # tooz expects a byte string for the hash
-        if isinstance(key, six.string_types):
+        if isinstance(key, str):
             key = key.encode('utf-8')
 
         try:
             # We need to pop the value from the set. If empty,
             # KeyError is raised
-            return self._hash_ring[key].pop()
+            node_uuid = self._hash_ring[key].pop()
+            return node_uuid, self._node_last_touch[node_uuid]
         except KeyError:
-            raise exceptions.HashRingIsEmpty(key=key)
+            raise exceptions.HashRingIsEmpty(
+                key=key, node_count=self._offline_node_count)

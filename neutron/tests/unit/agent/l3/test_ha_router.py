@@ -22,6 +22,7 @@ from oslo_utils import uuidutils
 
 from neutron.agent.l3 import ha_router
 from neutron.agent.l3 import router_info
+from neutron.common import utils as common_utils
 from neutron.tests import base
 from neutron.tests.common import l3_test_common
 
@@ -30,18 +31,20 @@ _uuid = uuidutils.generate_uuid
 
 class TestBasicRouterOperations(base.BaseTestCase):
     def setUp(self):
-        super(TestBasicRouterOperations, self).setUp()
+        super().setUp()
         self.device_exists_p = mock.patch(
             'neutron.agent.linux.ip_lib.device_exists')
         self.device_exists = self.device_exists_p.start()
+        self.delete_if_exists_p = mock.patch(
+            'neutron.agent.linux.utils.delete_if_exists')
+        self.delete_if_exists = self.delete_if_exists_p.start()
 
     def _create_router(self, router=None, **kwargs):
         if not router:
             router = mock.MagicMock()
         self.agent_conf = mock.Mock()
         self.router_id = _uuid()
-        return ha_router.HaRouter(mock.sentinel.enqueue_state,
-                                  mock.sentinel.agent,
+        return ha_router.HaRouter(mock.sentinel.agent,
                                   self.router_id,
                                   router,
                                   self.agent_conf,
@@ -55,6 +58,31 @@ class TestBasicRouterOperations(base.BaseTestCase):
         addresses = ['15.1.2.2/24', '15.1.2.3/32']
         ri._get_cidrs_from_keepalived = mock.MagicMock(return_value=addresses)
         self.assertEqual(set(addresses), ri.get_router_cidrs(device))
+
+    def test_routes_updated_with_dvr(self):
+        ri = self._create_router(router={'distributed': True})
+        ri.keepalived_manager = mock.Mock()
+        base_routes_updated = mock.patch(
+            'neutron.agent.l3.router_info.'
+            'RouterInfo.routes_updated').start()
+        mock_instance = mock.Mock()
+        mock_instance.virtual_routes.gateway_routes = []
+        ri._get_keepalived_instance = mock.Mock(
+            return_value=mock_instance)
+        ri.routes_updated([], [])
+        self.assertTrue(base_routes_updated.called)
+
+    def test_routes_updated_with_non_dvr(self):
+        ri = self._create_router(router={'distributed': False})
+        ri.keepalived_manager = mock.Mock()
+        base_routes_updated = mock.patch(
+            'neutron.agent.l3.router_info.'
+            'RouterInfo.routes_updated').start()
+        mock_instance = mock.Mock()
+        mock_instance.virtual_routes.gateway_routes = []
+        ri._get_keepalived_instance = mock.Mock(return_value=mock_instance)
+        ri.routes_updated([], [])
+        self.assertFalse(base_routes_updated.called)
 
     def test__add_default_gw_virtual_route(self):
         ri = self._create_router()
@@ -84,6 +112,10 @@ class TestBasicRouterOperations(base.BaseTestCase):
         ri._add_default_gw_virtual_route(ex_gw_port, 'qg-abc')
         self.assertEqual(0, len(mock_instance.virtual_routes.gateway_routes))
 
+        subnets[1]['gateway_ip'] = '30.0.1.1'
+        ri._add_default_gw_virtual_route(ex_gw_port, 'qg-abc')
+        self.assertEqual(2, len(mock_instance.virtual_routes.gateway_routes))
+
     @mock.patch.object(router_info.RouterInfo, 'remove_floating_ip')
     def test_remove_floating_ip(self, super_remove_floating_ip):
         ri = self._create_router(mock.MagicMock())
@@ -94,6 +126,34 @@ class TestBasicRouterOperations(base.BaseTestCase):
 
         ri.remove_floating_ip(device, fip_cidr)
         self.assertTrue(super_remove_floating_ip.called)
+
+    @mock.patch.object(ha_router.LOG, 'debug')
+    def test_spawn_state_change_monitor(self, mock_log):
+        ri = self._create_router(mock.MagicMock())
+        with mock.patch.object(ri,
+                               '_get_state_change_monitor_process_manager')\
+                as m_get_state:
+            mock_pm = m_get_state.return_value
+            mock_pm.active = True
+            mock_pm.pid = 1234
+            ri.spawn_state_change_monitor(mock_pm)
+
+        mock_pm.enable.assert_called_once()
+        mock_log.assert_called_once()
+
+    @mock.patch.object(ha_router.LOG, 'warning')
+    def test_spawn_state_change_monitor_no_pid(self, mock_log):
+        ri = self._create_router(mock.MagicMock())
+        with mock.patch.object(ri,
+                               '_get_state_change_monitor_process_manager')\
+                as m_get_state:
+            mock_pm = m_get_state.return_value
+            mock_pm.active = True
+            mock_pm.pid = None
+            ri.spawn_state_change_monitor(mock_pm)
+
+        mock_pm.enable.assert_called_once()
+        mock_log.assert_called_once()
 
     def test_destroy_state_change_monitor_ok(self):
         ri = self._create_router(mock.MagicMock())
@@ -109,21 +169,27 @@ class TestBasicRouterOperations(base.BaseTestCase):
         mock_pm.disable.assert_called_once_with(
             sig=str(int(signal.SIGTERM)))
 
-    def test_destroy_state_change_monitor_force(self):
+    @mock.patch.object(common_utils, 'wait_until_true')
+    @mock.patch.object(ha_router.HaRouter,
+                       '_get_state_change_monitor_process_manager')
+    def test_destroy_state_change_monitor_force(self, m_get_state,
+                                                mock_wait_until):
         ri = self._create_router(mock.MagicMock())
         # need a port for destroy_state_change_monitor() to call PM code
         ri.ha_port = {'id': _uuid()}
-        with mock.patch.object(ri,
-                               '_get_state_change_monitor_process_manager')\
-                as m_get_state:
-            mock_pm = m_get_state.return_value
-            mock_pm.active = False
-            with mock.patch.object(ha_router, 'SIGTERM_TIMEOUT', 0):
-                ri.destroy_state_change_monitor(mock_pm)
+        mock_pm = m_get_state.return_value
+        mock_pm.active = False
+        mock_wait_until.side_effect = common_utils.WaitTimeout
 
-        calls = ["sig='str(%d)'" % signal.SIGTERM,
-                 "sig='str(%d)'" % signal.SIGKILL]
-        mock_pm.disable.has_calls(calls)
+        ri.destroy_state_change_monitor(mock_pm)
+
+        m_get_state.assert_called_once_with()
+        mock_pm.unregister.assert_called_once_with(
+            self.router_id, ha_router.IP_MONITOR_PROCESS_SERVICE)
+        mock_wait_until.assert_called_once_with(mock.ANY, timeout=10)
+        mock_pm.disable.assert_has_calls([
+            mock.call(sig=str(int(signal.SIGTERM))),
+            mock.call(sig=str(int(signal.SIGKILL)))])
 
     def _test_ha_state(self, read_return, expected):
         ri = self._create_router(mock.MagicMock())
@@ -134,8 +200,8 @@ class TestBasicRouterOperations(base.BaseTestCase):
             lib_fixtures.OpenFixture('ha_state', read_return)).mock_open
         self.assertEqual(expected, ri.ha_state)
 
-    def test_ha_state_master(self):
-        self._test_ha_state('master', 'master')
+    def test_ha_state_primary(self):
+        self._test_ha_state('primary', 'primary')
 
     def test_ha_state_unknown(self):
         # an empty state file should yield 'unknown'

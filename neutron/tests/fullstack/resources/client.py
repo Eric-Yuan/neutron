@@ -37,7 +37,7 @@ class ClientFixture(fixtures.Fixture):
     """Manage and cleanup neutron resources."""
 
     def __init__(self, client):
-        super(ClientFixture, self).__init__()
+        super().__init__()
         self.client = client
 
     def _create_resource(self, resource_type, spec):
@@ -62,6 +62,38 @@ class ClientFixture(fixtures.Fixture):
 
         return delete(id)
 
+    def create_local_ip(self, project_id, network_id=None):
+        delete = self.delete_local_ip
+
+        path = '/local_ips'
+        body = {'local_ip': {'project_id': project_id,
+                             'network_id': network_id}}
+        resp = self.client.post(path, body=body)
+        data = resp['local_ip']
+        self.addCleanup(_safe_method(delete), data['id'])
+        return data
+
+    def create_local_ip_association(self, local_ip_id, port_id, fixed_ip=None):
+        delete = self.delete_local_ip_association
+
+        path = f'/local_ips/{local_ip_id}/port_associations'
+        body = {'port_association': {'fixed_port_id': port_id}}
+        if fixed_ip:
+            body['port_association']['fixed_ip'] = fixed_ip
+        resp = self.client.post(path, body=body)
+        data = resp['port_association']
+        self.addCleanup(_safe_method(delete), local_ip_id, port_id)
+        return data
+
+    def delete_local_ip(self, local_ip_id):
+        path = f"/local-ips/{local_ip_id}"
+        self.client.delete(path)
+
+    def delete_local_ip_association(self, local_ip_id, port_id):
+        path = "/local_ips/{}/port_associations/{}".format(
+            local_ip_id, port_id)
+        self.client.delete(path)
+
     def create_router(self, tenant_id, name=None, ha=False,
                       external_network=None, external_subnet=None):
         resource_type = 'router'
@@ -79,9 +111,19 @@ class ClientFixture(fixtures.Fixture):
     def update_router(self, router_id, **kwargs):
         return self._update_resource('router', router_id, kwargs)
 
+    def create_segment(self, project_id, network, name, network_type=None,
+                       segmentation_id=None, physical_network=None):
+        resource_type = 'segment'
+        name = name or utils.get_rand_name(prefix=resource_type)
+        spec = {'project_id': project_id, 'name': name, 'network_id': network,
+                'network_type': network_type,
+                'physical_network': physical_network,
+                'segmentation_id': segmentation_id}
+        return self._create_resource(resource_type, spec)
+
     def create_network(self, tenant_id, name=None, external=False,
                        network_type=None, segmentation_id=None,
-                       physical_network=None, mtu=None):
+                       physical_network=None, mtu=None, qos_policy_id=None):
         resource_type = 'network'
 
         name = name or utils.get_rand_name(prefix=resource_type)
@@ -96,6 +138,8 @@ class ClientFixture(fixtures.Fixture):
             spec['provider:physical_network'] = physical_network
         if mtu is not None:
             spec['mtu'] = mtu
+        if qos_policy_id is not None:
+            spec['qos_policy_id'] = qos_policy_id
 
         return self._create_resource(resource_type, spec)
 
@@ -106,9 +150,10 @@ class ClientFixture(fixtures.Fixture):
         return self._delete_resource('network', id)
 
     def create_subnet(self, tenant_id, network_id,
-                      cidr, gateway_ip=None, name=None, enable_dhcp=True,
+                      cidr=None, gateway_ip=None, name=None, enable_dhcp=True,
                       ipv6_address_mode='slaac', ipv6_ra_mode='slaac',
-                      subnetpool_id=None, ip_version=None):
+                      subnetpool_id=None, ip_version=None,
+                      host_routes=None, segment=None):
         resource_type = 'subnet'
 
         name = name or utils.get_rand_name(prefix=resource_type)
@@ -126,8 +171,32 @@ class ClientFixture(fixtures.Fixture):
             spec['subnetpool_id'] = subnetpool_id
         if cidr:
             spec['cidr'] = cidr
+        if host_routes:
+            spec['host_routes'] = host_routes
+        if segment:
+            spec['segment_id'] = segment
 
         return self._create_resource(resource_type, spec)
+
+    def create_subnetpool(self, project_id, name=None, min_prefixlen=8,
+                          max_prefixlen=24, default_prefixlen=24,
+                          prefixes=None):
+        resource_type = 'subnetpool'
+        name = name or utils.get_rand_name(prefix=resource_type)
+        spec = {'project_id': project_id,
+                'name': name,
+                'min_prefixlen': min_prefixlen,
+                'max_prefixlen': max_prefixlen,
+                'default_prefixlen': default_prefixlen,
+                'is_default': False,
+                'shared': False,
+                'prefixes': prefixes}
+
+        return self._create_resource(resource_type, spec)
+
+    def list_subnets(self, retrieve_all=True, **kwargs):
+        resp = self.client.list_subnets(retrieve_all=retrieve_all, **kwargs)
+        return resp['subnets']
 
     def list_ports(self, retrieve_all=True, **kwargs):
         resp = self.client.list_ports(retrieve_all=retrieve_all, **kwargs)
@@ -197,9 +266,9 @@ class ClientFixture(fixtures.Fixture):
 
         return policy['policy']
 
-    def create_bandwidth_limit_rule(self, tenant_id, qos_policy_id, limit=None,
+    def create_bandwidth_limit_rule(self, qos_policy_id, limit=None,
                                     burst=None, direction=None):
-        rule = {'tenant_id': tenant_id}
+        rule = {}
         if limit:
             rule['max_kbps'] = limit
         if burst:
@@ -216,10 +285,29 @@ class ClientFixture(fixtures.Fixture):
 
         return rule['bandwidth_limit_rule']
 
-    def create_minimum_bandwidth_rule(self, tenant_id, qos_policy_id,
-                                      min_bw, direction=None):
-        rule = {'tenant_id': tenant_id,
-                'min_kbps': min_bw}
+    def create_packet_rate_limit_rule(self, qos_policy_id, limit=None,
+                                      burst=None, direction=None):
+        rule = {}
+        if limit:
+            rule['max_kpps'] = limit
+        if burst:
+            rule['max_burst_kpps'] = burst
+        if direction:
+            rule['direction'] = direction
+        rule = self.client.create_packet_rate_limit_rule(
+            policy=qos_policy_id,
+            body={'packet_rate_limit_rule': rule})
+
+        self.addCleanup(
+            _safe_method(self.client.delete_packet_rate_limit_rule),
+            rule['packet_rate_limit_rule']['id'],
+            qos_policy_id)
+
+        return rule['packet_rate_limit_rule']
+
+    def create_minimum_bandwidth_rule(self, qos_policy_id, min_bw,
+                                      direction=None):
+        rule = {'min_kbps': min_bw}
         if direction:
             rule['direction'] = direction
         rule = self.client.create_minimum_bandwidth_rule(
@@ -232,8 +320,8 @@ class ClientFixture(fixtures.Fixture):
 
         return rule['minimum_bandwidth_rule']
 
-    def create_dscp_marking_rule(self, tenant_id, qos_policy_id, dscp_mark=0):
-        rule = {'tenant_id': tenant_id}
+    def create_dscp_marking_rule(self, qos_policy_id, dscp_mark=0):
+        rule = {}
         if dscp_mark:
             rule['dscp_mark'] = dscp_mark
         rule = self.client.create_dscp_marking_rule(
@@ -354,3 +442,10 @@ class ClientFixture(fixtures.Fixture):
 
     def update_quota(self, project_id, tracked_resource, quota):
         self._update_resource('quota', project_id, {tracked_resource: quota})
+
+    def add_gateway_router(self, router_id, network_id):
+        self.client.add_gateway_router(
+            router_id,
+            {'network_id': network_id})
+        self.addCleanup(
+            self.client.remove_gateway_router, router_id)

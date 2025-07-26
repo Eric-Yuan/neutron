@@ -33,7 +33,8 @@ class FloatingIPTcCommandBase(ip_lib.IPDevice):
     def _execute_tc_cmd(self, cmd, **kwargs):
         cmd = ['tc'] + cmd
         ip_wrapper = ip_lib.IPWrapper(self.namespace)
-        return ip_wrapper.netns.execute(cmd, run_as_root=True, **kwargs)
+        return ip_wrapper.netns.execute(cmd, run_as_root=True,
+                                        privsep_exec=True, **kwargs)
 
     def _get_qdisc_id_for_filter(self, direction):
         qdiscs = tc_lib.list_tc_qdiscs(self.name, namespace=self.namespace)
@@ -62,6 +63,7 @@ class FloatingIPTcCommandBase(ip_lib.IPDevice):
         if not filters_output:
             raise exceptions.FilterIDForIPNotFound(ip=ip)
         filter_lines = filters_output.split('\n')
+        filter_id = None
         for line in filter_lines:
             line = line.strip()
             m = FILTER_ID_REGEX.match(line)
@@ -69,14 +71,14 @@ class FloatingIPTcCommandBase(ip_lib.IPDevice):
                 filter_id = m.group(2)
                 # It matched, so ip/32 is not here. continue
                 continue
-            elif not line.startswith('match'):
+            if not line.startswith('match'):
                 continue
             parts = line.split(" ")
-            if ip + '/32' in parts:
+            if ip + '/32' in parts and filter_id:
                 filterids_for_ip.append(filter_id)
         if len(filterids_for_ip) > 1:
             raise exceptions.MultipleFilterIDForIPFound(ip=ip)
-        elif len(filterids_for_ip) == 0:
+        if len(filterids_for_ip) == 0:
             raise exceptions.FilterIDForIPNotFound(ip=ip)
         return filterids_for_ip[0]
 
@@ -101,8 +103,8 @@ class FloatingIPTcCommandBase(ip_lib.IPDevice):
         return filterids
 
     def _add_filter(self, qdisc_id, direction, ip, rate, burst):
-        rate_value = "%s%s" % (rate, tc_lib.BW_LIMIT_UNIT)
-        burst_value = "%s%s" % (
+        rate_value = f"{rate}{tc_lib.BW_LIMIT_UNIT}"
+        burst_value = "{}{}".format(
             tc_lib.TcCommand.get_ingress_qdisc_burst_value(rate, burst),
             tc_lib.BURST_UNIT
         )

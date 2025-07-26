@@ -13,18 +13,18 @@ the SNAT service to a backup DVR/SNAT router on an l3-agent running on a
 different node.
 
 SNAT high availability is implemented in a manner similar to the
-:ref:`deploy-lb-ha-vrrp` and :ref:`deploy-ovs-ha-vrrp` examples where
-``keepalived`` uses VRRP to provide quick failover of SNAT services.
+:ref:`deploy-ovs-ha-vrrp` example where ``keepalived`` uses VRRP to provide
+quick failover of SNAT services.
 
-During normal operation, the master router periodically transmits *heartbeat*
+During normal operation, the primary router periodically transmits *heartbeat*
 packets over a hidden project network that connects all HA routers for a
 particular project.
 
 If the DVR/SNAT backup router stops receiving these packets, it assumes failure
-of the master DVR/SNAT router and promotes itself to master router by
+of the primary DVR/SNAT router and promotes itself to primary router by
 configuring IP addresses on the interfaces in the ``snat`` namespace. In
 environments with more than one backup router, the rules of VRRP are followed
-to select a new master router.
+to select a new primary router.
 
 .. warning::
 
@@ -49,7 +49,6 @@ Controller node configuration
       [DEFAULT]
       core_plugin = ml2
       service_plugins = router
-      allow_overlapping_ips = True
       router_distributed = True
       l3_ha = True
       l3_ha_net_cidr = 169.254.192.0/18
@@ -130,7 +129,6 @@ Network nodes
 
       [DEFAULT]
       ha_vrrp_auth_password = password
-      interface_driver = openvswitch
       agent_mode = dvr_snat
 
 
@@ -152,14 +150,13 @@ Compute nodes
       l2_population = True
 
       [securitygroup]
-      firewall_driver = neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+      firewall_driver = iptables_hybrid
 
 #. Configure the L3 agent. Add the following to ``/etc/neutron/l3_agent.ini``:
 
    .. code-block:: ini
 
       [DEFAULT]
-      interface_driver = openvswitch
       agent_mode = dvr
 
    Replace ``TUNNEL_INTERFACE_IP_ADDRESS`` with the IP address of the interface
@@ -172,12 +169,6 @@ Keepalived VRRP health check
 
 Known limitations
 ~~~~~~~~~~~~~~~~~
-
-* Migrating a router from distributed only, HA only, or legacy to distributed
-  HA is not supported at this time. The router must be created as distributed
-  HA.
-  The reverse direction is also not supported. You cannot reconfigure a
-  distributed HA router to be only distributed, only HA, or legacy.
 
 * There are certain scenarios where l2pop and distributed HA routers do not
   interact in an expected manner. These situations are the same that affect HA

@@ -15,6 +15,7 @@
 import errno
 import itertools
 import os
+import signal
 
 import netaddr
 from neutron_lib import constants
@@ -26,6 +27,8 @@ from oslo_utils import fileutils
 
 from neutron._i18n import _
 from neutron.agent.linux import external_process
+from neutron.agent.linux import utils as linux_utils
+from neutron.cmd import runtime_checks as checks
 from neutron.common import utils
 
 VALID_STATES = ['MASTER', 'BACKUP']
@@ -35,10 +38,20 @@ PRIMARY_VIP_RANGE_SIZE = 24
 KEEPALIVED_SERVICE_NAME = 'keepalived'
 KEEPALIVED_EMAIL_FROM = 'neutron@openstack.local'
 KEEPALIVED_ROUTER_ID = 'neutron'
-GARP_MASTER_DELAY = 60
+GARP_PRIMARY_DELAY = 60
 HEALTH_CHECK_NAME = 'ha_health_check'
+_IS_NO_TRACK_SUPPORTED = None
 
 LOG = logging.getLogger(__name__)
+SIGTERM_TIMEOUT = 5
+
+
+def _is_keepalived_use_no_track_supported():
+    global _IS_NO_TRACK_SUPPORTED
+    if _IS_NO_TRACK_SUPPORTED is None:
+        _IS_NO_TRACK_SUPPORTED = (
+            checks.keepalived_use_no_track_support())
+    return _IS_NO_TRACK_SUPPORTED
 
 
 def get_free_range(parent_range, excluded_ranges, size=PRIMARY_VIP_RANGE_SIZE):
@@ -52,7 +65,7 @@ def get_free_range(parent_range, excluded_ranges, size=PRIMARY_VIP_RANGE_SIZE):
     free_cidrs = netaddr.IPSet([parent_range]) - netaddr.IPSet(excluded_ranges)
     for cidr in free_cidrs.iter_cidrs():
         if cidr.prefixlen <= size:
-            return '%s/%s' % (cidr.network, size)
+            return f'{cidr.network}/{size}'
 
     raise ValueError(_('Network of size %(size)s, from IP range '
                        '%(parent_range)s excluding IP ranges '
@@ -69,7 +82,7 @@ class InvalidInstanceStateException(exceptions.NeutronException):
     def __init__(self, **kwargs):
         if 'valid_states' not in kwargs:
             kwargs['valid_states'] = ', '.join(VALID_STATES)
-        super(InvalidInstanceStateException, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
 
 class InvalidAuthenticationTypeException(exceptions.NeutronException):
@@ -79,10 +92,10 @@ class InvalidAuthenticationTypeException(exceptions.NeutronException):
     def __init__(self, **kwargs):
         if 'valid_auth_types' not in kwargs:
             kwargs['valid_auth_types'] = ', '.join(VALID_AUTH_TYPES)
-        super(InvalidAuthenticationTypeException, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
 
-class KeepalivedVipAddress(object):
+class KeepalivedVipAddress:
     """A virtual address entry of a keepalived configuration."""
 
     def __init__(self, ip_address, interface_name, scope=None, track=True):
@@ -96,21 +109,21 @@ class KeepalivedVipAddress(object):
                 self.ip_address == other.ip_address)
 
     def __str__(self):
-        return '[%s, %s, %s, %s]' % (self.ip_address,
-                                     self.interface_name,
-                                     self.scope,
-                                     self.track)
+        return '[{}, {}, {}, {}]'.format(self.ip_address,
+                                         self.interface_name,
+                                         self.scope,
+                                         self.track)
 
     def build_config(self):
-        result = '%s dev %s' % (self.ip_address, self.interface_name)
+        result = f'{self.ip_address} dev {self.interface_name}'
         if self.scope:
             result += ' scope %s' % self.scope
-        if not self.track:
+        if not self.track and _is_keepalived_use_no_track_supported():
             result += ' no_track'
         return result
 
 
-class KeepalivedVirtualRoute(object):
+class KeepalivedVirtualRoute:
     """A virtual route entry of a keepalived configuration."""
 
     def __init__(self, destination, nexthop, interface_name=None,
@@ -128,11 +141,17 @@ class KeepalivedVirtualRoute(object):
             output += ' dev %s' % self.interface_name
         if self.scope:
             output += ' scope %s' % self.scope
-        output += ' no_track'
+        if _is_keepalived_use_no_track_supported():
+            output += ' no_track'
+        # NOTE(mstinsky): neutron and keepalived are adding the same routes on
+        # primary routers. With this we ensure that both are adding the routes
+        # with the same procotol and prevent duplicated routes which result in
+        # neutron exception for ip route commands.
+        output += ' protocol static'
         return output
 
 
-class KeepalivedInstanceRoutes(object):
+class KeepalivedInstanceRoutes:
     def __init__(self):
         self.gateway_routes = []
         self.extra_routes = []
@@ -161,13 +180,13 @@ class KeepalivedInstanceRoutes(object):
                                ['    }'])
 
 
-class KeepalivedInstance(object):
+class KeepalivedInstance:
     """Instance section of a keepalived configuration."""
 
     def __init__(self, state, interface, vrouter_id, ha_cidrs,
-                 priority=HA_DEFAULT_PRIORITY, advert_int=None,
-                 mcast_src_ip=None, nopreempt=False,
-                 garp_master_delay=GARP_MASTER_DELAY,
+                 priority=HA_DEFAULT_PRIORITY,
+                 advert_int=None, mcast_src_ip=None, nopreempt=False,
+                 garp_primary_delay=GARP_PRIMARY_DELAY,
                  vrrp_health_check_interval=0,
                  ha_conf_dir=None):
         self.name = 'VR_%s' % vrouter_id
@@ -182,7 +201,7 @@ class KeepalivedInstance(object):
         self.nopreempt = nopreempt
         self.advert_int = advert_int
         self.mcast_src_ip = mcast_src_ip
-        self.garp_master_delay = garp_master_delay
+        self.garp_primary_delay = garp_primary_delay
         self.track_interfaces = []
         self.vips = []
         self.virtual_routes = KeepalivedInstanceRoutes()
@@ -244,7 +263,8 @@ class KeepalivedInstance(object):
 
         ip = (netaddr.IPNetwork(self.primary_vip_range).network +
               self.vrouter_id)
-        return str(netaddr.IPNetwork('%s/%s' % (ip, PRIMARY_VIP_RANGE_SIZE)))
+        return str(netaddr.IPNetwork('{}/{}'.format(
+            ip, PRIMARY_VIP_RANGE_SIZE)))
 
     def _build_vips_config(self):
         # NOTE(amuller): The primary VIP must be consistent in order to avoid
@@ -294,7 +314,7 @@ class KeepalivedInstance(object):
                        '    interface %s' % self.interface,
                        '    virtual_router_id %s' % self.vrouter_id,
                        '    priority %s' % self.priority,
-                       '    garp_master_delay %s' % self.garp_master_delay])
+                       '    garp_master_delay %s' % self.garp_primary_delay])
 
         if self.nopreempt:
             config.append('    nopreempt')
@@ -329,7 +349,7 @@ class KeepalivedInstance(object):
         return config
 
 
-class KeepalivedConf(object):
+class KeepalivedConf:
     """A keepalived configuration."""
 
     def __init__(self):
@@ -364,7 +384,7 @@ class KeepalivedConf(object):
         return '\n'.join(self.build_config())
 
 
-class KeepalivedManager(object):
+class KeepalivedManager:
     """Wrapper for keepalived.
 
     This wrapper permits to write keepalived config files, to start/restart
@@ -380,7 +400,7 @@ class KeepalivedManager(object):
         self.process_monitor = process_monitor
         self.conf_path = conf_path
         # configure throttler for spawn to introduce delay between SIGHUPs,
-        # otherwise keepalived master may unnecessarily flip to slave
+        # otherwise keepalived primary may unnecessarily flip to backup
         if throttle_restart_value is not None:
             self._throttle_spawn(throttle_restart_value)
 
@@ -408,15 +428,6 @@ class KeepalivedManager(object):
 
         return config_path
 
-    @staticmethod
-    def _safe_remove_pid_file(pid_file):
-        try:
-            os.remove(pid_file)
-        except OSError as e:
-            if e.errno != errno.ENOENT:
-                LOG.error("Could not delete file %s, keepalived can "
-                          "refuse to start.", pid_file)
-
     def get_vrrp_pid_file_name(self, base_pid_file):
         return '%s-vrrp' % base_pid_file
 
@@ -425,7 +436,7 @@ class KeepalivedManager(object):
         try:
             with open(config_path) as conf:
                 return conf.read()
-        except (OSError, IOError) as e:
+        except OSError as e:
             if e.errno != errno.ENOENT:
                 raise
 
@@ -456,7 +467,15 @@ class KeepalivedManager(object):
                                         service_name=KEEPALIVED_SERVICE_NAME)
 
         pm = self.get_process()
-        pm.disable(sig='15')
+        pm.disable(sig=str(int(signal.SIGTERM)))
+        try:
+            utils.wait_until_true(lambda: not pm.active,
+                                  timeout=SIGTERM_TIMEOUT)
+        except utils.WaitTimeout:
+            LOG.warning('Keepalived process %s did not finish after SIGTERM '
+                        'signal in %s seconds, sending SIGKILL signal',
+                        pm.pid, SIGTERM_TIMEOUT)
+            pm.disable(sig=str(int(signal.SIGKILL)))
 
     def check_processes(self):
         keepalived_pm = self.get_process()
@@ -486,11 +505,12 @@ class KeepalivedManager(object):
             # will be orphan and prevent keepalived process to be spawned.
             # A check here will let the l3-agent to kill the orphan process
             # and spawn keepalived successfully.
+            # Also removes stale pid file
             if vrrp_pm.active:
-                vrrp_pm.disable()
+                vrrp_pm.disable(delete_pid_file=False)
 
-            self._safe_remove_pid_file(pid_file)
-            self._safe_remove_pid_file(self.get_vrrp_pid_file_name(pid_file))
+            linux_utils.delete_if_exists(self.get_vrrp_pid_file_name(pid_file),
+                                         run_as_root=vrrp_pm.run_as_root)
 
             cmd = ['keepalived', '-P',
                    '-f', config_path,
@@ -515,7 +535,7 @@ class KeepalivedTrackScript(KeepalivedConf):
 
     def build_config_preamble(self):
         config = ['',
-                  'vrrp_script %s_%s {' % (HEALTH_CHECK_NAME, self.vr_id),
+                  f'vrrp_script {HEALTH_CHECK_NAME}_{self.vr_id} {{',
                   '    script "%s"' % self._get_script_location(),
                   '    interval %s' % self.interval,
                   '    fall 2',
@@ -537,7 +557,7 @@ class KeepalivedTrackScript(KeepalivedConf):
             return ''
 
         config = ['    track_script {',
-                  '        %s_%s' % (HEALTH_CHECK_NAME, self.vr_id),
+                  f'        {HEALTH_CHECK_NAME}_{self.vr_id}',
                   '    }']
 
         return config
@@ -555,7 +575,7 @@ class KeepalivedTrackScript(KeepalivedConf):
             6: 'ping6',
         }.get(netaddr.IPAddress(ip_addr).version)
 
-        return '%s -c 1 -w 1 %s 1>/dev/null || exit 1' % (cmd, ip_addr)
+        return f'{cmd} -c 1 -w 1 {ip_addr} 1>/dev/null || exit 1'
 
     def _check_ip_assigned(self):
         cmd = 'ip a | grep %s || exit 0'

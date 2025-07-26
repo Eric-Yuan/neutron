@@ -13,8 +13,8 @@
 from unittest import mock
 
 from neutron_lib.api.definitions import fip_pf_description as ext_apidef
+from neutron_lib.api.definitions import fip_pf_port_range as ext_range_apidef
 from neutron_lib.api.definitions import floating_ip_port_forwarding as apidef
-from neutron_lib.callbacks import exceptions as c_exc
 from neutron_lib import exceptions as lib_exc
 from neutron_lib.exceptions import l3 as lib_l3_exc
 from neutron_lib.plugins import constants as plugin_constants
@@ -30,7 +30,7 @@ from neutron.tests.unit.plugins.ml2 import base as ml2_test_base
 class PortForwardingTestCaseBase(ml2_test_base.ML2TestFramework,
                                  functional_base.BaseLoggingTestCase):
     def setUp(self):
-        super(PortForwardingTestCaseBase, self).setUp()
+        super().setUp()
         self.pf_plugin = pf_plugin.PortForwardingPlugin()
         directory.add_plugin(plugin_constants.PORTFORWARDING, self.pf_plugin)
 
@@ -85,7 +85,7 @@ class PortForwardingTestCaseBase(ml2_test_base.ML2TestFramework,
 
 class PortForwardingTestCase(PortForwardingTestCaseBase):
     def setUp(self):
-        super(PortForwardingTestCase, self).setUp()
+        super().setUp()
         self._prepare_env()
 
     def _get_network_port_ips(self):
@@ -98,7 +98,8 @@ class PortForwardingTestCase(PortForwardingTestCaseBase):
     def _prepare_env(self):
         self.router = self._create_router(distributed=True)
         self.ext_net = self._create_network(
-            self.fmt, 'ext-net', True, arg_list=("router:external",),
+            self.fmt, 'ext-net', True, as_admin=True,
+            arg_list=("router:external",),
             **{"router:external": True}).json['network']
         self.ext_subnet = self._create_subnet(
             self.fmt, self.ext_net['id'], '172.24.2.0/24').json['subnet']
@@ -121,6 +122,8 @@ class PortForwardingTestCase(PortForwardingTestCaseBase):
             apidef.RESOURCE_NAME:
                 {apidef.EXTERNAL_PORT: 2225,
                  apidef.INTERNAL_PORT: 25,
+                 ext_range_apidef.EXTERNAL_PORT_RANGE: '2225:2225',
+                 ext_range_apidef.INTERNAL_PORT_RANGE: '25:25',
                  apidef.INTERNAL_PORT_ID: self.port['id'],
                  apidef.PROTOCOL: "tcp",
                  ext_apidef.DESCRIPTION_FIELD: 'Some description',
@@ -140,6 +143,8 @@ class PortForwardingTestCase(PortForwardingTestCaseBase):
         expect = {
             "external_port": 2225,
             "internal_port": 25,
+            "internal_port_range": '25:25',
+            "external_port_range": '2225:2225',
             "internal_port_id": self.port['id'],
             "protocol": "tcp",
             "internal_ip_address": self.port['fixed_ips'][0]['ip_address'],
@@ -202,6 +207,8 @@ class PortForwardingTestCase(PortForwardingTestCaseBase):
         expect = {
             "external_port": 2225,
             "internal_port": 25,
+            "external_port_range": '2225:2225',
+            "internal_port_range": '25:25',
             "internal_port_id": self.port['id'],
             "protocol": "tcp",
             "internal_ip_address": self.port['fixed_ips'][0]['ip_address'],
@@ -243,6 +250,8 @@ class PortForwardingTestCase(PortForwardingTestCaseBase):
         expect = {
             "external_port": 2226,
             "internal_port": 26,
+            "external_port_range": '2226:2226',
+            "internal_port_range": '26:26',
             "internal_port_id": self.port['id'],
             "protocol": "udp",
             "internal_ip_address": self.port['fixed_ips'][0]['ip_address'],
@@ -270,7 +279,9 @@ class PortForwardingTestCase(PortForwardingTestCaseBase):
             self.context, res['id'], self.fip['id'], update_body)
         expect = {
             "external_port": 2227,
+            "external_port_range": '2227:2227',
             "internal_port": 27,
+            "internal_port_range": '27:27',
             "internal_port_id": new_port['id'],
             "protocol": "tcp",
             "internal_ip_address": new_port['fixed_ips'][0]['ip_address'],
@@ -317,12 +328,17 @@ class PortForwardingTestCase(PortForwardingTestCaseBase):
         # There is already a port forwarding. We create another port forwarding
         # with the new_port, and update the new one with the same params of the
         # existing one.
-        new_port = self._create_port(self.fmt, self.net['id']).json['port']
+        fixed_ips = [{'subnet_id': self.subnet['id']}]
+        new_port = self._create_port(self.fmt, self.net['id'],
+                                     fixed_ips=fixed_ips).json['port']
         self.port_forwarding[apidef.RESOURCE_NAME].update({
             'internal_port_id': new_port['id'],
             'internal_ip_address': new_port['fixed_ips'][0]['ip_address'],
             'external_port': self.port_forwarding[
-                                 apidef.RESOURCE_NAME]['external_port'] + 1
+                                 apidef.RESOURCE_NAME]['external_port'] + 1,
+            'external_port_range': '{port}:{port}'.format(
+                port=self.port_forwarding[
+                            apidef.RESOURCE_NAME]['external_port'] + 1)
         })
         new_res = self.pf_plugin.create_floatingip_port_forwarding(
             self.context, self.fip['id'], self.port_forwarding)
@@ -346,6 +362,7 @@ class PortForwardingTestCase(PortForwardingTestCaseBase):
         new_port = self._create_port(self.fmt, self.net['id']).json['port']
         self.port_forwarding[apidef.RESOURCE_NAME].update({
             'external_port': 2226,
+            'external_port_range': '2226:2226',
             'internal_port_id': new_port['id'],
             'internal_ip_address': new_port['fixed_ips'][0]['ip_address']
         })
@@ -387,76 +404,14 @@ class PortForwardingTestCase(PortForwardingTestCaseBase):
                           self.pf_plugin.delete_floatingip_port_forwarding,
                           self.context, res['id'], uuidutils.generate_uuid())
 
-    def test_concurrent_create_port_forwarding_delete_fip(self):
-
-        func1 = self.pf_plugin.create_floatingip_port_forwarding
-        func2 = self._delete_floatingip
-        funcs = [func1, func2]
-        args_list = [(self.context, self.fip['id'], self.port_forwarding),
-                     (self.fip['id'],)]
-        self.assertRaises(c_exc.CallbackFailure,
-                          self._simulate_concurrent_requests_process_and_raise,
-                          funcs, args_list)
-
-        port_forwardings = self.pf_plugin.get_floatingip_port_forwardings(
-            self.context, floatingip_id=self.fip['id'], fields=['id'])
-        self.pf_plugin.delete_floatingip_port_forwarding(
-            self.context, port_forwardings[0][apidef.ID],
-            floatingip_id=self.fip['id'])
-
-        funcs.reverse()
-        args_list.reverse()
-        self.assertRaises(lib_l3_exc.FloatingIPNotFound,
-                          self._simulate_concurrent_requests_process_and_raise,
-                          funcs, args_list)
-
-    def test_concurrent_create_port_forwarding_update_fip(self):
-        newport = self._create_port(self.fmt, self.net['id']).json['port']
-        func1 = self.pf_plugin.create_floatingip_port_forwarding
-        func2 = self._update_floatingip
-        funcs = [func1, func2]
-        args_list = [(self.context, self.fip['id'], self.port_forwarding),
-                     (self.fip['id'], {'port_id': newport['id']})]
-        self.assertRaises(c_exc.CallbackFailure,
-                          self._simulate_concurrent_requests_process_and_raise,
-                          funcs, args_list)
-
-        funcs.reverse()
-        args_list.reverse()
-        self.assertRaises(c_exc.CallbackFailure,
-                          self._simulate_concurrent_requests_process_and_raise,
-                          funcs, args_list)
-
-    def test_concurrent_create_port_forwarding_update_port(self):
-        new_ip = self._find_ip_address(
-            self.subnet,
-            exclude=self._get_network_port_ips(),
-            is_random=True)
-        funcs = [self.pf_plugin.create_floatingip_port_forwarding,
-                 self._update_port]
-        args_list = [(self.context, self.fip['id'], self.port_forwarding),
-                     (self.port['id'], {
-                         'fixed_ips': [{'subnet_id': self.subnet['id'],
-                                        'ip_address': new_ip}]})]
-        self._simulate_concurrent_requests_process_and_raise(funcs, args_list)
-        self.assertEqual([], self.pf_plugin.get_floatingip_port_forwardings(
-            self.context, floatingip_id=self.fip['id']))
-
-    def test_concurrent_create_port_forwarding_delete_port(self):
-        funcs = [self.pf_plugin.create_floatingip_port_forwarding,
-                 self._delete_port]
-        args_list = [(self.context, self.fip['id'], self.port_forwarding),
-                     (self.port['id'],)]
-        self._simulate_concurrent_requests_process_and_raise(funcs, args_list)
-        self.assertEqual([], self.pf_plugin.get_floatingip_port_forwardings(
-            self.context, floatingip_id=self.fip['id']))
-
     def test_create_floatingip_port_forwarding_port_in_use(self):
         res = self.pf_plugin.create_floatingip_port_forwarding(
             self.context, self.fip['id'], self.port_forwarding)
         expected = {
             "external_port": 2225,
             "internal_port": 25,
+            "external_port_range": '2225:2225',
+            "internal_port_range": '25:25',
             "internal_port_id": self.port['id'],
             "protocol": "tcp",
             "internal_ip_address": self.port['fixed_ips'][0]['ip_address'],

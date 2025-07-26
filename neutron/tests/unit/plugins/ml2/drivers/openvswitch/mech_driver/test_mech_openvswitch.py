@@ -20,11 +20,10 @@ from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib import constants
 from neutron_lib.plugins.ml2 import api
+from neutron_lib.plugins.ml2 import ovs_constants as a_const
 from oslo_config import cfg
 
 from neutron.conf.plugins.ml2.drivers.openvswitch import mech_ovs_conf
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import (
-    constants as a_const)
 from neutron.plugins.ml2.drivers.openvswitch.mech_driver import (
     mech_openvswitch)
 from neutron.tests.unit.plugins.ml2 import _test_mech_agent as base
@@ -44,6 +43,7 @@ class OpenvswitchMechanismBaseTestCase(base.AgentMechanismBaseTestCase):
     GOOD_TUNNEL_TYPES = ['gre', 'vxlan']
     GOOD_CONFIGS = {'bridge_mappings': GOOD_MAPPINGS,
                     'integration_bridge': 'br-int',
+                    portbindings.OVS_HYBRID_PLUG: True,
                     'tunnel_types': GOOD_TUNNEL_TYPES}
 
     BAD_MAPPINGS = {'wrong_physical_network': 'wrong_bridge'}
@@ -54,19 +54,27 @@ class OpenvswitchMechanismBaseTestCase(base.AgentMechanismBaseTestCase):
 
     AGENTS = [{'alive': True,
                'configurations': GOOD_CONFIGS,
-               'host': 'host'}]
+               'host': 'host',
+               'agent_type': AGENT_TYPE,
+               }]
     AGENTS_DEAD = [{'alive': False,
                     'configurations': GOOD_CONFIGS,
-                    'host': 'dead_host'}]
+                    'host': 'dead_host',
+                    'agent_type': AGENT_TYPE,
+                    }]
     AGENTS_BAD = [{'alive': False,
                    'configurations': GOOD_CONFIGS,
-                   'host': 'bad_host_1'},
+                   'host': 'bad_host_1',
+                   'agent_type': AGENT_TYPE,
+                   },
                   {'alive': True,
                    'configurations': BAD_CONFIGS,
-                   'host': 'bad_host_2'}]
+                   'host': 'bad_host_2',
+                   'agent_type': AGENT_TYPE,
+                   }]
 
     def setUp(self):
-        super(OpenvswitchMechanismBaseTestCase, self).setUp()
+        super().setUp()
         cfg.CONF.set_override('firewall_driver', 'iptables_hybrid',
                               'SECURITYGROUP')
         self.driver = mech_openvswitch.OpenvswitchMechanismDriver()
@@ -93,7 +101,7 @@ class OpenvswitchMechanismBaseTestCase(base.AgentMechanismBaseTestCase):
             fake_vif_details.get(portbindings.VIF_DETAILS_BRIDGE_NAME, ''))
         # replace callback with noop
         registry.unsubscribe(fake_callback, a_const.OVS_BRIDGE_NAME,
-                           events.BEFORE_READ)
+                             events.BEFORE_READ)
         registry.subscribe(noop_callback, a_const.OVS_BRIDGE_NAME,
                            events.BEFORE_READ)
         fake_vif_details = {}
@@ -119,11 +127,23 @@ class OpenvswitchMechanismSGDisabledBaseTestCase(
                    portbindings.VIF_DETAILS_CONNECTIVITY:
                        portbindings.CONNECTIVITY_L2}
 
+    GOOD_MAPPINGS = {'fake_physical_network': 'fake_bridge'}
+    GOOD_TUNNEL_TYPES = ['gre', 'vxlan']
+    GOOD_CONFIGS = {'bridge_mappings': GOOD_MAPPINGS,
+                    'integration_bridge': 'br-int',
+                    portbindings.OVS_HYBRID_PLUG: False,
+                    'tunnel_types': GOOD_TUNNEL_TYPES}
+    AGENTS = [{'alive': True,
+               'configurations': GOOD_CONFIGS,
+               'host': 'host',
+               'agent_type': constants.AGENT_TYPE_OVS,
+               }]
+
     def setUp(self):
         cfg.CONF.set_override('enable_security_group',
                               False,
                               group='SECURITYGROUP')
-        super(OpenvswitchMechanismSGDisabledBaseTestCase, self).setUp()
+        super().setUp()
 
 
 class OpenvswitchMechanismHybridPlugTestCase(OpenvswitchMechanismBaseTestCase):
@@ -133,17 +153,6 @@ class OpenvswitchMechanismHybridPlugTestCase(OpenvswitchMechanismBaseTestCase):
         return base.FakePortContext(self.AGENT_TYPE, agents, segments,
                                     vnic_type=self.VNIC_TYPE)
 
-    def test_backward_compat_with_unreporting_agent(self):
-        hybrid = portbindings.OVS_HYBRID_PLUG
-        # agent didn't report so it should be hybrid based on server config
-        context = self._make_port_ctx(self.AGENTS)
-        self.driver.bind_port(context)
-        self.assertTrue(context._bound_vif_details[hybrid])
-        self.driver.vif_details[hybrid] = False
-        context = self._make_port_ctx(self.AGENTS)
-        self.driver.bind_port(context)
-        self.assertFalse(context._bound_vif_details[hybrid])
-
     def test_hybrid_plug_true_if_agent_requests(self):
         hybrid = portbindings.OVS_HYBRID_PLUG
         # set server side default to false and ensure that hybrid becomes
@@ -151,7 +160,9 @@ class OpenvswitchMechanismHybridPlugTestCase(OpenvswitchMechanismBaseTestCase):
         self.driver.vif_details[hybrid] = False
         agents = [{'alive': True,
                    'configurations': {hybrid: True},
-                   'host': 'host'}]
+                   'host': 'host',
+                   'agent_type': self.AGENT_TYPE,
+                   }]
         context = self._make_port_ctx(agents)
         self.driver.bind_port(context)
         self.assertTrue(context._bound_vif_details[hybrid])
@@ -163,7 +174,9 @@ class OpenvswitchMechanismHybridPlugTestCase(OpenvswitchMechanismBaseTestCase):
         self.driver.vif_details[hybrid] = True
         agents = [{'alive': True,
                    'configurations': {hybrid: False},
-                   'host': 'host'}]
+                   'host': 'host',
+                   'agent_type': self.AGENT_TYPE,
+                   }]
         context = self._make_port_ctx(agents)
         self.driver.bind_port(context)
         self.assertFalse(context._bound_vif_details[hybrid])
@@ -171,16 +184,85 @@ class OpenvswitchMechanismHybridPlugTestCase(OpenvswitchMechanismBaseTestCase):
 
 class OpenvswitchMechanismGenericTestCase(OpenvswitchMechanismBaseTestCase,
                                           base.AgentMechanismGenericTestCase):
-    def test_driver_responsible_for_ports_allocation(self):
+    def test_driver_responsible_for_ports_allocation_min_bw(self):
         agents = [
-            {'agent_type': 'Open vSwitch agent',
+            {'agent_type': constants.AGENT_TYPE_OVS,
              'configurations': {'resource_provider_bandwidths': {'eth0': {}}},
              'id': '1',
              'host': 'host'}
         ]
         segments = []
+
         # uuid -v5 87ee7d5c-73bb-11e8-9008-c4d987b2a692 host:eth0
-        profile = {'allocation': '13cc0ed9-e802-5eaa-b4c7-3441855e31f2'}
+        fake_min_bw_rp = '13cc0ed9-e802-5eaa-b4c7-3441855e31f2'
+        fake_allocation = {
+            'fake_min_bw_resource_request_group': fake_min_bw_rp,
+        }
+        profile = {'allocation': fake_allocation}
+
+        port_ctx = base.FakePortContext(
+            self.AGENT_TYPE,
+            agents,
+            segments,
+            vnic_type=portbindings.VNIC_NORMAL,
+            profile=profile)
+        with mock.patch.object(self.driver, '_possible_agents_for_port',
+                               return_value=agents):
+            self.assertTrue(
+                self.driver.responsible_for_ports_allocation(port_ctx))
+
+    def test_driver_responsible_for_ports_allocation_min_pps(self):
+        agents = [
+            {'agent_type': constants.AGENT_TYPE_OVS,
+             'configurations': {
+                 'resource_provider_packet_processing_with_direction': {
+                     'host': {}}},
+             'id': '1',
+             'host': 'host'}
+        ]
+        segments = []
+
+        # uuid -v5 87ee7d5c-73bb-11e8-9008-c4d987b2a692 host
+        fake_min_pps_rp = '791f63f0-1a1a-5c38-8972-5e43014fd58b'
+        fake_allocation = {
+            'fake_min_pps_resource_request_group': fake_min_pps_rp,
+        }
+        profile = {'allocation': fake_allocation}
+
+        port_ctx = base.FakePortContext(
+            self.AGENT_TYPE,
+            agents,
+            segments,
+            vnic_type=portbindings.VNIC_NORMAL,
+            profile=profile)
+        with mock.patch.object(self.driver, '_possible_agents_for_port',
+                               return_value=agents):
+            self.assertTrue(
+                self.driver.responsible_for_ports_allocation(port_ctx))
+
+    def test_driver_responsible_for_ports_allocation_min_pps_and_min_bw(self):
+        agents = [{
+            'agent_type': constants.AGENT_TYPE_OVS,
+            'configurations': {
+                'resource_provider_packet_processing_without_direction': {
+                    'host': {}
+                },
+                'resource_provider_bandwidths': {'eth0': {}}
+            },
+            'id': '1',
+            'host': 'host'
+        }]
+        segments = []
+
+        # uuid -v5 87ee7d5c-73bb-11e8-9008-c4d987b2a692 host
+        fake_min_pps_rp = '791f63f0-1a1a-5c38-8972-5e43014fd58b'
+        # uuid -v5 87ee7d5c-73bb-11e8-9008-c4d987b2a692 host:eth0
+        fake_min_bw_rp = '13cc0ed9-e802-5eaa-b4c7-3441855e31f2'
+        fake_allocation = {
+            'fake_min_pps_resource_request_group': fake_min_pps_rp,
+            'fake_min_bw_resource_request_group': fake_min_bw_rp,
+        }
+        profile = {'allocation': fake_allocation}
 
         port_ctx = base.FakePortContext(
             self.AGENT_TYPE,
@@ -227,7 +309,7 @@ class OpenvswitchMechanismFirewallUndefinedTestCase(
         # this simple test case just ensures backward compatibility where
         # the server has no firewall driver configured, which should result
         # in hybrid plugging.
-        super(OpenvswitchMechanismFirewallUndefinedTestCase, self).setUp()
+        super().setUp()
         cfg.CONF.set_override('firewall_driver', '', 'SECURITYGROUP')
         self.driver = mech_openvswitch.OpenvswitchMechanismDriver()
         self.driver.initialize()
@@ -240,18 +322,19 @@ class OpenvswitchMechanismDPDKTestCase(OpenvswitchMechanismBaseTestCase):
     GOOD_TUNNEL_TYPES = ['gre', 'vxlan']
 
     VHOST_CONFIGS = {'bridge_mappings': GOOD_MAPPINGS,
-                    'integration_bridge': 'br-int',
-                    'tunnel_types': GOOD_TUNNEL_TYPES,
-                    'datapath_type': a_const.OVS_DATAPATH_NETDEV,
-                    'ovs_capabilities': {
-                        'iface_types': [a_const.OVS_DPDK_VHOST_USER]}}
+                     'integration_bridge': 'br-int',
+                     'tunnel_types': GOOD_TUNNEL_TYPES,
+                     'datapath_type': a_const.OVS_DATAPATH_NETDEV,
+                     'ovs_capabilities': {
+                         'iface_types': [a_const.OVS_DPDK_VHOST_USER]}}
 
     VHOST_SERVER_CONFIGS = {'bridge_mappings': GOOD_MAPPINGS,
-                    'integration_bridge': 'br-int',
-                    'tunnel_types': GOOD_TUNNEL_TYPES,
-                    'datapath_type': a_const.OVS_DATAPATH_NETDEV,
-                    'ovs_capabilities': {
-                        'iface_types': [a_const.OVS_DPDK_VHOST_USER_CLIENT]}}
+                            'integration_bridge': 'br-int',
+                            'tunnel_types': GOOD_TUNNEL_TYPES,
+                            'datapath_type': a_const.OVS_DATAPATH_NETDEV,
+                            'ovs_capabilities': {
+                                'iface_types':
+                                    [a_const.OVS_DPDK_VHOST_USER_CLIENT]}}
 
     SYSTEM_CONFIGS = {'bridge_mappings': GOOD_MAPPINGS,
                       'integration_bridge': 'br-int',
@@ -332,28 +415,30 @@ class OpenvswitchMechVnicTypesTestCase(OpenvswitchMechanismBaseTestCase):
 
     supported_vnics = [portbindings.VNIC_NORMAL,
                        portbindings.VNIC_DIRECT,
-                       portbindings.VNIC_SMARTNIC]
+                       portbindings.VNIC_SMARTNIC,
+                       portbindings.VNIC_VHOST_VDPA,
+                       ]
 
     def setUp(self):
-        self.blacklist_cfg = {
+        self.prohibit_list_cfg = {
             'OVS_DRIVER': {
-                'vnic_type_blacklist': []
+                'vnic_type_prohibit_list': []
             }
         }
         self.default_supported_vnics = self.supported_vnics
-        super(OpenvswitchMechVnicTypesTestCase, self).setUp()
+        super().setUp()
 
     def test_default_vnic_types(self):
         self.assertEqual(self.default_supported_vnics,
                          self.driver.supported_vnic_types)
 
-    def test_vnic_type_blacklist_valid_item(self):
-        self.blacklist_cfg['OVS_DRIVER']['vnic_type_blacklist'] = \
+    def test_vnic_type_prohibit_list_valid_item(self):
+        self.prohibit_list_cfg['OVS_DRIVER']['vnic_type_prohibit_list'] = \
             [portbindings.VNIC_DIRECT]
 
         fake_conf = cfg.CONF
         fake_conf_fixture = base.MechDriverConfFixture(
-            fake_conf, self.blacklist_cfg,
+            fake_conf, self.prohibit_list_cfg,
             mech_ovs_conf.register_ovs_mech_driver_opts)
         self.useFixture(fake_conf_fixture)
 
@@ -364,24 +449,25 @@ class OpenvswitchMechVnicTypesTestCase(OpenvswitchMechanismBaseTestCase):
         self.assertEqual(len(self.default_supported_vnics) - 1,
                          len(supported_vnic_types))
 
-    def test_vnic_type_blacklist_not_valid_item(self):
-        self.blacklist_cfg['OVS_DRIVER']['vnic_type_blacklist'] = ['foo']
+    def test_vnic_type_prohibit_list_not_valid_item(self):
+        self.prohibit_list_cfg['OVS_DRIVER']['vnic_type_prohibit_list'] = \
+            ['foo']
 
         fake_conf = cfg.CONF
         fake_conf_fixture = base.MechDriverConfFixture(
-            fake_conf, self.blacklist_cfg,
+            fake_conf, self.prohibit_list_cfg,
             mech_ovs_conf.register_ovs_mech_driver_opts)
         self.useFixture(fake_conf_fixture)
 
         self.assertRaises(ValueError,
                           mech_openvswitch.OpenvswitchMechanismDriver)
 
-    def test_vnic_type_blacklist_all_items(self):
-        self.blacklist_cfg['OVS_DRIVER']['vnic_type_blacklist'] = \
+    def test_vnic_type_prohibit_list_all_items(self):
+        self.prohibit_list_cfg['OVS_DRIVER']['vnic_type_prohibit_list'] = \
             self.supported_vnics
         fake_conf = cfg.CONF
         fake_conf_fixture = base.MechDriverConfFixture(
-            fake_conf, self.blacklist_cfg,
+            fake_conf, self.prohibit_list_cfg,
             mech_ovs_conf.register_ovs_mech_driver_opts)
         self.useFixture(fake_conf_fixture)
 

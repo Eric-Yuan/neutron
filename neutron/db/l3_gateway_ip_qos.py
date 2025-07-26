@@ -18,6 +18,7 @@
 from neutron_lib.api.definitions import l3 as l3_apidef
 from neutron_lib.api.definitions import qos_gateway_ip
 from neutron_lib.api import extensions
+from neutron_lib.db import api as db_api
 from neutron_lib.db import resource_extend
 from neutron_lib.services.qos import constants as qos_consts
 from oslo_log import log as logging
@@ -38,10 +39,17 @@ class L3_gw_ip_qos_dbonly_mixin(l3_gwmode_db.L3_NAT_dbonly_mixin):
     @staticmethod
     @resource_extend.extends([l3_apidef.ROUTERS])
     def _extend_router_dict_gw_qos(router_res, router_db):
-        if router_db.gw_port_id and router_db.get('qos_policy_binding'):
-            policy_id = router_db.qos_policy_binding.policy_id
-            router_res[l3_apidef.EXTERNAL_GW_INFO].update(
-                {qos_consts.QOS_POLICY_ID: policy_id})
+        if router_db.gw_port and (
+                router_db.qos_policy_binding or
+                router_db.gw_port.qos_network_policy_binding):
+            qos_bind = router_db.qos_policy_binding
+            qos_net_bind = router_db.gw_port.qos_network_policy_binding
+            policy_id = qos_bind.policy_id if qos_bind else None
+            net_policy_id = qos_net_bind.policy_id if qos_net_bind else None
+            router_res[l3_apidef.EXTERNAL_GW_INFO].update({
+                qos_consts.QOS_POLICY_ID: policy_id})
+            router_res[qos_consts.QOS_POLICY_ID] = policy_id
+            router_res[qos_consts.QOS_NETWORK_POLICY_ID] = net_policy_id
 
     @property
     def _is_gw_ip_qos_supported(self):
@@ -57,17 +65,21 @@ class L3_gw_ip_qos_dbonly_mixin(l3_gwmode_db.L3_NAT_dbonly_mixin):
 
     def _delete_gw_ip_qos_db(self, context, router_id, policy_id):
         policy = policy_object.QosPolicy.get_policy_obj(context, policy_id)
-        policy.detach_router(router_id)
+        policy.detach_router(router_id, if_exists=True)
 
-    def _update_router_gw_info(self, context, router_id, info, router=None):
+    def _update_router_gw_info(self, context, router_id, info,
+                               request_body, router=None):
         # Calls superclass, pass router db object for avoiding re-loading
-        router = super(L3_gw_ip_qos_dbonly_mixin,
-                       self)._update_router_gw_info(
-            context, router_id, info, router)
+        router = super()._update_router_gw_info(
+                           context, router_id, info, request_body, router)
 
-        if self._is_gw_ip_qos_supported and router.gw_port:
-            self._update_router_gw_qos_policy(context, router_id,
-                                              info, router)
+        if not self._is_gw_ip_qos_supported:
+            return router
+
+        with db_api.CONTEXT_WRITER.using(context):
+            if not router.gw_port:
+                info = {qos_consts.QOS_POLICY_ID: None}
+            self._update_router_gw_qos_policy(context, router_id, info, router)
 
         return router
 
@@ -77,9 +89,9 @@ class L3_gw_ip_qos_dbonly_mixin(l3_gwmode_db.L3_NAT_dbonly_mixin):
 
     def _update_router_gw_qos_policy(self, context, router_id, info, router):
         if not info or qos_consts.QOS_POLICY_ID not in info:
-            # An explicit 'None' for `qos_polcy_id` indicates to clear
+            # An explicit 'None' for `qos_policy_id` indicates to clear
             # the router gateway IP policy. So if info does not have
-            # the key `qos_polcy_id`, we can not decide what behavior
+            # the key `qos_policy_id`, we can not decide what behavior
             # to be done, then directly return here.
             return
 
@@ -94,16 +106,12 @@ class L3_gw_ip_qos_dbonly_mixin(l3_gwmode_db.L3_NAT_dbonly_mixin):
                                           router_id,
                                           old_qos_policy_id)
 
-        with context.session.begin(subtransactions=True):
-            context.session.refresh(router)
-
         if new_qos_policy_id:
             self._create_gw_ip_qos_db(
                 context, router_id, new_qos_policy_id)
 
     def _build_routers_list(self, context, routers, gw_ports):
-        routers = super(L3_gw_ip_qos_dbonly_mixin,
-                        self)._build_routers_list(
+        routers = super()._build_routers_list(
                             context, routers, gw_ports)
 
         if not self._is_gw_ip_qos_supported:

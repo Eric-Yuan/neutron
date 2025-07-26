@@ -23,9 +23,7 @@ _ec_dispatcher = Dispatcher()
 
 
 def process_revision_directives(context, revision, directives):
-    directives[:] = [
-        directive for directive in _assign_directives(context, directives)
-    ]
+    directives[:] = list(_assign_directives(context, directives))
 
 
 def _assign_directives(context, directives, phase=None):
@@ -59,10 +57,9 @@ def _migration_script_ops(context, directive, phase):
 
     op = ops.MigrationScript(
         new_rev_id(),
-        ops.UpgradeOps(ops=[
-            d for d in _assign_directives(
-                context, directive.upgrade_ops.ops, phase)
-        ]),
+        ops.UpgradeOps(ops=list(
+            _assign_directives(context, directive.upgrade_ops.ops, phase)
+        )),
         ops.DowngradeOps(ops=[]),
         message=directive.message,
         **autogen_kwargs
@@ -79,8 +76,6 @@ def _migration_script_ops(context, directive, phase):
 def _expands(context, directive, phase):
     if phase == 'expand':
         return directive
-    else:
-        return None
 
 
 @_ec_dispatcher.dispatch_for(ops.DropConstraintOp)
@@ -90,35 +85,26 @@ def _expands(context, directive, phase):
 def _contracts(context, directive, phase):
     if phase == 'contract':
         return directive
-    else:
-        return None
 
 
 @_ec_dispatcher.dispatch_for(ops.AlterColumnOp)
 def _alter_column(context, directive, phase):
     is_expand = phase == 'expand'
 
-    if is_expand and (
-        directive.modify_nullable is True
-    ):
+    if is_expand and directive.modify_nullable is True:
         return directive
-    elif not is_expand and (
-        directive.modify_nullable is False
-    ):
+    if not is_expand and directive.modify_nullable is False:
         return directive
-    else:
-        raise NotImplementedError(
-            _("Don't know if operation is an expand or "
-              "contract at the moment: %s") % directive)
+    raise NotImplementedError(
+        _("Don't know if operation is an expand or "
+          "contract at the moment: %s") % directive)
 
 
 @_ec_dispatcher.dispatch_for(ops.ModifyTableOps)
 def _modify_table_ops(context, directive, phase):
     op = ops.ModifyTableOps(
         directive.table_name,
-        ops=[
-            d for d in _assign_directives(context, directive.ops, phase)
-        ],
+        ops=list(_assign_directives(context, directive.ops, phase)),
         schema=directive.schema)
     if not op.is_empty():
         return op

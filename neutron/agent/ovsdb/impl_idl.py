@@ -12,31 +12,18 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from debtcollector import moves
+from neutron_lib.plugins.ml2 import ovs_constants
 from oslo_config import cfg
 from ovsdbapp.backend.ovs_idl import command
 from ovsdbapp.backend.ovs_idl import connection
 from ovsdbapp.backend.ovs_idl import idlutils
-from ovsdbapp.backend.ovs_idl import transaction
 from ovsdbapp.backend.ovs_idl import vlog
 from ovsdbapp.schema.open_vswitch import impl_idl
 
 from neutron.agent.ovsdb.native import connection as n_connection
+from neutron.common import utils
 from neutron.conf.agent import ovs_conf
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants
 
-NeutronOVSDBTransaction = moves.moved_class(
-    impl_idl.OvsVsctlTransaction,
-    'NeutronOVSDBTransaction',
-    __name__)
-
-VswitchdInterfaceAddException = moves.moved_class(
-    impl_idl.VswitchdInterfaceAddException,
-    'VswitchdInterfaceAddException',
-    __name__)
-
-Transaction = moves.moved_class(transaction.Transaction,
-                                'Transaction', __name__)
 
 ovs_conf.register_ovs_agent_opts()
 _connection = None
@@ -56,7 +43,7 @@ def api_factory():
 
 class OvsCleanup(command.BaseCommand):
     def __init__(self, api, bridge, all_ports=False):
-        super(OvsCleanup, self).__init__(api)
+        super().__init__(api)
         self.bridge = bridge
         self.all_ports = all_ports
 
@@ -75,7 +62,7 @@ class OvsCleanup(command.BaseCommand):
         # Deletable defined as "looks like vif port and not set to skip delete"
         if self.all_ports:
             return True
-        if constants.SKIP_CLEANUP in port.external_ids:
+        if ovs_constants.SKIP_CLEANUP in port.external_ids:
             return False
         if not all(field in port.external_ids
                    for field in ('iface-id', 'attached-mac')):
@@ -83,12 +70,13 @@ class OvsCleanup(command.BaseCommand):
         return True
 
 
+@utils.SingletonDecorator
 class NeutronOvsdbIdl(impl_idl.OvsdbIdl):
     def __init__(self, connection, idl_monitor):
         max_level = None if cfg.CONF.OVS.ovsdb_debug else vlog.INFO
         vlog.use_python_logger(max_level=max_level)
         self.idl_monitor = idl_monitor
-        super(NeutronOvsdbIdl, self).__init__(connection)
+        super().__init__(connection)
 
     def ovs_cleanup(self, bridges, all_ports=False):
         return OvsCleanup(self, bridges, all_ports)

@@ -10,19 +10,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from importlib.metadata import entry_points
+
 from oslo_config import cfg
-import pkg_resources
 
 from neutron._i18n import _
 
 
 MIGRATION_ENTRYPOINTS = 'neutron.db.alembic_migrations'
+
 migration_entrypoints = {
     entrypoint.name: entrypoint
-    for entrypoint in pkg_resources.iter_entry_points(MIGRATION_ENTRYPOINTS)
+    for entrypoint in entry_points(group=MIGRATION_ENTRYPOINTS)
 }
 
-INSTALLED_SUBPROJECTS = [project_ for project_ in migration_entrypoints]
+INSTALLED_SUBPROJECTS = list(migration_entrypoints)
 
 CORE_OPTS = [
     cfg.StrOpt('subproject',

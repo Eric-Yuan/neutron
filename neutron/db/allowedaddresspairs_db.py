@@ -12,10 +12,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
+import collections
 
 from neutron_lib.api.definitions import allowedaddresspairs as addr_apidef
 from neutron_lib.api.definitions import port as port_def
 from neutron_lib.api import validators
+from neutron_lib.callbacks import events
+from neutron_lib.callbacks import registry
+from neutron_lib.callbacks import resources
 from neutron_lib.db import api as db_api
 from neutron_lib.db import resource_extend
 from neutron_lib.db import utils as db_utils
@@ -28,13 +32,25 @@ from neutron.objects.port.extensions import (allowedaddresspairs
 
 
 @resource_extend.has_resource_extenders
-class AllowedAddressPairsMixin(object):
+class AllowedAddressPairsMixin:
     """Mixin class for allowed address pairs."""
 
     def _process_create_allowed_address_pairs(self, context, port,
                                               allowed_address_pairs):
         if not validators.is_attr_set(allowed_address_pairs):
             return []
+
+        desired_state = {
+            'context': context,
+            'network_id': port['network_id'],
+            'allowed_address_pairs': allowed_address_pairs,
+        }
+        registry.publish(
+            resources.ALLOWED_ADDRESS_PAIR, events.BEFORE_CREATE, self,
+            payload=events.DBEventPayload(
+                context,
+                resource_id=port['id'],
+                desired_state=desired_state))
         try:
             with db_api.CONTEXT_WRITER.using(context):
                 for address_pair in allowed_address_pairs:
@@ -65,6 +81,17 @@ class AllowedAddressPairsMixin(object):
         return [self._make_allowed_address_pairs_dict(pair.db_obj)
                 for pair in pairs]
 
+    def get_allowed_address_pairs_for_ports(self, context, port_ids):
+        pairs = (
+            obj_addr_pair.AllowedAddressPair.
+            get_allowed_address_pairs_for_ports(
+                context, port_ids=port_ids))
+        result = collections.defaultdict(list)
+        for pair in pairs:
+            result[pair.port_id].append(
+                self._make_allowed_address_pairs_dict(pair.db_obj))
+        return result
+
     @staticmethod
     @resource_extend.extends([port_def.COLLECTION_NAME])
     def _extend_port_dict_allowed_address_pairs(port_res, port_db):
@@ -91,7 +118,7 @@ class AllowedAddressPairsMixin(object):
 
     def _has_address_pairs(self, port):
         return (validators.is_attr_set(
-                    port['port'][addr_apidef.ADDRESS_PAIRS]) and
+            port['port'][addr_apidef.ADDRESS_PAIRS]) and
                 port['port'][addr_apidef.ADDRESS_PAIRS] != [])
 
     def _check_update_has_allowed_address_pairs(self, port):

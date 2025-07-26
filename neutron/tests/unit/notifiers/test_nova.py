@@ -13,8 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import queue
+import threading
+import time
 from unittest import mock
 
+from keystoneauth1 import exceptions as ks_exc
 from neutron_lib import constants as n_const
 from neutron_lib import context as n_ctx
 from neutron_lib import exceptions as n_exc
@@ -26,6 +30,7 @@ from oslo_config import cfg
 from oslo_utils import uuidutils
 from sqlalchemy.orm import attributes as sql_attr
 
+from neutron.notifiers import batch_notifier
 from neutron.notifiers import nova
 from neutron.objects import ports as port_obj
 from neutron.tests import base
@@ -36,11 +41,11 @@ DEVICE_OWNER_BAREMETAL = n_const.DEVICE_OWNER_BAREMETAL_PREFIX + 'fake'
 
 class TestNovaNotify(base.BaseTestCase):
     def setUp(self, plugin=None):
-        super(TestNovaNotify, self).setUp()
+        super().setUp()
         self.ctx = n_ctx.get_admin_context()
         self.port_uuid = uuidutils.generate_uuid()
 
-        class FakePlugin(object):
+        class FakePlugin:
             def get_port(self, context, port_id):
                 device_id = '32102d7b-1cf4-404d-b50a-97aae1f55f87'
                 return {'device_id': device_id,
@@ -53,16 +58,16 @@ class TestNovaNotify(base.BaseTestCase):
     def test_notify_port_status_all_values(self):
         states = [n_const.PORT_STATUS_ACTIVE, n_const.PORT_STATUS_DOWN,
                   n_const.PORT_STATUS_ERROR, n_const.PORT_STATUS_BUILD,
-                  sql_attr.NO_VALUE]
+                  None]
         device_id = '32102d7b-1cf4-404d-b50a-97aae1f55f87'
         # test all combinations
         for previous_port_status in states:
             for current_port_status in states:
-
-                port = port_obj.Port(self.ctx, id=self.port_uuid,
-                                     device_id=device_id,
-                                     device_owner=DEVICE_OWNER_COMPUTE,
-                                     status=current_port_status)
+                params = {'id': self.port_uuid, 'device_id': device_id,
+                          'device_owner': DEVICE_OWNER_COMPUTE}
+                if current_port_status:
+                    params['status'] = current_port_status
+                port = port_obj.Port(self.ctx, **params)
                 self._record_port_status_changed_helper(current_port_status,
                                                         previous_port_status,
                                                         port)
@@ -139,7 +144,7 @@ class TestNovaNotify(base.BaseTestCase):
         device_id = '32102d7b-1cf4-404d-b50a-97aae1f55f87'
         returned_obj = {'port':
                         {'device_owner': DEVICE_OWNER_COMPUTE,
-                         'id': u'bee50827-bcee-4cc8-91c1-a27b0ce54222',
+                         'id': 'bee50827-bcee-4cc8-91c1-a27b0ce54222',
                          'device_id': device_id}}
 
         expected_event = {'server_uuid': device_id,
@@ -152,7 +157,7 @@ class TestNovaNotify(base.BaseTestCase):
     def test_create_floatingip_notify(self):
         device_id = '32102d7b-1cf4-404d-b50a-97aae1f55f87'
         returned_obj = {'floatingip':
-                        {'port_id': u'bee50827-bcee-4cc8-91c1-a27b0ce54222'}}
+                        {'port_id': 'bee50827-bcee-4cc8-91c1-a27b0ce54222'}}
 
         expected_event = {'server_uuid': device_id,
                           'name': 'network-changed',
@@ -172,7 +177,7 @@ class TestNovaNotify(base.BaseTestCase):
     def test_delete_floatingip_notify(self):
         device_id = '32102d7b-1cf4-404d-b50a-97aae1f55f87'
         returned_obj = {'floatingip':
-                        {'port_id': u'bee50827-bcee-4cc8-91c1-a27b0ce54222'}}
+                        {'port_id': 'bee50827-bcee-4cc8-91c1-a27b0ce54222'}}
 
         expected_event = {'server_uuid': device_id,
                           'name': 'network-changed',
@@ -183,7 +188,8 @@ class TestNovaNotify(base.BaseTestCase):
 
     def test_delete_floatingip_deleted_port_no_notify(self):
         port_id = 'bee50827-bcee-4cc8-91c1-a27b0ce54222'
-        with mock.patch.object(directory.get_plugin(), 'get_port',
+        with mock.patch.object(
+                directory.get_plugin(), 'get_port',
                 side_effect=n_exc.PortNotFound(port_id=port_id)):
             returned_obj = {'floatingip':
                             {'port_id': port_id}}
@@ -202,7 +208,7 @@ class TestNovaNotify(base.BaseTestCase):
     def test_associate_floatingip_notify(self):
         device_id = '32102d7b-1cf4-404d-b50a-97aae1f55f87'
         returned_obj = {'floatingip':
-                        {'port_id': u'5a39def4-3d3f-473d-9ff4-8e90064b9cc1'}}
+                        {'port_id': '5a39def4-3d3f-473d-9ff4-8e90064b9cc1'}}
         original_obj = {'port_id': None}
 
         expected_event = {'server_uuid': device_id,
@@ -235,46 +241,73 @@ class TestNovaNotify(base.BaseTestCase):
             self.assertFalse(send_events.called)
 
     @mock.patch('novaclient.client.Client')
+    def test_nova_send_events_noendpoint_invalidate_session(self, mock_client):
+        create = mock_client().server_external_events.create
+        create.side_effect = ks_exc.EndpointNotFound
+        with mock.patch.object(self.nova_notifier.session,
+                               'invalidate', return_value=True) as mock_sess:
+            self.nova_notifier.send_events([])
+            create.assert_called()
+            mock_sess.assert_called()
+
+    @mock.patch('novaclient.client.Client')
     def test_nova_send_events_returns_bad_list(self, mock_client):
-        mock_client.server_external_events.create.return_value = (
-            'i am a string!')
+        create = mock_client().server_external_events.create
+        create.return_value = 'i am a string!'
         self.nova_notifier.send_events([])
+        create.assert_called()
 
     @mock.patch('novaclient.client.Client')
     def test_nova_send_event_rasies_404(self, mock_client):
-        mock_client.server_external_events.create.return_value = (
-            nova_exceptions.NotFound)
+        create = mock_client().server_external_events.create
+        create.return_value = nova_exceptions.NotFound
         self.nova_notifier.send_events([])
+        create.assert_called()
+
+    @mock.patch('novaclient.client.Client')
+    def test_nova_send_events_raises_connect_exc(self, mock_client):
+        create = mock_client().server_external_events.create
+        create.side_effect = (
+            ks_exc.ConnectFailure, ks_exc.ConnectTimeout, [])
+        self.nova_notifier.send_events([])
+        self.assertEqual(3, create.call_count)
 
     @mock.patch('novaclient.client.Client')
     def test_nova_send_events_raises(self, mock_client):
-        mock_client.server_external_events.create.return_value = Exception
+        create = mock_client().server_external_events.create
+        create.return_value = Exception
         self.nova_notifier.send_events([])
+        create.assert_called()
 
     @mock.patch('novaclient.client.Client')
     def test_nova_send_events_returns_non_200(self, mock_client):
         device_id = '32102d7b-1cf4-404d-b50a-97aae1f55f87'
-        mock_client.server_external_events.create.return_value = [
+        create = mock_client().server_external_events.create
+        create.return_value = [
             {'code': 404,
              'name': 'network-changed',
              'server_uuid': device_id}]
         self.nova_notifier.send_events([{'name': 'network-changed',
                                          'server_uuid': device_id}])
+        create.assert_called()
 
     @mock.patch('novaclient.client.Client')
     def test_nova_send_events_return_200(self, mock_client):
         device_id = '32102d7b-1cf4-404d-b50a-97aae1f55f87'
-        mock_client.server_external_events.create.return_value = [
+        create = mock_client().server_external_events.create
+        create.return_value = [
             {'code': 200,
              'name': 'network-changed',
              'server_uuid': device_id}]
         self.nova_notifier.send_events([{'name': 'network-changed',
                                          'server_uuid': device_id}])
+        create.assert_called()
 
     @mock.patch('novaclient.client.Client')
-    def test_nova_send_events_multiple(self, mock_create):
+    def test_nova_send_events_multiple(self, mock_client):
         device_id = '32102d7b-1cf4-404d-b50a-97aae1f55f87'
-        mock_create.server_external_events.create.return_value = [
+        create = mock_client().server_external_events.create
+        create.return_value = [
             {'code': 200,
              'name': 'network-changed',
              'server_uuid': device_id},
@@ -284,8 +317,11 @@ class TestNovaNotify(base.BaseTestCase):
         self.nova_notifier.send_events([
             {'name': 'network-changed', 'server_uuid': device_id},
             {'name': 'network-changed', 'server_uuid': device_id}])
+        create.assert_called()
 
-    def test_reassociate_floatingip_without_disassociate_event(self):
+    @mock.patch.object(batch_notifier.BatchNotifier, '_notify')
+    def test_reassociate_floatingip_without_disassociate_event(
+            self, mock_notify):
         returned_obj = {'floatingip':
                         {'port_id': 'f5348a16-609a-4971-b0f0-4b8def5235fb'}}
         original_obj = {'port_id': '5a39def4-3d3f-473d-9ff4-8e90064b9cc1'}
@@ -334,6 +370,7 @@ class TestNovaNotify(base.BaseTestCase):
         self.nova_notifier.send_events(response)
         mock_client.assert_called_once_with(
             api_versions.APIVersion(nova.NOVA_API_VERSION),
+            connect_retries=3,
             session=mock.ANY,
             region_name=cfg.CONF.nova.region_name,
             endpoint_type='public',
@@ -347,13 +384,15 @@ class TestNovaNotify(base.BaseTestCase):
         self.nova_notifier.send_events(response)
         mock_client.assert_called_once_with(
             api_versions.APIVersion(nova.NOVA_API_VERSION),
+            connect_retries=3,
             session=mock.ANY,
             region_name=cfg.CONF.nova.region_name,
             endpoint_type='internal',
             extensions=mock.ANY,
             global_request_id=mock.ANY)
 
-    def test_notify_port_active_direct(self):
+    @mock.patch.object(batch_notifier.BatchNotifier, '_notify')
+    def test_notify_port_active_direct(self, mock_notify):
         device_id = '32102d7b-1cf4-404d-b50a-97aae1f55f87'
         port_id = 'bee50827-bcee-4cc8-91c1-a27b0ce54222'
         port = port_obj.Port(self.ctx, id=port_id, device_id=device_id,
@@ -369,3 +408,43 @@ class TestNovaNotify(base.BaseTestCase):
         self.assertEqual(
             expected_event,
             self.nova_notifier.batch_notifier._pending_events.get())
+
+    def test_notify_concurrent_enable_flag_update(self):
+        # This test assumes Neutron server can use eventlet or not.
+        # NOTE(ralonsoh): the exceptions raise inside a thread won't stop the
+        # test. The checks are stored in "_queue" and tested at the end of the
+        # test execution.
+        # NOTE(ralonsoh): once the eventlet deprecation is finished, the
+        # ``time.sleep()`` calls can be removed; the kernel threads are
+        # preemptive and it is not needed to manually yield the GIL.
+        _queue = queue.Queue()
+
+        def _local_executor(thread_idx):
+            # This thread has not yet initialized the local "enable" flag.
+            _queue.put(getattr(nova._notifier_store, 'enable', None) is None)
+            time.sleep(0)  # Next thread execution.
+            new_enable = bool(thread_idx % 2)
+            with self.nova_notifier.context_enabled(new_enable):
+                # At this point, the Nova Notifier should have updated the
+                # "enable" flag.
+                _queue.put(new_enable == nova._notifier_store.enable)
+                time.sleep(0)  # Next thread execution.
+                _queue.put(new_enable == nova._notifier_store.enable)
+            _queue.put(nova.NOTIFIER_ENABLE_DEFAULT ==
+                       nova._notifier_store.enable)
+
+        num_threads = 20
+        threads = []
+        for idx in range(num_threads):
+            t = threading.Thread(target=_local_executor, args=(idx,))
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join()
+
+        try:
+            while True:
+                self.assertTrue(_queue.get(block=False))
+        except queue.Empty:
+            pass

@@ -22,16 +22,15 @@ from neutron_lib import constants as const
 from neutron_lib.placement import utils as place_utils
 from neutron_lib.plugins.ml2 import api
 from oslo_log import log
-import six
 
 from neutron._i18n import _
 from neutron.db import provisioning_blocks
+from neutron.plugins.ml2.common import constants as ml2_consts
 
 LOG = log.getLogger(__name__)
 
 
-@six.add_metaclass(abc.ABCMeta)
-class AgentMechanismDriverBase(api.MechanismDriver):
+class AgentMechanismDriverBase(api.MechanismDriver, metaclass=abc.ABCMeta):
     """Base class for drivers that attach to networks using an L2 agent.
 
     The AgentMechanismDriverBase provides common code for mechanism
@@ -44,18 +43,25 @@ class AgentMechanismDriverBase(api.MechanismDriver):
     __init__(), and must implement try_to_bind_segment_for_agent().
     """
 
-    def __init__(self, agent_type,
-                 supported_vnic_types=[portbindings.VNIC_NORMAL]):
+    _explicitly_not_supported_extensions = set()
+
+    def __init__(self, agent_type, supported_vnic_types):
         """Initialize base class for specific L2 agent type.
 
         :param agent_type: Constant identifying agent type in agents_db
         :param supported_vnic_types: The binding:vnic_type values we can bind
         """
+        super().__init__()
         self.agent_type = agent_type
         self.supported_vnic_types = supported_vnic_types
 
     def initialize(self):
         pass
+
+    def supported_extensions(self, extensions):
+        # filter out extensions which this mech driver explicitly claimed
+        # that are not supported
+        return extensions - self._explicitly_not_supported_extensions
 
     def create_port_precommit(self, context):
         self._insert_provisioning_block(context)
@@ -72,6 +78,11 @@ class AgentMechanismDriverBase(api.MechanismDriver):
         if not context.host or port['status'] == const.PORT_STATUS_ACTIVE:
             # no point in putting in a block if the status is already ACTIVE
             return
+
+        if port['device_owner'] in ml2_consts.NO_PBLOCKS_TYPES:
+            # do not set provisioning_block if it is neutron service port
+            return
+
         vnic_type = context.current.get(portbindings.VNIC_TYPE,
                                         portbindings.VNIC_NORMAL)
         if vnic_type not in self.supported_vnic_types:
@@ -80,7 +91,7 @@ class AgentMechanismDriverBase(api.MechanismDriver):
             return
         if context.host_agents(self.agent_type):
             provisioning_blocks.add_provisioning_component(
-                context._plugin_context, port['id'], resources.PORT,
+                context.plugin_context, port['id'], resources.PORT,
                 provisioning_blocks.L2_AGENT_ENTITY)
 
     def bind_port(self, context):
@@ -94,6 +105,23 @@ class AgentMechanismDriverBase(api.MechanismDriver):
             LOG.debug("Refusing to bind due to unsupported vnic_type: %s",
                       vnic_type)
             return
+
+        allowed_binding_segments = []
+
+        subnets = self.get_subnets_from_fixed_ips(context)
+        if subnets:
+            # In case that fixed IPs is provided, filter segments per subnet
+            # that they belong to first.
+            for segment in context.segments_to_bind:
+                for subnet in subnets:
+                    seg_id = subnet.get('segment_id')
+                    # If subnet is not attached to any segment, let's use
+                    # default behavior.
+                    if seg_id is None or seg_id == segment[api.ID]:
+                        allowed_binding_segments.append(segment)
+        else:
+            allowed_binding_segments = context.segments_to_bind
+
         agents = context.host_agents(self.agent_type)
         if not agents:
             LOG.debug("Port %(pid)s on network %(network)s not bound, "
@@ -110,7 +138,7 @@ class AgentMechanismDriverBase(api.MechanismDriver):
                     LOG.debug('Agent on host %s can not bind SmartNIC '
                               'port %s', agent['host'], context.current['id'])
                     continue
-                for segment in context.segments_to_bind:
+                for segment in allowed_binding_segments:
                     if self.try_to_bind_segment_for_agent(context, segment,
                                                           agent):
                         LOG.debug("Bound using segment: %s", segment)
@@ -119,6 +147,15 @@ class AgentMechanismDriverBase(api.MechanismDriver):
                 LOG.warning("Refusing to bind port %(pid)s to dead agent: "
                             "%(agent)s",
                             {'pid': context.current['id'], 'agent': agent})
+
+    def get_subnets_from_fixed_ips(self, context):
+        subnets = []
+        for data in context.current.get('fixed_ips', []):
+            subnet_id = data.get('subnet_id')
+            if subnet_id:
+                subnets.append(context._plugin.get_subnet(
+                    context.plugin_context, subnet_id))
+        return subnets
 
     @abc.abstractmethod
     def try_to_bind_segment_for_agent(self, context, segment, agent):
@@ -140,19 +177,23 @@ class AgentMechanismDriverBase(api.MechanismDriver):
         return True. Otherwise, it must return False.
         """
 
-    def blacklist_supported_vnic_types(self, vnic_types, blacklist):
-        """Validate the blacklist and blacklist the supported_vnic_types
+    def prohibit_list_supported_vnic_types(self, vnic_types, prohibit_list):
+        """Validate the prohibit_list and prohibit the supported_vnic_types
 
         :param vnic_types: The supported_vnic_types list
-        :param blacklist: The blacklist as in vnic_type_blacklist
-        :return The blacklisted vnic_types
+        :param prohibit_list: The prohibit_list as in vnic_type_prohibit_list
+        :return The supported vnic_types minus those ones present in
+                prohibit_list
         """
-        if not blacklist:
+        if not prohibit_list:
+            LOG.info("%s's supported_vnic_types: %s", self.agent_type,
+                     vnic_types)
             return vnic_types
 
-        # Not valid values in the blacklist:
-        if not all(bl in vnic_types for bl in blacklist):
-            raise ValueError(_("Not all of the items from vnic_type_blacklist "
+        # Not valid values in the prohibit_list:
+        if not all(bl in vnic_types for bl in prohibit_list):
+            raise ValueError(_("Not all of the items from "
+                               "vnic_type_prohibit_list "
                                "are valid vnic_types for %(agent)s mechanism "
                                "driver. The valid values are: "
                                "%(valid_vnics)s.") %
@@ -160,12 +201,15 @@ class AgentMechanismDriverBase(api.MechanismDriver):
                               'valid_vnics': vnic_types})
 
         supported_vnic_types = [vnic_t for vnic_t in vnic_types if
-                                vnic_t not in blacklist]
+                                vnic_t not in prohibit_list]
 
         # Nothing left in the supported vnict types list:
         if len(supported_vnic_types) < 1:
-            raise ValueError(_("All possible vnic_types were blacklisted for "
+            raise ValueError(_("All possible vnic_types were prohibited for "
                                "%s mechanism driver!") % self.agent_type)
+
+        LOG.info("%s's supported_vnic_types: %s", self.agent_type,
+                 supported_vnic_types)
         return supported_vnic_types
 
     def _possible_agents_for_port(self, context):
@@ -179,7 +223,7 @@ class AgentMechanismDriverBase(api.MechanismDriver):
             # trying to bind with a dead agent.
         }
         return context._plugin.get_agents(
-            context._plugin_context,
+            context.plugin_context,
             filters=agent_filters,
         )
 
@@ -189,7 +233,7 @@ class AgentMechanismDriverBase(api.MechanismDriver):
         :param context: PortContext instance describing the port
         :returns: True for responsible, False for not responsible
 
-        An agent based mechanism driver is reponsible for a resource provider
+        An agent based mechanism driver is responsible for a resource provider
         if an agent of it is responsible for that resource provider. An agent
         reports responsibility by including the resource provider in the
         configurations field of the agent heartbeat.
@@ -200,44 +244,57 @@ class AgentMechanismDriverBase(api.MechanismDriver):
         if 'allocation' not in context.current['binding:profile']:
             return False
 
-        rp = uuid.UUID(context.current['binding:profile']['allocation'])
+        allocation = context.current['binding:profile']['allocation']
         host_agents = self._possible_agents_for_port(context)
 
         reported = {}
         for agent in host_agents:
-            if 'resource_provider_bandwidths' in agent['configurations']:
+            if const.RP_BANDWIDTHS in agent['configurations']:
                 for device in agent['configurations'][
-                        'resource_provider_bandwidths'].keys():
+                        const.RP_BANDWIDTHS].keys():
                     device_rp_uuid = place_utils.device_resource_provider_uuid(
                         namespace=uuid_ns,
                         host=agent['host'],
                         device=device)
-                    if device_rp_uuid == rp:
-                        reported[agent['id']] = agent
+                    for group, rp in allocation.items():
+                        if device_rp_uuid == uuid.UUID(rp):
+                            reported[group] = reported.get(group, []) + [agent]
+            if (const.RP_PP_WITHOUT_DIRECTION in agent['configurations'] or
+                    const.RP_PP_WITH_DIRECTION in agent['configurations']):
+                for group, rp in allocation.items():
+                    agent_rp_uuid = place_utils.agent_resource_provider_uuid(
+                        namespace=uuid_ns,
+                        host=agent['host'])
+                    if agent_rp_uuid == uuid.UUID(rp):
+                        reported[group] = reported.get(group, []) + [agent]
 
-        if len(reported) == 1:
-            agent = list(reported.values())[0]
-            LOG.debug("Agent %(agent)s of type %(agent_type)s reports to be "
-                      "responsible for resource provider %(rsc_provider)s",
-                      {'agent': agent['id'],
-                       'agent_type': agent['agent_type'],
-                       'rsc_provider': rp})
-            return True
-        elif len(reported) > 1:
-            LOG.error("Agent misconfiguration, multiple agents on the same "
-                      "host %(host)s reports being responsible for resource "
-                      "provider %(rsc_provider)s: %(agents)s",
-                      {'host': context.current['binding:host_id'],
-                       'rsc_provider': rp,
-                       'agents': reported.keys()})
-            return False
-        else:
-            # not responsible, must be somebody else
-            return False
+        for group, agents in reported.items():
+            if len(agents) == 1:
+                agent = agents[0]
+                LOG.debug(
+                    "Agent %(agent)s of type %(agent_type)s reports to be "
+                    "responsible for resource provider %(rsc_provider)s",
+                    {'agent': agent['id'],
+                     'agent_type': agent['agent_type'],
+                     'rsc_provider': allocation[group]})
+            elif len(agents) > 1:
+                LOG.error(
+                    "Agent misconfiguration, multiple agents on the same "
+                    "host %(host)s reports being responsible for resource "
+                    "provider %(rsc_provider)s: %(agents)s",
+                    {'host': context.current['binding:host_id'],
+                     'rsc_provider': allocation[group],
+                     'agents': [agent['id'] for agent in agents]})
+                return False
+            else:
+                # not responsible, must be somebody else
+                return False
+
+        return (len(reported) >= 1 and (len(reported) == len(allocation)))
 
 
-@six.add_metaclass(abc.ABCMeta)
-class SimpleAgentMechanismDriverBase(AgentMechanismDriverBase):
+class SimpleAgentMechanismDriverBase(AgentMechanismDriverBase,
+                                     metaclass=abc.ABCMeta):
     """Base class for simple drivers using an L2 agent.
 
     The SimpleAgentMechanismDriverBase provides common code for
@@ -254,19 +311,25 @@ class SimpleAgentMechanismDriverBase(AgentMechanismDriverBase):
     """
 
     def __init__(self, agent_type, vif_type, vif_details,
-                 supported_vnic_types=[portbindings.VNIC_NORMAL]):
+                 supported_vnic_types=None, vnic_type_prohibit_list=None):
         """Initialize base class for specific L2 agent type.
 
         :param agent_type: Constant identifying agent type in agents_db
         :param vif_type: Value for binding:vif_type when bound
         :param vif_details: Dictionary with details for VIF driver when bound
         :param supported_vnic_types: The binding:vnic_type values we can bind
+        :param vnic_type_prohibit_list: VNIC types administratively prohibited
+                                        by the mechanism driver
         """
-        super(SimpleAgentMechanismDriverBase, self).__init__(
+        supported_vnic_types = (supported_vnic_types or
+                                [portbindings.VNIC_NORMAL])
+        super().__init__(
             agent_type, supported_vnic_types)
+        self.supported_vnic_types = self.prohibit_list_supported_vnic_types(
+            self.supported_vnic_types, vnic_type_prohibit_list)
         self.vif_type = vif_type
         self.vif_details = {portbindings.VIF_DETAILS_CONNECTIVITY:
-                            portbindings.CONNECTIVITY_LEGACY}
+                            self.connectivity}
         self.vif_details.update(vif_details)
 
     def try_to_bind_segment_for_agent(self, context, segment, agent):
@@ -275,8 +338,7 @@ class SimpleAgentMechanismDriverBase(AgentMechanismDriverBase):
                                 self.get_vif_type(context, agent, segment),
                                 self.get_vif_details(context, agent, segment))
             return True
-        else:
-            return False
+        return False
 
     def get_vif_details(self, context, agent, segment):
         return self.vif_details
@@ -334,6 +396,8 @@ class SimpleAgentMechanismDriverBase(AgentMechanismDriverBase):
         determine whether or not the specified network segment can be
         bound for the agent.
         """
+        if agent['agent_type'] != self.agent_type:
+            return False
 
         mappings = self.get_mappings(agent)
         allowed_network_types = self.get_allowed_network_types(agent)

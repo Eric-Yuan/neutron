@@ -29,7 +29,7 @@ class UplinkStatusPropagationML2ExtDriverTestCase(
         cfg.CONF.set_override('extension_drivers',
                               self._extension_drivers,
                               group='ml2')
-        super(UplinkStatusPropagationML2ExtDriverTestCase, self).setUp()
+        super().setUp()
         self.plugin = directory.get_plugin()
 
     def test_extend_port_dict_no_project_default(self):
@@ -39,7 +39,7 @@ class UplinkStatusPropagationML2ExtDriverTestCase(
 
             driver = usp.UplinkStatusPropagationExtensionDriver()
             driver.extend_port_dict(session, db_data, response_data)
-            self.assertFalse(response_data['propagate_uplink_status'])
+            self.assertTrue(response_data['propagate_uplink_status'])
 
     def test_show_port_has_propagate_uplink_status(self):
         with self.port(propagate_uplink_status=True) as port:

@@ -18,7 +18,7 @@ from neutron._i18n import _
 
 
 ovs_driver_opts = [
-    cfg.ListOpt('vnic_type_blacklist',
+    cfg.ListOpt('vnic_type_prohibit_list',
                 default=[],
                 help=_("Comma-separated list of VNIC types for which support "
                        "is administratively prohibited by the mechanism "

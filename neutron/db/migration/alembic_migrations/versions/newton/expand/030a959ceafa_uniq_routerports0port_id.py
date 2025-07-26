@@ -58,10 +58,10 @@ def check_sanity(connection):
 
 
 def get_duplicate_port_records_in_routerport_database(connection):
-    insp = sa.engine.reflection.Inspector.from_engine(connection)
+    insp = sa.inspect(connection)
     if 'routerports' not in insp.get_table_names():
         return []
-    session = sa.orm.Session(bind=connection.connect())
+    session = sa.orm.Session(bind=connection)
     query = (session.query(routerports.c.port_id)
              .group_by(routerports.c.port_id)
              .having(sa.func.count() > 1)).all()

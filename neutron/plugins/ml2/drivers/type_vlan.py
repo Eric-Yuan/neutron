@@ -26,7 +26,6 @@ from neutron_lib.plugins.ml2 import api
 from neutron_lib.plugins import utils as plugin_utils
 from oslo_config import cfg
 from oslo_log import log
-from oslo_utils import uuidutils
 
 from neutron._i18n import _
 from neutron.conf.plugins.ml2.drivers import driver_type
@@ -53,56 +52,31 @@ class VlanTypeDriver(helpers.SegmentTypeDriver):
     """
 
     def __init__(self):
-        super(VlanTypeDriver, self).__init__(vlanalloc.VlanAllocation)
+        super().__init__(vlanalloc.VlanAllocation)
         self.model_segmentation_id = vlan_alloc_model.VlanAllocation.vlan_id
         self._parse_network_vlan_ranges()
 
-    @db_api.retry_db_errors
-    def _populate_new_default_network_segment_ranges(self):
-        ctx = context.get_admin_context()
+    def _populate_new_default_network_segment_ranges(self, ctx, start_time):
         for (physical_network, vlan_ranges) in (
-                self.network_vlan_ranges.items()):
+                self._network_vlan_ranges.items()):
             for vlan_min, vlan_max in vlan_ranges:
-                res = {
-                    'id': uuidutils.generate_uuid(),
-                    'name': '',
-                    'default': True,
-                    'shared': True,
-                    'network_type': p_const.TYPE_VLAN,
-                    'physical_network': physical_network,
-                    'minimum': vlan_min,
-                    'maximum': vlan_max}
-                with db_api.CONTEXT_WRITER.using(ctx):
-                    new_default_range_obj = (
-                        range_obj.NetworkSegmentRange(ctx, **res))
-                    new_default_range_obj.create()
-
-    @db_api.retry_db_errors
-    def _delete_expired_default_network_segment_ranges(self):
-        ctx = context.get_admin_context()
-        with db_api.CONTEXT_WRITER.using(ctx):
-            filters = {
-                'default': True,
-                'network_type': p_const.TYPE_VLAN,
-            }
-            old_default_range_objs = range_obj.NetworkSegmentRange.get_objects(
-                ctx, **filters)
-            for obj in old_default_range_objs:
-                obj.delete()
+                range_obj.NetworkSegmentRange.new_default(
+                    ctx, self.get_type(), physical_network, vlan_min,
+                    vlan_max, start_time)
 
     def _parse_network_vlan_ranges(self):
         try:
-            self.network_vlan_ranges = plugin_utils.parse_network_vlan_ranges(
+            self._network_vlan_ranges = plugin_utils.parse_network_vlan_ranges(
                 cfg.CONF.ml2_type_vlan.network_vlan_ranges)
         except Exception:
             LOG.exception("Failed to parse network_vlan_ranges. "
                           "Service terminated!")
             sys.exit(1)
-        LOG.info("Network VLAN ranges: %s", self.network_vlan_ranges)
+        LOG.info("Network VLAN ranges: %s", self._network_vlan_ranges)
 
     @db_api.retry_db_errors
-    def _sync_vlan_allocations(self):
-        ctx = context.get_admin_context()
+    def _sync_vlan_allocations(self, ctx=None):
+        ctx = ctx or context.get_admin_context()
         with db_api.CONTEXT_WRITER.using(ctx):
             # VLAN ranges per physical network:
             #   {phy1: [(1, 10), (30, 50)], ...}
@@ -165,9 +139,9 @@ class VlanTypeDriver(helpers.SegmentTypeDriver):
                                                      vlan_ids)
 
     @db_api.retry_db_errors
-    def _get_network_segment_ranges_from_db(self):
+    def _get_network_segment_ranges_from_db(self, ctx=None):
         ranges = {}
-        ctx = context.get_admin_context()
+        ctx = ctx or context.get_admin_context()
         with db_api.CONTEXT_READER.using(ctx):
             range_objs = (range_obj.NetworkSegmentRange.get_objects(
                 ctx, network_type=self.get_type()))
@@ -194,15 +168,21 @@ class VlanTypeDriver(helpers.SegmentTypeDriver):
             self._sync_vlan_allocations()
         LOG.info("VlanTypeDriver initialization complete")
 
-    def initialize_network_segment_range_support(self):
-        self._delete_expired_default_network_segment_ranges()
-        self._populate_new_default_network_segment_ranges()
-        # Override self.network_vlan_ranges with the network segment range
-        # information from DB and then do a sync_allocations since the
-        # segment range service plugin has not yet been loaded at this
-        # initialization time.
-        self.network_vlan_ranges = self._get_network_segment_ranges_from_db()
-        self._sync_vlan_allocations()
+    @db_api.retry_db_errors
+    def initialize_network_segment_range_support(self, start_time):
+        admin_context = context.get_admin_context()
+        with db_api.CONTEXT_WRITER.using(admin_context):
+            self._delete_expired_default_network_segment_ranges(
+                admin_context, start_time)
+            self._populate_new_default_network_segment_ranges(
+                admin_context, start_time)
+            # Override self._network_vlan_ranges with the network segment range
+            # information from DB and then do a sync_allocations since the
+            # segment range service plugin has not yet been loaded at this
+            # initialization time.
+            self._network_vlan_ranges = (
+                self._get_network_segment_ranges_from_db(ctx=admin_context))
+            self._sync_vlan_allocations(ctx=admin_context)
 
     def update_network_segment_range_allocations(self):
         self._sync_vlan_allocations()
@@ -214,7 +194,7 @@ class VlanTypeDriver(helpers.SegmentTypeDriver):
         ``NETWORK_SEGMENT_RANGE`` service plugin is enabled. Otherwise,
         they will be loaded from the host config file - `ml2_conf.ini`.
         """
-        ranges = self.network_vlan_ranges
+        ranges = self._network_vlan_ranges
         if directory.get_plugin(plugin_constants.NETWORK_SEGMENT_RANGE):
             ranges = self._get_network_segment_ranges_from_db()
 
@@ -238,12 +218,6 @@ class VlanTypeDriver(helpers.SegmentTypeDriver):
                              "%(max)s)") %
                            {'min': p_const.MIN_VLAN_TAG,
                             'max': p_const.MAX_VLAN_TAG})
-                    raise exc.InvalidInput(error_message=msg)
-            else:
-                if not ranges.get(physical_network):
-                    msg = (_("Physical network %s requires segmentation_id "
-                             "to be specified when creating a provider "
-                             "network") % physical_network)
                     raise exc.InvalidInput(error_message=msg)
         elif segmentation_id is not None:
             msg = _("segmentation_id requires physical_network for VLAN "
@@ -339,7 +313,7 @@ class VlanTypeDriver(helpers.SegmentTypeDriver):
                          'physical_network': physical_network})
 
     def get_mtu(self, physical_network):
-        seg_mtu = super(VlanTypeDriver, self).get_mtu()
+        seg_mtu = super().get_mtu()
         mtu = []
         if seg_mtu > 0:
             mtu.append(seg_mtu)

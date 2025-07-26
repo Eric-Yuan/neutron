@@ -13,6 +13,8 @@
 
 from unittest import mock
 
+from neutron_lib import constants as n_const
+
 from neutron.agent.linux import ipset_manager
 from neutron.tests import base
 
@@ -30,7 +32,7 @@ FAKE_IPS = [('10.0.0.1', 'fa:16:3e:aa:bb:c1'),
 
 class BaseIpsetManagerTest(base.BaseTestCase):
     def setUp(self):
-        super(BaseIpsetManagerTest, self).setUp()
+        super().setUp()
         self.ipset = ipset_manager.IpsetManager()
         self.execute = mock.patch.object(self.ipset, "execute").start()
         self.expected_calls = []
@@ -65,54 +67,47 @@ class BaseIpsetManagerTest(base.BaseTestCase):
 
     def expect_set(self, addresses):
         temp_input = ['create %s hash:net family inet' % TEST_SET_NAME_NEW]
-        temp_input.extend('add %s %s' % (TEST_SET_NAME_NEW, ip)
+        temp_input.extend(f'add {TEST_SET_NAME_NEW} {ip}'
                           for ip in self.ipset._sanitize_addresses(addresses))
         input = '\n'.join(temp_input)
         self.expected_calls.extend([
             mock.call(['ipset', 'restore', '-exist'],
-                      process_input=input,
-                      run_as_root=True,
-                      check_exit_code=True),
+                      process_input=input, run_as_root=True,
+                      check_exit_code=True, privsep_exec=True),
             mock.call(['ipset', 'swap', TEST_SET_NAME_NEW, TEST_SET_NAME],
-                      process_input=None,
-                      run_as_root=True,
-                      check_exit_code=True),
+                      process_input=None, run_as_root=True,
+                      check_exit_code=True, privsep_exec=True),
             mock.call(['ipset', 'destroy', TEST_SET_NAME_NEW],
-                      process_input=None,
-                      run_as_root=True,
-                      check_exit_code=False)])
+                      process_input=None, run_as_root=True,
+                      check_exit_code=False, privsep_exec=True)])
 
     def expect_add(self, addresses):
         self.expected_calls.extend(
             mock.call(['ipset', 'add', '-exist', TEST_SET_NAME, ip],
-                      process_input=None,
-                      run_as_root=True,
-                      check_exit_code=True)
+                      process_input=None, run_as_root=True,
+                      check_exit_code=True, privsep_exec=True)
             for ip in self.ipset._sanitize_addresses(addresses))
 
     def expect_del(self, addresses):
 
         self.expected_calls.extend(
             mock.call(['ipset', 'del', TEST_SET_NAME, ip],
-                      process_input=None,
-                      run_as_root=True,
-                      check_exit_code=False)
+                      process_input=None, run_as_root=True,
+                      check_exit_code=False, privsep_exec=True)
             for ip in self.ipset._sanitize_addresses(addresses))
 
     def expect_create(self):
         self.expected_calls.append(
             mock.call(['ipset', 'create', '-exist', TEST_SET_NAME,
                        'hash:net', 'family', 'inet'],
-                      process_input=None,
-                      run_as_root=True,
-                      check_exit_code=True))
+                      process_input=None, run_as_root=True,
+                      check_exit_code=True, privsep_exec=True))
 
     def expect_destroy(self):
         self.expected_calls.append(
             mock.call(['ipset', 'destroy', TEST_SET_NAME],
-                      process_input=None,
-                      run_as_root=True,
-                      check_exit_code=False))
+                      process_input=None, run_as_root=True,
+                      check_exit_code=False, privsep_exec=True))
 
     def add_first_ip(self):
         self.expect_set([FAKE_IPS[0]])
@@ -153,9 +148,9 @@ class IpsetManagerTestCase(BaseIpsetManagerTest):
         self.verify_mock_calls()
 
     def test_set_members_adding_all_zero_ipv4(self):
-        self.expect_set([('0.0.0.0/0', 'fa:16:3e:aa:bb:c1'), ])
+        self.expect_set([(n_const.IPv4_ANY, 'fa:16:3e:aa:bb:c1'), ])
         self.ipset.set_members(TEST_SET_ID, ETHERTYPE,
-                               [('0.0.0.0/0', 'fa:16:3e:aa:bb:c1'), ])
+                               [(n_const.IPv4_ANY, 'fa:16:3e:aa:bb:c1'), ])
         self.verify_mock_calls()
 
     def test_set_members_adding_all_zero_ipv6(self):

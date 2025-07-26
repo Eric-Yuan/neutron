@@ -1,7 +1,7 @@
 .. _config-mtu:
 
 ==================
-MTU considerations
+MTU Considerations
 ==================
 
 The Networking service uses the MTU of the underlying physical network to
@@ -129,3 +129,19 @@ while the L3 agent provides an appropriate MTU value to instances using
 IPv6. IPv6 uses RA via the L3 agent because the DHCP agent only supports
 IPv4. Instances using IPv4 and IPv6 should obtain the same MTU value
 regardless of method.
+
+.. note::
+
+   If you are using an MTU value on your network below 1280, please
+   read the warning listed in the
+   `IPv6 configuration guide <./config-ipv6.html#project-network-considerations>`__
+   before creating any subnets.
+
+Networks with enabled vlan transparency
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In case of networks with enabled vlan transparency, if additional vlan tag is
+configured inside guest VM, MTU has to be lowered by 4 bytes to make space for
+additional vlan tag in the packet's header.
+For example, if network's MTU is set to ``1500``, value configured for the
+interfaces in the guest vm should be manually set to ``1496`` or less bytes.

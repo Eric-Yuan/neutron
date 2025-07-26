@@ -12,32 +12,31 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from concurrent import futures
 import os.path
+import queue
 import random
 import re
 import sys
+import threading
 import time
 from unittest import mock
 
 import ddt
-import eventlet
-from eventlet import queue
 import netaddr
 from neutron_lib import constants
+from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import timeutils
 from osprofiler import profiler
-import six
-import testscenarios
 import testtools
 
 from neutron.common import utils
 from neutron.tests import base
 from neutron.tests.unit import tests
 
-load_tests = testscenarios.load_tests_apply_scenarios
 
-
-class _PortRange(object):
+class _PortRange:
     """A linked list of port ranges."""
     def __init__(self, base, prev_ref=None):
         self.base = base
@@ -76,12 +75,13 @@ class _PortRange(object):
         return [str(self)]
 
 
-_hex_str = lambda num: format(num, '#06x')
+def _hex_str(num):
+    return format(num, '#06x')
 
 
 def _hex_format(port, mask):
     if mask != 0xffff:
-        return "%s/%s" % (_hex_str(port), _hex_str(0xffff & mask))
+        return f"{_hex_str(port)}/{_hex_str(0xffff & mask)}"
     return _hex_str(port)
 
 
@@ -118,11 +118,14 @@ class TestExceptionLogger(base.BaseTestCase):
         logger = mock.Mock()
 
         @utils.exception_logger(logger=logger)
-        def func():
-            return result
+        def func(ret):
+            ret.append(result)
 
-        gt = eventlet.spawn(func)
-        self.assertEqual(result, gt.wait())
+        ret_value = []
+        _thread = threading.Thread(target=func, args=(ret_value, ))
+        _thread.start()
+        _thread.join()
+        self.assertEqual(result, ret_value[0])
         self.assertFalse(logger.called)
 
     def test_spawn_raise(self):
@@ -133,8 +136,8 @@ class TestExceptionLogger(base.BaseTestCase):
         def func():
             raise RuntimeError(result)
 
-        gt = eventlet.spawn(func)
-        self.assertRaises(RuntimeError, gt.wait)
+        _thread = threading.Thread(target=func)
+        _thread.start()
         self.assertTrue(logger.called)
 
     def test_pool_spawn_normal(self):
@@ -145,10 +148,9 @@ class TestExceptionLogger(base.BaseTestCase):
         def func(i):
             calls(i)
 
-        pool = eventlet.GreenPool(4)
-        for i in range(0, 4):
-            pool.spawn(func, i)
-        pool.waitall()
+        with futures.ThreadPoolExecutor(max_workers=4) as executor:
+            fs = [executor.submit(func, i) for i in range(4)]
+            all(f.done() for f in fs)
 
         calls.assert_has_calls([mock.call(0), mock.call(1),
                                 mock.call(2), mock.call(3)],
@@ -163,29 +165,31 @@ class TestExceptionLogger(base.BaseTestCase):
         def func(i):
             if i == 2:
                 raise RuntimeError(2)
-            else:
-                calls(i)
+            calls(i)
 
-        pool = eventlet.GreenPool(4)
-        for i in range(0, 4):
-            pool.spawn(func, i)
-        pool.waitall()
+        with futures.ThreadPoolExecutor(max_workers=4) as executor:
+            fs = [executor.submit(func, i) for i in range(4)]
+            all(f.done() for f in fs)
 
         calls.assert_has_calls([mock.call(0), mock.call(1), mock.call(3)],
                                any_order=True)
         self.assertTrue(logger.called)
+
+    def test_wait_until_true(self):
+
+        class FalseException(Exception):
+            pass
+
+        self.assertRaises(
+            FalseException,
+            utils.wait_until_true,
+            lambda: False, timeout=1, exception=FalseException)
 
 
 class TestDvrServices(base.BaseTestCase):
 
     def _test_is_dvr_serviced(self, device_owner, expected):
         self.assertEqual(expected, utils.is_dvr_serviced(device_owner))
-
-    def test_is_dvr_serviced_with_lb_port(self):
-        self._test_is_dvr_serviced(constants.DEVICE_OWNER_LOADBALANCER, True)
-
-    def test_is_dvr_serviced_with_lbv2_port(self):
-        self._test_is_dvr_serviced(constants.DEVICE_OWNER_LOADBALANCERV2, True)
 
     def test_is_dvr_serviced_with_dhcp_port(self):
         self._test_is_dvr_serviced(constants.DEVICE_OWNER_DHCP, True)
@@ -198,12 +202,6 @@ class TestFipServices(base.BaseTestCase):
 
     def _test_is_fip_serviced(self, device_owner, expected):
         self.assertEqual(expected, utils.is_fip_serviced(device_owner))
-
-    def test_is_fip_serviced_with_lb_port(self):
-        self._test_is_fip_serviced(constants.DEVICE_OWNER_LOADBALANCER, True)
-
-    def test_is_fip_serviced_with_lbv2_port(self):
-        self._test_is_fip_serviced(constants.DEVICE_OWNER_LOADBALANCERV2, True)
 
     def test_is_fip_serviced_with_dhcp_port(self):
         self._test_is_fip_serviced(constants.DEVICE_OWNER_DHCP, False)
@@ -332,11 +330,11 @@ class TestPortRuleMasking(base.BaseTestCase):
     def compare_port_ranges_results(self, port_min, port_max):
         observed = utils.port_rule_masking(port_min, port_max)
         expected = _port_rule_masking(port_min, port_max)
-        self.assertItemsEqual(expected, observed)
+        self.assertCountEqual(expected, observed)
 
     def test_port_rule_masking_random_ranges(self):
         # calling randint a bunch of times is really slow
-        randports = sorted(random.sample(six.moves.range(1, 65536), 2000))
+        randports = sorted(random.sample(range(1, 65536), 2000))
         port_max = 0
         for i in randports:
             port_min = port_max
@@ -392,7 +390,7 @@ class TestExcDetails(base.BaseTestCase):
 
     def test_extract_exc_details_no_details_attached(self):
         self.assertIsInstance(
-            utils.extract_exc_details(Exception()), six.text_type)
+            utils.extract_exc_details(Exception()), str)
 
 
 @ddt.ddt
@@ -424,20 +422,19 @@ class TestThrottler(base.BaseTestCase):
 
         throttled_func()
 
-        sleep = utils.eventlet.sleep
+        sleep = utils.time.sleep
 
         def sleep_mock(amount_to_sleep):
             sleep(amount_to_sleep)
-            self.assertGreater(threshold, amount_to_sleep)
+            self.assertGreaterEqual(threshold, amount_to_sleep)
 
-        with mock.patch.object(utils.eventlet, "sleep",
+        with mock.patch.object(utils.time, "sleep",
                                side_effect=sleep_mock):
             throttled_func()
 
         self.assertEqual(2, orig_function.call_count)
 
-        lock_with_timer = six.get_function_closure(
-            throttled_func)[1].cell_contents
+        lock_with_timer = throttled_func.__closure__[1].cell_contents
         timestamp = lock_with_timer.timestamp - threshold
         lock_with_timer.timestamp = timestamp
 
@@ -447,7 +444,7 @@ class TestThrottler(base.BaseTestCase):
         self.assertLess(timestamp, lock_with_timer.timestamp)
 
     def test_method_docstring_is_preserved(self):
-        class Klass(object):
+        class Klass:
             @utils.throttler()
             def method(self):
                 """Docstring"""
@@ -455,7 +452,7 @@ class TestThrottler(base.BaseTestCase):
         self.assertEqual("Docstring", Klass.method.__doc__)
 
     def test_method_still_callable(self):
-        class Klass(object):
+        class Klass:
             @utils.throttler()
             def method(self):
                 pass
@@ -464,7 +461,7 @@ class TestThrottler(base.BaseTestCase):
         obj.method()
 
 
-class BaseUnitConversionTest(object):
+class BaseUnitConversionTest:
 
     def test_bytes_to_bits(self):
         test_values = [
@@ -518,7 +515,7 @@ class TestIECUnitConversions(BaseUnitConversionTest, base.BaseTestCase):
 class TestRpBandwidthValidator(base.BaseTestCase):
 
     def setUp(self):
-        super(TestRpBandwidthValidator, self).setUp()
+        super().setUp()
         self.device_name_set = {'ens4', 'ens7'}
         self.valid_rp_bandwidths = {
             'ens7': {'egress': 10000, 'ingress': 10000}
@@ -539,48 +536,7 @@ class TestRpBandwidthValidator(base.BaseTestCase):
                           self.not_valid_rp_bandwidth, self.device_name_set)
 
 
-class TimerTestCase(base.BaseTestCase):
-
-    def test__getattr(self):
-        with utils.Timer() as timer:
-            time.sleep(1)
-        self.assertEqual(1, round(timer.total_seconds()))
-        self.assertEqual(1, timer.delta.seconds)
-
-    def test__enter_with_timeout(self):
-        with utils.Timer(timeout=10) as timer:
-            time.sleep(1)
-        self.assertEqual(1, round(timer.total_seconds()))
-
-    def test__enter_with_timeout_exception(self):
-        msg = r'Timer timeout expired after 1 second\(s\).'
-        with self.assertRaisesRegex(utils.TimerTimeout, msg):
-            with utils.Timer(timeout=1):
-                time.sleep(2)
-
-    def test__enter_with_timeout_no_exception(self):
-        with utils.Timer(timeout=1, raise_exception=False):
-            time.sleep(2)
-
-    def test__iter(self):
-        iterations = []
-        for i in utils.Timer(timeout=2):
-            iterations.append(i)
-            time.sleep(1.1)
-        self.assertEqual(2, len(iterations))
-
-    def test_delta_time_sec(self):
-        with utils.Timer() as timer:
-            self.assertIsInstance(timer.delta_time_sec, float)
-
-
-class SpawnWithOrWithoutProfilerTestCase(
-        testscenarios.WithScenarios, base.BaseTestCase):
-
-    scenarios = [
-        ('spawn', {'spawn_variant': utils.spawn}),
-        ('spawn_n', {'spawn_variant': utils.spawn_n}),
-    ]
+class SpawnWithOrWithoutProfilerTestCase(base.BaseTestCase):
 
     def _compare_profilers_in_parent_and_in_child(self, init_profiler):
 
@@ -596,14 +552,14 @@ class SpawnWithOrWithoutProfilerTestCase(
             if init_profiler:
                 profiler.init(hmac_key='fake secret')
 
-            self.spawn_variant(
-                lambda: q.put(is_profiler_initialized('in-child')))
+            utils.spawn_n(lambda: q.put(is_profiler_initialized('in-child')))
             q.put(is_profiler_initialized('in-parent'))
 
         # Make sure in parent we start with an uninitialized profiler by
-        # eventlet.spawn()-ing a new thread. Otherwise the unit test runner
-        # thread may leak an initialized profiler from one test to another.
-        eventlet.spawn(thread_with_no_leaked_profiler)
+        # spawning a new thread. Otherwise the unit test runner thread may
+        # leak an initialized profiler from one test to another.
+        _thread = threading.Thread(target=thread_with_no_leaked_profiler)
+        _thread.start()
 
         # In order to have some global protection against leaking initialized
         # profilers neutron.test.base.BaseTestCase.setup() also calls
@@ -624,3 +580,208 @@ class SpawnWithOrWithoutProfilerTestCase(
 
     def test_spawn_without_profiler(self):
         self._compare_profilers_in_parent_and_in_child(init_profiler=False)
+
+
+@utils.SingletonDecorator
+class _TestSingletonClass1:
+    def __init__(self, variable):
+        self.variable = variable
+
+
+@utils.SingletonDecorator
+class _TestSingletonClass2:
+    def __init__(self, variable):
+        self.variable = variable
+
+
+class SingletonDecoratorTestCase(base.BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.instance_1 = self.instance_2 = None
+        self.addCleanup(self._destroy_instances)
+
+    def _destroy_instances(self):
+        try:
+            del self.instance_1
+        except AttributeError:
+            pass
+        try:
+            del self.instance_2
+        except AttributeError:
+            pass
+
+    def test_singleton_instance_class(self):
+        self.instance_1 = _TestSingletonClass1('value1')
+        self.instance_2 = _TestSingletonClass1('other_value_that_is_not_set')
+        self.assertIs(self.instance_1, self.instance_2)
+        self.assertEqual('value1', self.instance_2.variable)
+
+        # If one reference is deleted, the other variable (instance_2) is still
+        # referenced to the same object and the singleton decorator keeps it.
+        del self.instance_1
+        self.instance_1 = _TestSingletonClass1('again_value_that_is_not_set')
+        self.assertIs(self.instance_1, self.instance_2)
+        self.assertEqual('value1', self.instance_2.variable)
+
+    def test_singleton_several_independent_classes(self):
+        self.instance_1 = _TestSingletonClass1('value1')
+        self.instance_2 = _TestSingletonClass2('value2')
+        self.assertIsNot(self.instance_1, self.instance_2)
+        self.assertEqual('value1', self.instance_1.variable)
+        self.assertEqual('value2', self.instance_2.variable)
+
+    def test_singleton_instance_deletion(self):
+        self.instance_1 = _TestSingletonClass1('value1')
+        self.instance_2 = _TestSingletonClass2('value2')
+        self.assertIsNotNone(self.instance_1)
+        self.assertIsNotNone(self.instance_2)
+
+        # Delete instance 1, new value "value1_b" set in __init__()
+        del self.instance_1
+        self.instance_1 = _TestSingletonClass1('value1_b')
+        self.instance_2 = _TestSingletonClass2('value2_b')
+        self.assertIsNotNone(self.instance_1)
+        self.assertIsNotNone(self.instance_2)
+        self.assertEqual('value1_b', self.instance_1.variable)
+        self.assertEqual('value2', self.instance_2.variable)
+
+        # Delete instance 2, new value "value2_c" set in __init__()
+        del self.instance_2
+        self.instance_1 = _TestSingletonClass1('value1_c')
+        self.instance_2 = _TestSingletonClass2('value2_c')
+        self.assertIsNotNone(self.instance_1)
+        self.assertIsNotNone(self.instance_2)
+        self.assertEqual('value1_b', self.instance_1.variable)
+        self.assertEqual('value2_c', self.instance_2.variable)
+
+
+class DisableNotificationTestCase(base.BaseTestCase):
+
+    @utils.disable_notifications
+    def sample_method(self):
+        raise AttributeError()
+
+    def test_notification_rpc_workers_lt_one(self):
+        cfg.CONF.set_override('rpc_workers', 0)
+        self.assertIsNone(self.sample_method())
+
+    def test_notification_rpc_workers_none(self):
+        cfg.CONF.set_override('rpc_workers', None)
+        self.assertRaises(AttributeError, self.sample_method)
+
+    def test_notification_rpc_workers_one(self):
+        cfg.CONF.set_override('rpc_workers', 1)
+        self.assertRaises(AttributeError, self.sample_method)
+
+
+class SignatureTestCase(base.BaseTestCase):
+
+    def test_sign_instance_id(self):
+        conf = mock.Mock()
+        conf.metadata_proxy_shared_secret = 'secret'
+        self.assertEqual(
+            '773ba44693c7553d6ee20f61ea5d2757a9a4f4a44d2841ae4e95b52e4cd62db4',
+            utils.sign_instance_id(conf, 'foo')
+        )
+
+
+class ParsePermittedEthertypesTestCase(base.BaseTestCase):
+
+    @mock.patch.object(utils, 'LOG')
+    def test_parse_permitted_ethertypes(self, mock_log):
+        permitted_ethertypes = ['0x1234',
+                                '0x1234',
+                                '0x5678',
+                                '0XCAfe',
+                                '1112',
+                                '0x123R']
+        ret = utils.parse_permitted_ethertypes(permitted_ethertypes)
+        self.assertEqual({'0x1234', '0x5678', '0xcafe'}, ret)
+        calls = [mock.call('Custom ethertype %s is repeated', '0x1234'),
+                 mock.call('Custom ethertype %s is not a hexadecimal number.',
+                           '1112'),
+                 mock.call('Custom ethertype %s is not a hexadecimal number.',
+                           '0x123R'),
+                 ]
+        mock_log.warning.assert_has_calls(calls)
+
+
+class StringMapTestCase(base.BaseTestCase):
+    data = {'a': 1, 'b': None, 'c': 'hi'}
+
+    def test_stringmap(self):
+        expected = {'a': '1', 'b': '', 'c': 'hi'}
+
+        self.assertEqual(expected, utils.stringmap(self.data))
+
+    def test_stringmap_custom_default(self):
+        self.assertEqual('None', utils.stringmap(self.data, 'None')['b'])
+
+
+class ThreadPoolExecutorWithBlockTestCase(base.BaseTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self._queue = queue.Queue()
+
+    def _check_values(self, expected_values):
+        # Retrieve all stored values
+        stored_values = []
+        while not self._queue.empty():
+            stored_values.append(self._queue.get())
+
+        for expected_value in expected_values:
+            self.assertIn(expected_value, stored_values)
+
+    def _add_tasks(self, tpool, num_tasks):
+        expected_values = []
+        for idx in range(num_tasks):
+            value1 = 'value1_%s' % idx
+            value2 = 'value2_%s' % idx
+            values = (value1, value2)
+            expected_values.append(values)
+            tpool.submit(self._task, self._queue, value1, value2=value2)
+        return expected_values
+
+    @staticmethod
+    def _task(_queue, value1, value2=None):
+        _queue.put((value1, value2))
+        time.sleep(1)
+
+    def test_simple_execution(self):
+        max_workers = 5
+        t1 = timeutils.utcnow()
+        with utils.ThreadPoolExecutorWithBlock(max_workers=max_workers) as \
+                tpool:
+            expected_values = self._add_tasks(tpool, max_workers * 3)
+
+        utils.wait_until_true(lambda: self._queue.qsize() == max_workers * 3,
+                              timeout=5, sleep=0.1)
+        t2 = timeutils.utcnow()
+        diff_seconds = (t2 - t1).total_seconds()
+        # NOTE(ralonsoh): we can't expect a 3 seconds sharp time gap, but at
+        # least the execution is contained in this interval. If each task takes
+        # 1 second, 5 threads can be executed in parallel and 15 workers are
+        # required, that will take at least 3 seconds and should complete in
+        # 6 seconds (2x).
+        self.assertTrue(3 < diff_seconds < 6)
+
+        self._check_values(expected_values)
+
+    def test_simple_execution_fast_exit(self):
+        max_workers = 5
+        t1 = timeutils.utcnow()
+        with utils.ThreadPoolExecutorWithBlock(max_workers=max_workers) as \
+                tpool:
+            expected_values = self._add_tasks(tpool, max_workers)
+            tpool.shutdown(wait=False)
+            self._add_tasks(tpool, max_workers)
+
+        utils.wait_until_true(lambda: self._queue.qsize() == max_workers,
+                              timeout=5, sleep=0.1)
+        t2 = timeutils.utcnow()
+        diff_seconds = (t2 - t1).total_seconds()
+        # Similar to above, execution will take at least 1 second and should
+        # complete in 2 seconds (2x).
+        self.assertTrue(1 < diff_seconds < 2)
+        self._check_values(expected_values)

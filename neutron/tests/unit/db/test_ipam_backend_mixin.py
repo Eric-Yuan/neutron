@@ -23,18 +23,19 @@ from neutron_lib.exceptions import address_scope as addr_scope_exc
 from oslo_utils import uuidutils
 import webob.exc
 
-from neutron.db import db_base_plugin_v2
+from neutron.common.ovn import constants as ovn_const
 from neutron.db import ipam_backend_mixin
-from neutron.db import portbindings_db
 from neutron.objects import subnet as subnet_obj
+from neutron.plugins.ml2 import plugin as ml2_plugin
+from neutron.services.segments import db as segments_db
 from neutron.tests import base
-from neutron.tests.unit.db import test_db_base_plugin_v2
+from neutron.tests.common import test_db_base_plugin_v2
 
 
 class TestIpamBackendMixin(base.BaseTestCase):
 
     def setUp(self):
-        super(TestIpamBackendMixin, self).setUp()
+        super().setUp()
         self.mixin = ipam_backend_mixin.IpamBackendMixin()
         self.ctx = mock.Mock()
         self.default_new_ips = (('id-1', '192.168.1.1'),
@@ -78,14 +79,27 @@ class TestIpamBackendMixin(base.BaseTestCase):
                     self.ctx,
                     ipv6_address_mode=constants.IPV6_SLAAC,
                     ipv6_ra_mode=constants.IPV6_SLAAC)
-            else:
-                return subnet_obj.Subnet(
-                    self.ctx,
-                    ipv6_address_mode=None,
-                    ipv6_ra_mode=None)
+            return subnet_obj.Subnet(
+                self.ctx, ipv6_address_mode=None, ipv6_ra_mode=None)
 
         self.mixin._get_subnet_object = mock.Mock(
             side_effect=_get_subnet_object)
+
+    def test__is_distributed_service(self):
+        uuid = uuidutils.generate_uuid()
+        port = {'device_owner':
+                '%snova' % constants.DEVICE_OWNER_COMPUTE_PREFIX,
+                'device_id': uuid}
+        self.assertFalse(self.mixin._is_distributed_service(port))
+        port = {'device_owner': constants.DEVICE_OWNER_DHCP,
+                'device_id': uuid}
+        self.assertFalse(self.mixin._is_distributed_service(port))
+        port = {'device_owner': constants.DEVICE_OWNER_DHCP,
+                'device_id': ovn_const.OVN_METADATA_PREFIX + uuid}
+        self.assertFalse(self.mixin._is_distributed_service(port))
+        port = {'device_owner': constants.DEVICE_OWNER_DISTRIBUTED,
+                'device_id': ovn_const.OVN_METADATA_PREFIX + uuid}
+        self.assertTrue(self.mixin._is_distributed_service(port))
 
     def _test_get_changed_ips_for_port(self, expected, original_ips,
                                        new_ips, owner):
@@ -94,9 +108,9 @@ class TestIpamBackendMixin(base.BaseTestCase):
                                                       new_ips,
                                                       owner)
 
-        self.assertItemsEqual(expected.add, change.add)
-        self.assertItemsEqual(expected.original, change.original)
-        self.assertItemsEqual(expected.remove, change.remove)
+        self.assertCountEqual(expected.add, change.add)
+        self.assertCountEqual(expected.original, change.original)
+        self.assertCountEqual(expected.remove, change.remove)
 
     def test__get_changed_ips_for_port(self):
         new_ips = self._prepare_ips(self.default_new_ips)
@@ -330,32 +344,23 @@ class TestIpamBackendMixin(base.BaseTestCase):
                           None)
 
 
-class TestPlugin(db_base_plugin_v2.NeutronDbPluginV2,
-                 portbindings_db.PortBindingMixin):
+class TestPlugin(ml2_plugin.Ml2Plugin, segments_db.SegmentDbMixin):
     __native_pagination_support = True
     __native_sorting_support = True
 
     supported_extension_aliases = [portbindings.ALIAS]
-
-    def get_plugin_description(self):
-        return "Test Plugin"
-
-    @classmethod
-    def get_plugin_type(cls):
-        return "test_plugin"
-
-    def create_port(self, context, port):
-        port_dict = super(TestPlugin, self).create_port(context, port)
-        self._process_portbindings_create_and_update(
-            context, port['port'], port_dict)
-        return port_dict
 
 
 class TestPortUpdateIpam(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
     def setUp(self, plugin=None):
         if not plugin:
             plugin = 'neutron.tests.unit.db.test_ipam_backend_mixin.TestPlugin'
-        super(TestPortUpdateIpam, self).setUp(plugin=plugin)
+        super().setUp(plugin=plugin)
+        ml2_plugin.MAX_BIND_TRIES = 0
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        ml2_plugin.MAX_BIND_TRIES = 10
 
     def test_port_update_allocate_from_net_subnet(self):
         """Tests that a port can get address by updating fixed_ips"""
@@ -367,7 +372,8 @@ class TestPortUpdateIpam(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
                                      net_id=network['network']['id'],
                                      tenant_id=network['network']['tenant_id'],
                                      arg_list=(portbindings.HOST_ID,),
-                                     **{portbindings.HOST_ID: 'fakehost'})
+                                     **{portbindings.HOST_ID: 'fakehost'},
+                                     is_admin=True)
         port = self.deserialize(self.fmt, response)
 
         # Create the subnet and try to update the port to get an IP
@@ -375,7 +381,8 @@ class TestPortUpdateIpam(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
             data = {'port': {
                 'fixed_ips': [{'subnet_id': subnet['subnet']['id']}]}}
             port_id = port['port']['id']
-            port_req = self.new_update_request('ports', data, port_id)
+            port_req = self.new_update_request('ports', data, port_id,
+                                               as_admin=True)
             response = port_req.get_response(self.api)
             res = self.deserialize(self.fmt, response)
 
@@ -388,4 +395,4 @@ class TestPortUpdateIpam(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
 
 class TestPortUpdateIpamML2(TestPortUpdateIpam):
     def setUp(self):
-        super(TestPortUpdateIpamML2, self).setUp(plugin='ml2')
+        super().setUp(plugin='ml2')

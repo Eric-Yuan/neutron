@@ -27,6 +27,7 @@ import webtest
 
 from neutron.api import extensions
 from neutron.api.v2 import router
+from neutron.conf import quota as quota_conf
 from neutron.extensions import providernet as pnet
 from neutron import quota
 from neutron.tests import tools
@@ -35,7 +36,7 @@ from neutron.tests.unit.api.v2 import test_base
 from neutron.tests.unit import testlib_api
 
 
-class ProviderExtensionManager(object):
+class ProviderExtensionManager:
 
     def get_resources(self):
         return []
@@ -54,7 +55,7 @@ class ProvidernetExtensionTestCase(testlib_api.WebTestCase):
     fmt = 'json'
 
     def setUp(self):
-        super(ProvidernetExtensionTestCase, self).setUp()
+        super().setUp()
 
         plugin = 'neutron.neutron_plugin_base_v2.NeutronPluginBaseV2'
 
@@ -80,7 +81,7 @@ class ProvidernetExtensionTestCase(testlib_api.WebTestCase):
         self.api = webtest.TestApp(router.APIRouter())
 
         quota.QUOTAS._driver = None
-        cfg.CONF.set_override('quota_driver', 'neutron.quota.ConfDriver',
+        cfg.CONF.set_override('quota_driver', quota_conf.QUOTA_DB_DRIVER,
                               group='QUOTAS')
 
     def _prepare_net_data(self):
@@ -91,21 +92,28 @@ class ProvidernetExtensionTestCase(testlib_api.WebTestCase):
 
     def _put_network_with_provider_attrs(self, ctx, expect_errors=False):
         data = self._prepare_net_data()
+        ctx.roles = ['member', 'reader']
+        if ctx.is_admin:
+            ctx.roles.append('admin')
         env = {'neutron.context': ctx}
         instance = self.plugin.return_value
-        instance.get_network.return_value = {'tenant_id': ctx.tenant_id,
+        instance.get_network.return_value = {'project_id': ctx.tenant_id,
                                              'shared': False}
         net_id = uuidutils.generate_uuid()
         res = self.api.put(test_base._get_path('networks',
                                                id=net_id,
                                                fmt=self.fmt),
                            self.serialize({'network': data}),
+                           content_type='application/' + self.fmt,
                            extra_environ=env,
                            expect_errors=expect_errors)
         return res, data, net_id
 
     def _post_network_with_provider_attrs(self, ctx, expect_errors=False):
         data = self._prepare_net_data()
+        ctx.roles = ['member', 'reader']
+        if ctx.is_admin:
+            ctx.roles.append('admin')
         env = {'neutron.context': ctx}
         res = self.api.post(test_base._get_path('networks', fmt=self.fmt),
                             self.serialize({'network': data}),
@@ -118,6 +126,9 @@ class ProvidernetExtensionTestCase(testlib_api.WebTestCase):
                                               expect_errors=False):
         data = self._prepare_net_data()
         data.update(bad_data)
+        ctx.roles = ['member', 'reader']
+        if ctx.is_admin:
+            ctx.roles.append('admin')
         env = {'neutron.context': ctx}
         res = self.api.post(test_base._get_path('networks', fmt=self.fmt),
                             self.serialize({'network': data}),
@@ -130,8 +141,9 @@ class ProvidernetExtensionTestCase(testlib_api.WebTestCase):
         ctx = context.get_admin_context()
         tenant_id = 'an_admin'
         ctx.tenant_id = tenant_id
-        res, data = self._post_network_with_provider_attrs(ctx)
         instance = self.plugin.return_value
+        instance.create_network.return_value = {}
+        res, data = self._post_network_with_provider_attrs(ctx)
         exp_input = {'network': data}
         exp_input['network'].update({'admin_state_up': True,
                                      'tenant_id': tenant_id,
@@ -152,8 +164,9 @@ class ProvidernetExtensionTestCase(testlib_api.WebTestCase):
     def test_network_update_with_provider_attrs(self):
         ctx = context.get_admin_context()
         ctx.tenant_id = 'an_admin'
-        res, data, net_id = self._put_network_with_provider_attrs(ctx)
         instance = self.plugin.return_value
+        instance.update_network.return_value = {}
+        res, data, net_id = self._put_network_with_provider_attrs(ctx)
         exp_input = {'network': data}
         instance.update_network.assert_called_with(mock.ANY,
                                                    net_id,

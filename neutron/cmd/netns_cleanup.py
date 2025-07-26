@@ -35,6 +35,7 @@ from neutron.common import config
 from neutron.conf.agent import cmd
 from neutron.conf.agent import common as agent_config
 from neutron.conf.agent import dhcp as dhcp_config
+from neutron.privileged.agent.linux import utils as priv_utils
 
 LOG = logging.getLogger(__name__)
 NS_PREFIXES = {
@@ -43,14 +44,13 @@ NS_PREFIXES = {
            dvr_fip_ns.FIP_NS_PREFIX],
 }
 SIGTERM_WAITTIME = 10
-NETSTAT_PIDS_REGEX = re.compile(r'.* (?P<pid>\d{2,6})/.*')
 
 
 class PidsInNamespaceException(Exception):
     pass
 
 
-class FakeDhcpPlugin(object):
+class FakeDhcpPlugin:
     """Fake RPC plugin to bypass any RPC calls."""
     def __getattribute__(self, name):
         def fake_method(*args):
@@ -66,6 +66,7 @@ def setup_conf():
     """
 
     conf = cfg.CONF
+    config.register_common_config_options()
     cmd.register_cmd_opts(cmd.netns_opts, conf)
     agent_config.register_interface_driver_opts_helper(conf)
     dhcp_config.register_agent_dhcp_opts(conf)
@@ -104,8 +105,8 @@ def eligible_for_deletion(conf, namespace, force=False):
         prefixes = NS_PREFIXES.get(conf.agent_type)
     else:
         prefixes = itertools.chain(*NS_PREFIXES.values())
-    ns_mangling_pattern = '(%s%s)' % ('|'.join(prefixes),
-                                      constants.UUID_PATTERN)
+    ns_mangling_pattern = '({}{})'.format('|'.join(prefixes),
+                                          constants.UUID_PATTERN)
 
     # filter out namespaces without UUID as the name
     if not re.match(ns_mangling_pattern, namespace):
@@ -134,22 +135,6 @@ def unplug_device(device):
         device.set_log_fail_as_error(orig_log_fail_as_error)
 
 
-def find_listen_pids_namespace(namespace):
-    """Retrieve a list of pids of listening processes within the given netns.
-
-    It executes netstat -nlp and returns a set of unique pairs
-    """
-    ip = ip_lib.IPWrapper(namespace=namespace)
-    pids = set()
-    cmd = ['netstat', '-nlp']
-    output = ip.netns.execute(cmd, run_as_root=True)
-    for line in output.splitlines():
-        m = NETSTAT_PIDS_REGEX.match(line)
-        if m:
-            pids.add(m.group('pid'))
-    return pids
-
-
 def wait_until_no_listen_pids_namespace(namespace, timeout=SIGTERM_WAITTIME):
     """Poll listening processes within the given namespace.
 
@@ -164,7 +149,7 @@ def wait_until_no_listen_pids_namespace(namespace, timeout=SIGTERM_WAITTIME):
     # previous command
     start = end = time.time()
     while end - start < timeout:
-        if not find_listen_pids_namespace(namespace):
+        if not priv_utils.find_listen_pids_namespace(namespace):
             return
         time.sleep(1)
         end = time.time()
@@ -179,7 +164,7 @@ def _kill_listen_processes(namespace, force=False):
     then a SIGKILL will be issued to all parents and all their children. Also,
     this function returns the number of listening processes.
     """
-    pids = find_listen_pids_namespace(namespace)
+    pids = priv_utils.find_listen_pids_namespace(namespace)
     pids_to_kill = {utils.find_fork_top_parent(pid) for pid in pids}
     kill_signal = signal.SIGTERM
     if force:

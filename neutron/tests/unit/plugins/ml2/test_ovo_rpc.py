@@ -17,6 +17,7 @@ from neutron_lib import context
 from neutron_lib.db import api as db_api
 from neutron_lib.plugins import directory
 
+from neutron.objects import address_group
 from neutron.objects import network
 from neutron.objects import securitygroup
 from neutron.objects import subnet
@@ -27,25 +28,35 @@ from neutron.tests.unit.plugins.ml2 import test_plugin
 class OVOServerRpcInterfaceTestCase(test_plugin.Ml2PluginV2TestCase):
 
     def setUp(self):
-        super(OVOServerRpcInterfaceTestCase, self).setUp()
+        super().setUp()
         self.plugin = directory.get_plugin()
         self.ctx = context.get_admin_context()
         self.received = []
-        receive = lambda s, ctx, obs, evt: self.received.append((obs[0], evt))
+        def receive(s, ctx, obs, evt):
+            return self.received.append((obs[0], evt))
         mock.patch('neutron.api.rpc.handlers.resources_rpc.'
                    'ResourcesPushRpcApi.push', new=receive).start()
         # base case blocks the handler
         self.ovo_push_interface_p.stop()
         self.plugin.ovo_notifier = ovo_rpc.OVOServerRpcInterface()
 
-    def _assert_object_received(self, ovotype, oid=None, event=None):
-        self.plugin.ovo_notifier.wait()
+    def _assert_object_received(self, ovotype, oid=None, event=None,
+                                count=1):
+        match = 0
         for obj, evt in self.received:
             if isinstance(obj, ovotype):
                 if (obj.id == oid or not oid) and (not event or event == evt):
-                    return obj
-        self.fail("Could not find OVO %s with ID %s in %s" %
-                  (ovotype, oid, self.received))
+                    match += 1
+                    if count == 1:
+                        return obj
+        if count > 1:
+            self.assertEqual(
+                match, count,
+                "Could not find match %s for OVO %s with ID %s in %s" %
+                (match, ovotype, oid, self.received))
+            return
+        self.fail("Could not find OVO %s with ID %s or event %s in %s" %
+                  (ovotype, oid, event, self.received))
 
     def test_network_lifecycle(self):
         with self.network() as n:
@@ -73,13 +84,15 @@ class OVOServerRpcInterfaceTestCase(test_plugin.Ml2PluginV2TestCase):
             sg = self._assert_object_received(securitygroup.SecurityGroup,
                                               event='updated')
             self.assertEqual(sg.tenant_id, n['network']['tenant_id'])
-            sgr = self.plugin.create_security_group_rule(self.ctx,
+            sgr = self.plugin.create_security_group_rule(
+                self.ctx,
                 {'security_group_rule': {'security_group_id': sg.id,
                                          'tenant_id': sg.tenant_id,
                                          'port_range_min': None,
                                          'port_range_max': None,
                                          'remote_ip_prefix': None,
                                          'remote_group_id': None,
+                                         'remote_address_group_id': None,
                                          'protocol': None,
                                          'direction': None,
                                          'ethertype': 'IPv4'}})
@@ -101,3 +114,30 @@ class OVOServerRpcInterfaceTestCase(test_plugin.Ml2PluginV2TestCase):
                                               'description': 'desc',
                                               'name': 'test'}})
             self.assertEqual([], self.received)
+
+    def test_address_group_lifecycle(self):
+        ag = self.plugin.create_address_group(
+            self.ctx,
+            {'address_group': {'project_id': self._tenant_id,
+                               'name': 'an-address-group',
+                               'description': 'An address group',
+                               'addresses': ['10.0.0.1/32',
+                                             '2001:db8::/32']}})
+        self._assert_object_received(
+            address_group.AddressGroup, ag['id'], 'updated', 2)
+        self.plugin.update_address_group(
+            self.ctx, ag['id'],
+            {'address_group': {'name': 'an-address-group-other-name'}})
+        self._assert_object_received(
+            address_group.AddressGroup, ag['id'], 'updated', 3)
+        self.plugin.add_addresses(self.ctx, ag['id'],
+                                  {'addresses': ['10.0.0.2/32']})
+        self._assert_object_received(
+            address_group.AddressGroup, ag['id'], 'updated', 4)
+        self.plugin.remove_addresses(self.ctx, ag['id'],
+                                     {'addresses': ['10.0.0.1/32']})
+        self._assert_object_received(
+            address_group.AddressGroup, ag['id'], 'updated', 5)
+        self.plugin.delete_address_group(self.ctx, ag['id'])
+        self._assert_object_received(
+            address_group.AddressGroup, ag['id'], 'deleted')

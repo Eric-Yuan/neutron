@@ -16,10 +16,10 @@
 import copy
 import datetime
 
-from eventlet import greenthread
 from neutron_lib.agent import constants as agent_consts
 from neutron_lib.api import converters
 from neutron_lib.api.definitions import agent as agent_apidef
+from neutron_lib.api.definitions import availability_zone_filter as azfil_ext
 from neutron_lib.api import extensions
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
@@ -27,24 +27,22 @@ from neutron_lib.callbacks import resources
 from neutron_lib import constants
 from neutron_lib import context
 from neutron_lib.db import api as db_api
-from neutron_lib.db import model_query
 from neutron_lib.db import utils as db_utils
 from neutron_lib.exceptions import agent as agent_exc
 from neutron_lib.exceptions import availability_zone as az_exc
 from neutron_lib.plugins import directory
 from oslo_config import cfg
+from oslo_db import exception as db_exc
 from oslo_log import log as logging
 import oslo_messaging
 from oslo_serialization import jsonutils
 from oslo_utils import importutils
 from oslo_utils import timeutils
-import six
+from sqlalchemy.sql import expression
 
 from neutron.agent.common import utils
 from neutron.api.rpc.callbacks import version_manager
 from neutron.conf.agent.database import agents_db
-from neutron.db.models import agent as agent_model
-from neutron.extensions import _availability_zone_filter_lib as azfil_ext
 from neutron.extensions import agent as ext_agent
 from neutron.extensions import availability_zone as az_ext
 from neutron.objects import agent as agent_obj
@@ -80,9 +78,9 @@ def get_availability_zones_by_agent_type(context, agent_type,
                                          availability_zones):
     """Get list of availability zones based on agent type"""
 
-    agents = agent_obj.Agent._get_agents_by_availability_zones_and_agent_type(
+    agents = agent_obj.Agent.get_agents_by_availability_zones_and_agent_type(
         context, agent_type=agent_type, availability_zones=availability_zones)
-    return set(agent.availability_zone for agent in agents)
+    return {agent.availability_zone for agent in agents}
 
 
 class AgentAvailabilityZoneMixin(az_ext.AvailabilityZonePluginBase):
@@ -125,7 +123,7 @@ class AgentAvailabilityZoneMixin(az_ext.AvailabilityZonePluginBase):
 
     def _adjust_az_filters(self, filters):
         # The intersect of sets gets us applicable filter keys (others ignored)
-        common_keys = six.viewkeys(filters) & six.viewkeys(AZ_ATTRIBUTE_MAP)
+        common_keys = filters.keys() & AZ_ATTRIBUTE_MAP.keys()
         for key in common_keys:
             filter_key = AZ_ATTRIBUTE_MAP[key]['agent_key']
             filter_vals = filters.pop(key)
@@ -149,16 +147,15 @@ class AgentAvailabilityZoneMixin(az_ext.AvailabilityZonePluginBase):
                      'name': k[0], 'resource': k[1],
                      'tenant_id': context.tenant_id}
                     for k, v in self._list_availability_zones(
-                                               context, filters).items()
+                        context, filters).items()
                     if not filter_states or v in filter_states]
-        else:
-            # NOTE(hichihara): 'tenant_id' is dummy for policy check.
-            # it is not visible via API.
-            return [{'state': v,
-                     'name': k[0], 'resource': k[1],
-                     'tenant_id': context.tenant_id}
-                    for k, v in self._list_availability_zones(
-                                               context, filters).items()]
+        # NOTE(hichihara): 'tenant_id' is dummy for policy check. it is not
+        # visible via API.
+        return [{'state': v,
+                 'name': k[0], 'resource': k[1],
+                 'tenant_id': context.tenant_id}
+                for k, v in self._list_availability_zones(
+                    context, filters).items()]
 
     @db_api.retry_if_session_inactive()
     def validate_availability_zones(self, context, resource_type,
@@ -242,7 +239,7 @@ class AgentDbMixin(ext_agent.AgentPluginBase, AgentAvailabilityZoneMixin):
         configs = agent.get('configurations', {})
         load_type = None
         load = 0
-        if(agent['agent_type'] == constants.AGENT_TYPE_DHCP):
+        if (agent['agent_type'] == constants.AGENT_TYPE_DHCP):
             load_type = cfg.CONF.dhcp_load_type
         if load_type:
             load = int(configs.get(load_type, 0))
@@ -251,8 +248,8 @@ class AgentDbMixin(ext_agent.AgentPluginBase, AgentAvailabilityZoneMixin):
     def _make_agent_dict(self, agent, fields=None):
         attr = agent_apidef.RESOURCE_ATTRIBUTE_MAP.get(
             agent_apidef.COLLECTION_NAME)
-        res = dict((k, agent[k]) for k in attr
-                   if k not in ['alive', 'configurations'])
+        res = {k: agent[k] for k in attr
+               if k not in ['alive', 'configurations']}
         res['alive'] = not utils.is_agent_down(
             res['heartbeat_timestamp']
         )
@@ -270,6 +267,9 @@ class AgentDbMixin(ext_agent.AgentPluginBase, AgentAvailabilityZoneMixin):
                          payload=events.DBEventPayload(
                              context, states=(agent,), resource_id=id))
         agent.delete()
+        registry.publish(resources.AGENT, events.AFTER_DELETE, self,
+                         payload=events.DBEventPayload(
+                             context, states=(agent,), resource_id=id))
 
     @db_api.retry_if_session_inactive()
     def update_agent(self, context, id, agent):
@@ -279,15 +279,6 @@ class AgentDbMixin(ext_agent.AgentPluginBase, AgentAvailabilityZoneMixin):
             agent.update_fields(agent_data)
             agent.update()
         return self._make_agent_dict(agent)
-
-    @db_api.retry_if_session_inactive()
-    def get_agents_db(self, context, filters=None):
-        # TODO(annp): keep this method for backward compatibility,
-        #             will need to clean it up later
-        query = model_query.get_collection_query(context,
-                                                 agent_model.Agent,
-                                                 filters=filters)
-        return query.all()
 
     @db_api.retry_if_session_inactive()
     def get_agent_objects(self, context, filters=None):
@@ -380,7 +371,7 @@ class AgentDbMixin(ext_agent.AgentPluginBase, AgentAvailabilityZoneMixin):
         status = agent_consts.AGENT_ALIVE
         with db_api.CONTEXT_WRITER.using(context):
             res_keys = ['agent_type', 'binary', 'host', 'topic']
-            res = dict((k, agent_state[k]) for k in res_keys)
+            res = {k: agent_state[k] for k in res_keys}
             if 'availability_zone' in agent_state:
                 res['availability_zone'] = agent_state['availability_zone']
             configurations_dict = agent_state.get('configurations', {})
@@ -395,6 +386,7 @@ class AgentDbMixin(ext_agent.AgentPluginBase, AgentAvailabilityZoneMixin):
                 agent = self._get_agent_by_type_and_host(
                     context, agent_state['agent_type'], agent_state['host'])
                 agent_state_orig = copy.deepcopy(agent_state)
+                agent_state_previous = copy.deepcopy(agent)
                 if not agent.is_active:
                     status = agent_consts.AGENT_REVIVED
                     if 'resource_versions' not in agent_state:
@@ -407,7 +399,6 @@ class AgentDbMixin(ext_agent.AgentPluginBase, AgentAvailabilityZoneMixin):
                 res['heartbeat_timestamp'] = current_time
                 if agent_state.get('start_flag'):
                     res['started_at'] = current_time
-                greenthread.sleep(0)
                 self._log_heartbeat(agent_state, agent, configurations_dict,
                                     agent_timestamp)
                 agent.update_fields(res)
@@ -415,22 +406,21 @@ class AgentDbMixin(ext_agent.AgentPluginBase, AgentAvailabilityZoneMixin):
                 event_type = events.AFTER_UPDATE
             except agent_exc.AgentNotFoundByTypeHost:
                 agent_state_orig = None
-                greenthread.sleep(0)
+                agent_state_previous = None
                 res['created_at'] = current_time
                 res['started_at'] = current_time
                 res['heartbeat_timestamp'] = current_time
                 res['admin_state_up'] = cfg.CONF.enable_new_agents
                 agent = agent_obj.Agent(context=context, **res)
-                greenthread.sleep(0)
                 agent.create()
                 event_type = events.AFTER_CREATE
                 self._log_heartbeat(agent_state, agent, configurations_dict,
                                     agent_timestamp)
                 status = agent_consts.AGENT_NEW
-            greenthread.sleep(0)
 
         agent_state['agent_status'] = status
         agent_state['admin_state_up'] = agent.admin_state_up
+        agent_state['id'] = agent.id
         registry.publish(resources.AGENT, event_type, self,
                          payload=events.DBEventPayload(
                              context=context, metadata={
@@ -438,7 +428,7 @@ class AgentDbMixin(ext_agent.AgentPluginBase, AgentAvailabilityZoneMixin):
                                  'plugin': self,
                                  'status': status
                              },
-                             states=(agent_state_orig, ),
+                             states=(agent_state_orig, agent_state_previous),
                              desired_state=agent_state,
                              resource_id=agent.id
                          ))
@@ -466,7 +456,7 @@ class AgentDbMixin(ext_agent.AgentPluginBase, AgentAvailabilityZoneMixin):
             tracker.set_versions(consumer, resource_versions)
 
 
-class AgentExtRpcCallback(object):
+class AgentExtRpcCallback:
     """Processes the rpc report in plugin implementations.
 
     This class implements the server side of an rpc interface.  The client side
@@ -478,14 +468,16 @@ class AgentExtRpcCallback(object):
         1.0 - Initial version.
         1.1 - report_state now returns agent state.
         1.2 - add method has_alive_neutron_server.
+        1.3 - has_alive_neutron_server tests db connection.
+        1.4 - add methods get_agents and delete_agent.
     """
 
-    target = oslo_messaging.Target(version='1.2',
+    target = oslo_messaging.Target(version='1.4',
                                    namespace=constants.RPC_NAMESPACE_STATE)
     START_TIME = timeutils.utcnow()
 
     def __init__(self, plugin=None):
-        super(AgentExtRpcCallback, self).__init__()
+        super().__init__()
         self.plugin = plugin
         # TODO(ajo): fix the resources circular dependency issue by dynamically
         #            registering object types in the RPC callbacks api
@@ -494,8 +486,23 @@ class AgentExtRpcCallback(object):
         # Initialize RPC api directed to other neutron-servers
         self.server_versions_rpc = resources_rpc.ResourcesPushToServersRpcApi()
 
+    @db_api.CONTEXT_READER
     def has_alive_neutron_server(self, context, **kwargs):
-        return True
+        """Give basic server status to agents.
+
+        Method for agents to check basic server status. In version 1.2 returned
+        always True so MQ connectivity could be checked. From version 1.3
+        return True or False according to a DB connection liveness check, so
+        both MQ and DB connectivity can be checked from the agent.
+        """
+        try:
+            context.session.scalar(expression.select(1))
+            return True
+        except db_exc.DBConnectionError:
+            return False
+        except Exception:
+            LOG.exception('Unexpected exception')
+            return False
 
     @db_api.retry_if_session_inactive()
     def report_state(self, context, **kwargs):
@@ -521,6 +528,41 @@ class AgentExtRpcCallback(object):
             context, agent_state, time)
         self._update_local_agent_resource_versions(context, agent_state)
         return agent_status
+
+    @db_api.retry_if_session_inactive()
+    def delete_agent(self, context, **kwargs):
+        """Delete agent on server
+
+        Deletes the agent on the server, if it exists.
+        """
+        try:
+            host = kwargs['host']
+            agent_type = kwargs['agent_type']
+        except KeyError:
+            LOG.warning("Insufficient arguments: %s for delete_agent; "
+                        "both 'host' and 'agent_type' are mandatory.",
+                        kwargs)
+            return
+        agent = agent_obj.Agent.get_object(context, **kwargs)
+        if not agent:
+            LOG.debug("No agent found for host: %(host)s with agent_type: "
+                      "%(agent_type)s, host already removed",
+                      {'host': host, 'agent_type': agent_type})
+            return
+        agent.delete()
+
+    @db_api.retry_if_session_inactive()
+    def get_agents(self, context, **filters):
+        """Get filtered list of agents.
+
+        Returns list of agents
+        """
+        is_active = filters.pop('is_active', None)
+        agents = agent_obj.Agent.get_objects(context, **filters)
+        if is_active is not None:
+            is_active = converters.convert_to_boolean(is_active)
+            agents = [a for a in agents if a.is_active == is_active]
+        return agents
 
     def _update_local_agent_resource_versions(self, context, agent_state):
         resource_versions_dict = agent_state.get('resource_versions')

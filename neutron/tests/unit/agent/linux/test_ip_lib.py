@@ -24,10 +24,10 @@ from neutron_lib import exceptions
 from oslo_utils import netutils
 from oslo_utils import uuidutils
 import pyroute2
-from pyroute2.netlink.rtnl import ifaddrmsg
+from pyroute2.netlink import exceptions as netlink_exceptions
 from pyroute2.netlink.rtnl import ifinfmsg
 from pyroute2.netlink.rtnl import ndmsg
-from pyroute2 import NetlinkError
+from pyroute2 import netns
 import testtools
 
 from neutron.agent.common import utils  # noqa
@@ -36,6 +36,7 @@ from neutron.common import utils as common_utils
 from neutron import privileged
 from neutron.privileged.agent.linux import ip_lib as priv_lib
 from neutron.tests import base
+
 
 NETNS_SAMPLE = [
     '12345678-1234-5678-abcd-1234567890ab',
@@ -99,10 +100,20 @@ SUBNET_SAMPLE1 = ("10.0.0.0/24 dev qr-23380d11-d2  scope link  src 10.0.0.1\n"
 SUBNET_SAMPLE2 = ("10.0.0.0/24 dev tap1d7888a7-10  scope link  src 10.0.0.2\n"
                   "10.0.0.0/24 dev qr-23380d11-d2  scope link  src 10.0.0.1")
 
+VXLAN4_GROUP_SAMPLE = "239.0.0.1"
+
+VXLAN4_LOCAL_SAMPLE = "192.168.45.100"
+
+VXLAN6_GROUP_SAMPLE = "ff00::1"
+
+VXLAN6_INVALID_IPV6_SAMPLE = "invalid:ipv6::address"
+
+VXLAN6_LOCAL_SAMPLE = "fd00::1"
+
 
 class TestSubProcessBase(base.BaseTestCase):
     def setUp(self):
-        super(TestSubProcessBase, self).setUp()
+        super().setUp()
         self.execute_p = mock.patch('neutron.agent.common.utils.execute')
         self.execute = self.execute_p.start()
 
@@ -112,6 +123,7 @@ class TestSubProcessBase(base.BaseTestCase):
 
         self.execute.assert_called_once_with(['ip', '-o', 'link', 'list'],
                                              run_as_root=True,
+                                             privsep_exec=True,
                                              log_fail_as_error=True)
 
     def test_execute_wrapper_int_options(self):
@@ -120,6 +132,7 @@ class TestSubProcessBase(base.BaseTestCase):
 
         self.execute.assert_called_once_with(['ip', '-4', 'link', 'list'],
                                              run_as_root=False,
+                                             privsep_exec=True,
                                              log_fail_as_error=True)
 
     def test_execute_wrapper_no_options(self):
@@ -128,6 +141,7 @@ class TestSubProcessBase(base.BaseTestCase):
 
         self.execute.assert_called_once_with(['ip', 'link', 'list'],
                                              run_as_root=False,
+                                             privsep_exec=True,
                                              log_fail_as_error=True)
 
     def test_run_no_namespace(self):
@@ -135,6 +149,7 @@ class TestSubProcessBase(base.BaseTestCase):
         base._run([], 'link', ('list',))
         self.execute.assert_called_once_with(['ip', 'link', 'list'],
                                              run_as_root=False,
+                                             privsep_exec=True,
                                              log_fail_as_error=True)
 
     def test_run_namespace(self):
@@ -143,6 +158,7 @@ class TestSubProcessBase(base.BaseTestCase):
         self.execute.assert_called_once_with(['ip', 'netns', 'exec', 'ns',
                                               'ip', 'link', 'list'],
                                              run_as_root=True,
+                                             privsep_exec=True,
                                              log_fail_as_error=True)
 
     def test_as_root_namespace(self):
@@ -151,12 +167,13 @@ class TestSubProcessBase(base.BaseTestCase):
         self.execute.assert_called_once_with(['ip', 'netns', 'exec', 'ns',
                                               'ip', 'link', 'list'],
                                              run_as_root=True,
+                                             privsep_exec=True,
                                              log_fail_as_error=True)
 
 
 class TestIpWrapper(base.BaseTestCase):
     def setUp(self):
-        super(TestIpWrapper, self).setUp()
+        super().setUp()
         self.execute_p = mock.patch.object(ip_lib.IPWrapper, '_execute')
         self.execute = self.execute_p.start()
 
@@ -186,7 +203,7 @@ class TestIpWrapper(base.BaseTestCase):
             netns_name='foo')
         self.assertEqual([], ip_lib.IPWrapper(namespace='foo').get_devices())
 
-    @mock.patch.object(pyroute2.netns, 'listnetns')
+    @mock.patch.object(netns, 'listnetns')
     @mock.patch.object(priv_lib, 'list_netns')
     def test_get_namespaces_non_root(self, priv_listnetns, listnetns):
         self.config(group='AGENT', use_helper_for_ns_read=False)
@@ -199,7 +216,7 @@ class TestIpWrapper(base.BaseTestCase):
         self.assertEqual(1, listnetns.call_count)
         self.assertFalse(priv_listnetns.called)
 
-    @mock.patch.object(pyroute2.netns, 'listnetns')
+    @mock.patch.object(netns, 'listnetns')
     @mock.patch.object(priv_lib, 'list_netns')
     def test_get_namespaces_root(self, priv_listnetns, listnetns):
         self.config(group='AGENT', use_helper_for_ns_read=True)
@@ -341,6 +358,21 @@ class TestIpWrapper(base.BaseTestCase):
                 self.assertNotIn(mock.call().delete('ns'),
                                  ip_ns_cmd_cls.mock_calls)
 
+    def test_garbage_collect_namespace_existing_broken(self):
+        with mock.patch.object(ip_lib, 'IpNetnsCommand') as ip_ns_cmd_cls:
+            ip_ns_cmd_cls.return_value.exists.return_value = True
+
+            ip = ip_lib.IPWrapper(namespace='ns')
+
+            with mock.patch.object(ip, 'get_devices',
+                                   side_effect=OSError(errno.EINVAL, None)
+                                   ) as mock_get_devices:
+                self.assertTrue(ip.garbage_collect_namespace())
+
+                mock_get_devices.assert_called_once_with()
+                expected = [mock.call().delete('ns')]
+                ip_ns_cmd_cls.assert_has_calls(expected)
+
     @mock.patch.object(priv_lib, 'create_interface')
     def test_add_vlan(self, create):
         retval = ip_lib.IPWrapper().add_vlan('eth0.1', 'eth0', '1')
@@ -369,20 +401,54 @@ class TestIpWrapper(base.BaseTestCase):
             'namespace': None,
             'kind': 'vxlan',
             'vxlan_id': 'vni0',
-            'vxlan_group': 'group0',
+            'vxlan_group': VXLAN4_GROUP_SAMPLE,
             'physical_interface': 'dev0',
             'vxlan_ttl': 'ttl0',
             'vxlan_tos': 'tos0',
-            'vxlan_local': 'local0',
+            'vxlan_local': VXLAN4_LOCAL_SAMPLE,
             'vxlan_proxy': True,
             'vxlan_port_range': ('1', '2')}
 
         retval = ip_lib.IPWrapper().add_vxlan('vxlan0', 'vni0',
-                                              group='group0',
+                                              group=VXLAN4_GROUP_SAMPLE,
                                               dev='dev0', ttl='ttl0',
                                               tos='tos0',
-                                              local='local0', proxy=True,
-                                              srcport=(1, 2))
+                                              local=VXLAN4_LOCAL_SAMPLE,
+                                              proxy=True, srcport=(1, 2))
+        self.assertIsInstance(retval, ip_lib.IPDevice)
+        self.assertEqual(retval.name, 'vxlan0')
+        self.assertDictEqual(expected_call_params, self.call_params)
+
+    @mock.patch.object(priv_lib, 'create_interface')
+    def test_add_vxlan6_valid_srcport_length(self, create):
+        self.call_params = {}
+
+        def fake_create_interface(ifname, namespace, kind, **kwargs):
+            self.call_params = dict(
+                ifname=ifname,
+                namespace=namespace,
+                kind=kind,
+                **kwargs)
+
+        create.side_effect = fake_create_interface
+        expected_call_params = {
+            'ifname': 'vxlan0',
+            'namespace': None,
+            'kind': 'vxlan',
+            'vxlan_id': 'vni0',
+            'vxlan_group6': VXLAN6_GROUP_SAMPLE,
+            'physical_interface': 'dev0',
+            'vxlan_ttl': 'ttl0',
+            'vxlan_tos': 'tos0',
+            'vxlan_local6': VXLAN6_LOCAL_SAMPLE,
+            'vxlan_proxy': True,
+            'vxlan_port_range': ('1', '2')}
+
+        retval = ip_lib.IPWrapper().add_vxlan('vxlan0', 'vni0', 'dev0',
+                                              group=VXLAN6_GROUP_SAMPLE,
+                                              ttl='ttl0', tos='tos0',
+                                              local=VXLAN6_LOCAL_SAMPLE,
+                                              proxy=True, srcport=(1, 2))
         self.assertIsInstance(retval, ip_lib.IPDevice)
         self.assertEqual(retval.name, 'vxlan0')
         self.assertDictEqual(expected_call_params, self.call_params)
@@ -390,18 +456,32 @@ class TestIpWrapper(base.BaseTestCase):
     def test_add_vxlan_invalid_srcport_length(self):
         wrapper = ip_lib.IPWrapper()
         self.assertRaises(exceptions.NetworkVxlanPortRangeError,
-                          wrapper.add_vxlan, 'vxlan0', 'vni0', group='group0',
-                          dev='dev0', ttl='ttl0', tos='tos0',
-                          local='local0', proxy=True,
+                          wrapper.add_vxlan, 'vxlan0', 'vni0',
+                          group=VXLAN4_GROUP_SAMPLE, dev='dev0', ttl='ttl0',
+                          tos='tos0', local=VXLAN4_LOCAL_SAMPLE, proxy=True,
                           srcport=('1', '2', '3'))
 
     def test_add_vxlan_invalid_srcport_range(self):
         wrapper = ip_lib.IPWrapper()
         self.assertRaises(exceptions.NetworkVxlanPortRangeError,
-                          wrapper.add_vxlan, 'vxlan0', 'vni0', group='group0',
-                          dev='dev0', ttl='ttl0', tos='tos0',
-                          local='local0', proxy=True,
+                          wrapper.add_vxlan, 'vxlan0', 'vni0',
+                          group=VXLAN4_GROUP_SAMPLE, dev='dev0', ttl='ttl0',
+                          tos='tos0', local=VXLAN4_LOCAL_SAMPLE, proxy=True,
                           srcport=(2000, 1000))
+
+    def test_add_vxlan_invalid_ipv6_groupaddr(self):
+        wrapper = ip_lib.IPWrapper()
+        self.assertRaises(exceptions.InvalidInput,
+                          wrapper.add_vxlan, 'vxlan0', 'vni0',
+                          group=VXLAN6_INVALID_IPV6_SAMPLE,
+                          dev='dev0', ttl='ttl0', tos='tos0')
+
+    def test_add_vxlan_invalid_ipv6_localaddr(self):
+        wrapper = ip_lib.IPWrapper()
+        self.assertRaises(exceptions.InvalidInput,
+                          wrapper.add_vxlan, 'vxlan0', 'vni0',
+                          local=VXLAN6_INVALID_IPV6_SAMPLE, dev='dev0',
+                          ttl='ttl0', tos='tos0')
 
     @mock.patch.object(priv_lib, 'create_interface')
     def test_add_vxlan_dstport(self, create):
@@ -420,21 +500,20 @@ class TestIpWrapper(base.BaseTestCase):
             'namespace': None,
             'kind': 'vxlan',
             'vxlan_id': 'vni0',
-            'vxlan_group': 'group0',
+            'vxlan_group': VXLAN4_GROUP_SAMPLE,
             'physical_interface': 'dev0',
             'vxlan_ttl': 'ttl0',
             'vxlan_tos': 'tos0',
-            'vxlan_local': 'local0',
+            'vxlan_local': VXLAN4_LOCAL_SAMPLE,
             'vxlan_proxy': True,
             'vxlan_port_range': ('1', '2'),
             'vxlan_port': 4789}
 
-        retval = ip_lib.IPWrapper().add_vxlan('vxlan0', 'vni0',
-                                              group='group0',
-                                              dev='dev0', ttl='ttl0',
-                                              tos='tos0',
-                                              local='local0', proxy=True,
-                                              srcport=(1, 2),
+        retval = ip_lib.IPWrapper().add_vxlan('vxlan0', 'vni0', 'dev0',
+                                              group=VXLAN4_GROUP_SAMPLE,
+                                              ttl='ttl0', tos='tos0',
+                                              local=VXLAN4_LOCAL_SAMPLE,
+                                              proxy=True, srcport=(1, 2),
                                               dstport=4789)
 
         self.assertIsInstance(retval, ip_lib.IPDevice)
@@ -481,50 +560,9 @@ class TestIPDevice(base.BaseTestCase):
         self.assertEqual(str(ip_lib.IPDevice('tap0')), 'tap0')
 
 
-class TestIPCommandBase(base.BaseTestCase):
-    def setUp(self):
-        super(TestIPCommandBase, self).setUp()
-        self.ip = mock.Mock()
-        self.ip.namespace = 'namespace'
-        self.ip_cmd = ip_lib.IpCommandBase(self.ip)
-        self.ip_cmd.COMMAND = 'foo'
-
-    def test_run(self):
-        self.ip_cmd._run([], ('link', 'show'))
-        self.ip.assert_has_calls([mock.call._run([], 'foo', ('link', 'show'))])
-
-    def test_run_with_options(self):
-        self.ip_cmd._run(['o'], ('link'))
-        self.ip.assert_has_calls([mock.call._run(['o'], 'foo', ('link'))])
-
-    def test_as_root_namespace_false(self):
-        self.ip_cmd._as_root([], ('link'))
-        self.ip.assert_has_calls(
-            [mock.call._as_root([],
-                                'foo',
-                                ('link'),
-                                use_root_namespace=False)])
-
-    def test_as_root_namespace_true(self):
-        self.ip_cmd._as_root([], ('link'), use_root_namespace=True)
-        self.ip.assert_has_calls(
-            [mock.call._as_root([],
-                                'foo',
-                                ('link'),
-                                use_root_namespace=True)])
-
-    def test_as_root_namespace_true_with_options(self):
-        self.ip_cmd._as_root('o', 'link', use_root_namespace=True)
-        self.ip.assert_has_calls(
-            [mock.call._as_root('o',
-                                'foo',
-                                ('link'),
-                                use_root_namespace=True)])
-
-
 class TestIPDeviceCommandBase(base.BaseTestCase):
     def setUp(self):
-        super(TestIPDeviceCommandBase, self).setUp()
+        super().setUp()
         self.ip_dev = mock.Mock()
         self.ip_dev.name = 'eth0'
         self.ip_dev._execute = mock.Mock(return_value='executed')
@@ -537,7 +575,7 @@ class TestIPDeviceCommandBase(base.BaseTestCase):
 
 class TestIPCmdBase(base.BaseTestCase):
     def setUp(self):
-        super(TestIPCmdBase, self).setUp()
+        super().setUp()
         self.parent = mock.Mock()
         self.parent.name = 'eth0'
 
@@ -545,15 +583,10 @@ class TestIPCmdBase(base.BaseTestCase):
         self.parent._run.assert_has_calls([
             mock.call(options, self.command, args)])
 
-    def _assert_sudo(self, options, args, use_root_namespace=False):
-        self.parent._as_root.assert_has_calls(
-            [mock.call(options, self.command, args,
-                       use_root_namespace=use_root_namespace)])
-
 
 class TestIpRuleCommand(TestIPCmdBase):
     def setUp(self):
-        super(TestIpRuleCommand, self).setUp()
+        super().setUp()
         self.parent._as_root.return_value = ''
         self.ns = uuidutils.generate_uuid()
         self.parent.namespace = self.ns
@@ -624,7 +657,7 @@ class TestIpRuleCommand(TestIPCmdBase):
 
 class TestIpLinkCommand(TestIPCmdBase):
     def setUp(self):
-        super(TestIpLinkCommand, self).setUp()
+        super().setUp()
         self.command = 'link'
         self.link_cmd = ip_lib.IpLinkCommand(self.parent)
 
@@ -659,8 +692,9 @@ class TestIpLinkCommand(TestIPCmdBase):
         set_link_attribute.assert_called_once_with(
             self.parent.name, self.parent.namespace, state='down')
 
+    @mock.patch.object(priv_lib, 'interface_exists', return_value=True)
     @mock.patch.object(priv_lib, 'set_link_attribute')
-    def test_set_netns(self, set_link_attribute):
+    def test_set_netns(self, set_link_attribute, *args):
         original_namespace = self.parent.namespace
         self.link_cmd.set_netns('foo')
         set_link_attribute.assert_called_once_with(
@@ -692,16 +726,17 @@ class TestIpLinkCommand(TestIPCmdBase):
         self.link_cmd.delete()
         delete.assert_called_once_with(self.parent.name, self.parent.namespace)
 
-    @mock.patch.object(priv_lib, 'get_link_attributes')
-    def test_settings_property(self, get_link_attributes):
-        self.link_cmd.attributes
+    @mock.patch.object(priv_lib, 'get_link_attributes', return_value='foo')
+    def test_attributes_property(self, get_link_attributes):
+        attrs = self.link_cmd.attributes
         get_link_attributes.assert_called_once_with(
             self.parent.name, self.parent.namespace)
+        self.assertEqual(attrs, 'foo')
 
 
 class TestIpAddrCommand(TestIPCmdBase):
     def setUp(self):
-        super(TestIpAddrCommand, self).setUp()
+        super().setUp()
         self.parent.name = 'tap0'
         self.command = 'addr'
         self.addr_cmd = ip_lib.IpAddrCommand(self.parent)
@@ -742,6 +777,18 @@ class TestIpAddrCommand(TestIPCmdBase):
             'global',
             None)
 
+    @mock.patch.object(priv_lib, 'add_ip_address')
+    def test_add_address_broadcast(self, add):
+        self.addr_cmd.add('192.168.45.100/32')
+        add.assert_called_once_with(
+            4,
+            '192.168.45.100',
+            32,
+            self.parent.name,
+            self.addr_cmd._parent.namespace,
+            'global',
+            '192.168.45.100')
+
     @mock.patch.object(priv_lib, 'delete_ip_address')
     def test_del_address(self, delete):
         self.addr_cmd.delete('192.168.45.100/24')
@@ -759,7 +806,8 @@ class TestIpAddrCommand(TestIPCmdBase):
             6, self.parent.name, self.addr_cmd._parent.namespace)
 
     def test_wait_until_address_ready(self):
-        self.addr_cmd.list = mock.Mock(return_value=[{'tentative': False}])
+        self.addr_cmd.list = mock.Mock(
+            return_value=[{'tentative': False, 'dadfailed': False}])
         # this address is not tentative or failed so it should return
         self.assertIsNone(self.addr_cmd.wait_until_address_ready(
             '2001:470:9:1224:fd91:272:581e:3a32'))
@@ -768,6 +816,24 @@ class TestIpAddrCommand(TestIPCmdBase):
         self.addr_cmd.list = mock.Mock(return_value=[])
         with testtools.ExpectedException(ip_lib.AddressNotReady):
             self.addr_cmd.wait_until_address_ready('abcd::1234')
+
+    def test_wait_until_address_dadfailed(self):
+        self.addr_cmd.list = mock.Mock(
+            return_value=[{'tentative': True, 'dadfailed': True}])
+        with testtools.ExpectedException(ip_lib.DADFailed):
+            self.addr_cmd.wait_until_address_ready('abcd::1234')
+
+    @mock.patch.object(common_utils, 'wait_until_true')
+    def test_wait_until_address_ready_success_one_timeout(self, mock_wuntil):
+        tentative_address = 'fe80::3023:39ff:febc:22ae'
+        self.addr_cmd.list = mock.Mock(return_value=[
+            dict(scope='link', dadfailed=False, tentative=True, dynamic=False,
+                 cidr=tentative_address + '/64'),
+            dict(scope='link', dadfailed=False, tentative=False, dynamic=False,
+                 cidr=tentative_address + '/64')])
+        self.assertIsNone(self.addr_cmd.wait_until_address_ready(
+            tentative_address, wait_time=3))
+        self.assertEqual(1, mock_wuntil.call_count)
 
     def test_wait_until_address_ready_timeout(self):
         tentative_address = 'fe80::3023:39ff:febc:22ae'
@@ -791,7 +857,7 @@ class TestIpAddrCommand(TestIPCmdBase):
         self.addr_cmd.list(scope='link')
         mock_get_dev_ip.assert_called_once_with('test_ns',
                                                 name=self.addr_cmd.name,
-                                                scope=253)
+                                                scope='link')
 
     @mock.patch.object(ip_lib, 'get_devices_with_ip')
     def test_list_to(self, mock_get_dev_ip):
@@ -844,7 +910,7 @@ class TestIpAddrCommand(TestIPCmdBase):
 
 class TestIpNetnsCommand(TestIPCmdBase):
     def setUp(self):
-        super(TestIpNetnsCommand, self).setUp()
+        super().setUp()
         self.command = 'netns'
         self.netns_cmd = ip_lib.IpNetnsCommand(self.parent)
 
@@ -858,37 +924,12 @@ class TestIpNetnsCommand(TestIPCmdBase):
                 ['ip', 'netns', 'exec', 'ns',
                  'sysctl', '-w', 'net.ipv4.conf.all.promote_secondaries=1'],
                 run_as_root=True, check_exit_code=True, extra_ok_codes=None,
-                log_fail_as_error=True)
+                log_fail_as_error=True, privsep_exec=True)
 
     @mock.patch.object(priv_lib, 'remove_netns')
     def test_delete_namespace(self, remove):
         self.netns_cmd.delete('ns')
         remove.assert_called_once_with('ns')
-
-    @mock.patch.object(pyroute2.netns, 'listnetns')
-    @mock.patch.object(priv_lib, 'list_netns')
-    def test_namespace_exists_use_helper(self, priv_listnetns, listnetns):
-        self.config(group='AGENT', use_helper_for_ns_read=True)
-        priv_listnetns.return_value = NETNS_SAMPLE
-        # need another instance to avoid mocking
-        netns_cmd = ip_lib.IpNetnsCommand(ip_lib.SubProcessBase())
-        self.assertTrue(
-            netns_cmd.exists('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'))
-        self.assertEqual(1, priv_listnetns.call_count)
-        self.assertFalse(listnetns.called)
-
-    @mock.patch.object(pyroute2.netns, 'listnetns')
-    @mock.patch.object(priv_lib, 'list_netns')
-    def test_namespace_does_not_exist_no_helper(self, priv_listnetns,
-                                                listnetns):
-        self.config(group='AGENT', use_helper_for_ns_read=False)
-        listnetns.return_value = NETNS_SAMPLE
-        # need another instance to avoid mocking
-        netns_cmd = ip_lib.IpNetnsCommand(ip_lib.SubProcessBase())
-        self.assertFalse(
-            netns_cmd.exists('bbbbbbbb-1111-2222-3333-bbbbbbbbbbbb'))
-        self.assertEqual(1, listnetns.call_count)
-        self.assertFalse(priv_listnetns.called)
 
     def test_execute(self):
         self.parent.namespace = 'ns'
@@ -899,7 +940,8 @@ class TestIpNetnsCommand(TestIPCmdBase):
                                             run_as_root=True,
                                             check_exit_code=True,
                                             extra_ok_codes=None,
-                                            log_fail_as_error=True)
+                                            log_fail_as_error=True,
+                                            privsep_exec=False)
 
     def test_execute_env_var_prepend(self):
         self.parent.namespace = 'ns'
@@ -908,10 +950,10 @@ class TestIpNetnsCommand(TestIPCmdBase):
             self.netns_cmd.execute(['ip', 'link', 'list'], env)
             execute.assert_called_once_with(
                 ['ip', 'netns', 'exec', 'ns', 'env'] +
-                ['%s=%s' % (k, v) for k, v in env.items()] +
+                [f'{k}={v}' for k, v in env.items()] +
                 ['ip', 'link', 'list'],
                 run_as_root=True, check_exit_code=True, extra_ok_codes=None,
-                log_fail_as_error=True)
+                log_fail_as_error=True, privsep_exec=False)
 
     def test_execute_nosudo_with_no_namespace(self):
         with mock.patch('neutron.agent.common.utils.execute') as execute:
@@ -921,7 +963,8 @@ class TestIpNetnsCommand(TestIPCmdBase):
                                             check_exit_code=True,
                                             extra_ok_codes=None,
                                             run_as_root=False,
-                                            log_fail_as_error=True)
+                                            log_fail_as_error=True,
+                                            privsep_exec=False)
 
 
 class TestDeviceExists(base.BaseTestCase):
@@ -953,345 +996,9 @@ class TestDeviceExists(base.BaseTestCase):
             self.assertFalse(ip_lib.ensure_device_is_ready("lo"))
 
 
-class TestGetRoutingTable(base.BaseTestCase):
-    ip_db_interfaces = {
-        1: {
-            'family': 0,
-            'txqlen': 0,
-            'ipdb_scope': 'system',
-            'index': 1,
-            'operstate': 'DOWN',
-            'num_tx_queues': 1,
-            'group': 0,
-            'carrier_changes': 0,
-            'ipaddr': [],
-            'neighbours': [],
-            'ifname': 'lo',
-            'promiscuity': 0,
-            'linkmode': 0,
-            'broadcast': '00:00:00:00:00:00',
-            'address': '00:00:00:00:00:00',
-            'vlans': [],
-            'ipdb_priority': 0,
-            'qdisc': 'noop',
-            'mtu': 65536,
-            'num_rx_queues': 1,
-            'carrier': 1,
-            'flags': 8,
-            'ifi_type': 772,
-            'ports': []
-        },
-        2: {
-            'family': 0,
-            'txqlen': 500,
-            'ipdb_scope': 'system',
-            'index': 2,
-            'operstate': 'DOWN',
-            'num_tx_queues': 1,
-            'group': 0,
-            'carrier_changes': 1,
-            'ipaddr': ['1111:1111:1111:1111::3/64', '10.0.0.3/24'],
-            'neighbours': [],
-            'ifname': 'tap-1',
-            'promiscuity': 0,
-            'linkmode': 0,
-            'broadcast': 'ff:ff:ff:ff:ff:ff',
-            'address': 'b6:d5:f6:a8:2e:62',
-            'vlans': [],
-            'ipdb_priority': 0,
-            'kind': 'tun',
-            'qdisc': 'fq_codel',
-            'mtu': 1500,
-            'num_rx_queues': 1,
-            'carrier': 0,
-            'flags': 4099,
-            'ifi_type': 1,
-            'ports': []
-        },
-        'tap-1': {
-            'family': 0,
-            'txqlen': 500,
-            'ipdb_scope': 'system',
-            'index': 2,
-            'operstate': 'DOWN',
-            'num_tx_queues': 1,
-            'group': 0,
-            'carrier_changes': 1,
-            'ipaddr': ['1111:1111:1111:1111::3/64', '10.0.0.3/24'],
-            'neighbours': [],
-            'ifname': 'tap-1',
-            'promiscuity': 0,
-            'linkmode': 0,
-            'broadcast': 'ff:ff:ff:ff:ff:ff',
-            'address': 'b6:d5:f6:a8:2e:62',
-            'vlans': [],
-            'ipdb_priority': 0,
-            'kind': 'tun',
-            'qdisc': 'fq_codel',
-            'mtu': 1500,
-            'num_rx_queues': 1,
-            'carrier': 0,
-            'flags': 4099,
-            'ifi_type': 1,
-            'ports': []
-        },
-        'lo': {
-            'family': 0,
-            'txqlen': 0,
-            'ipdb_scope': 'system',
-            'index': 1,
-            'operstate': 'DOWN',
-            'num_tx_queues': 1,
-            'group': 0,
-            'carrier_changes': 0,
-            'ipaddr': [],
-            'neighbours': [],
-            'ifname': 'lo',
-            'promiscuity': 0,
-            'linkmode': 0,
-            'broadcast': '00:00:00:00:00:00',
-            'address': '00:00:00:00:00:00',
-            'vlans': [],
-            'ipdb_priority': 0,
-            'qdisc': 'noop',
-            'mtu': 65536,
-            'num_rx_queues': 1,
-            'carrier': 1,
-            'flags': 8,
-            'ifi_type': 772,
-            'ports': []
-        }
-    }
-
-    ip_db_routes = [
-        {
-            'oif': 2,
-            'dst_len': 24,
-            'family': 2,
-            'proto': 3,
-            'tos': 0,
-            'dst': '10.0.1.0/24',
-            'flags': 16,
-            'ipdb_priority': 0,
-            'metrics': {},
-            'scope': 0,
-            'encap': {},
-            'src_len': 0,
-            'table': 254,
-            'multipath': [],
-            'type': 1,
-            'gateway': '10.0.0.1',
-            'ipdb_scope': 'system'
-        }, {
-            'oif': 2,
-            'type': 1,
-            'dst_len': 24,
-            'family': 2,
-            'proto': 2,
-            'tos': 0,
-            'dst': '10.0.0.0/24',
-            'ipdb_priority': 0,
-            'metrics': {},
-            'flags': 16,
-            'encap': {},
-            'src_len': 0,
-            'table': 254,
-            'multipath': [],
-            'prefsrc': '10.0.0.3',
-            'scope': 253,
-            'ipdb_scope': 'system'
-        }, {
-            'oif': 2,
-            'dst_len': 0,
-            'family': 2,
-            'proto': 3,
-            'tos': 0,
-            'dst': 'default',
-            'flags': 16,
-            'ipdb_priority': 0,
-            'metrics': {},
-            'scope': 0,
-            'encap': {},
-            'src_len': 0,
-            'table': 254,
-            'multipath': [],
-            'type': 1,
-            'gateway': '10.0.0.2',
-            'ipdb_scope': 'system'
-        }, {
-            'metrics': {},
-            'oif': 2,
-            'dst_len': 64,
-            'family': socket.AF_INET6,
-            'proto': 2,
-            'tos': 0,
-            'dst': '1111:1111:1111:1111::/64',
-            'pref': '00',
-            'ipdb_priority': 0,
-            'priority': 256,
-            'flags': 0,
-            'encap': {},
-            'src_len': 0,
-            'table': 254,
-            'multipath': [],
-            'type': 1,
-            'scope': 0,
-            'ipdb_scope': 'system'
-        }, {
-            'metrics': {},
-            'oif': 2,
-            'dst_len': 64,
-            'family': socket.AF_INET6,
-            'proto': 3,
-            'tos': 0,
-            'dst': '1111:1111:1111:1112::/64',
-            'pref': '00',
-            'flags': 0,
-            'ipdb_priority': 0,
-            'priority': 1024,
-            'scope': 0,
-            'encap': {},
-            'src_len': 0,
-            'table': 254,
-            'multipath': [],
-            'type': 1,
-            'gateway': '1111:1111:1111:1111::1',
-            'ipdb_scope': 'system'
-        }
-    ]
-
-    ip_db_multipath_routes = [
-        {
-            'dst_len': 24,
-            'family': socket.AF_INET,
-            'proto': 3,
-            'tos': 0,
-            'dst': '10.0.1.0/24',
-            'flags': 16,
-            'ipdb_priority': 0,
-            'metrics': {},
-            'scope': 0,
-            'encap': {},
-            'src_len': 0,
-            'table': 254,
-            'multipath': ({'oif': 1, 'family': socket.AF_INET},
-                          {'oif': 2, 'dst_len': 24, 'family': socket.AF_INET,
-                           'proto': 2, 'tos': 0, 'pref': '00',
-                           'priority': 256, 'flags': 0, 'encap': {},
-                           'src_len': 0, 'table': 254, 'type': 1,
-                           'scope': 0}),
-            'type': 1,
-            'gateway': '10.0.0.1',
-            'ipdb_scope': 'system'
-        }, {
-            'metrics': {},
-            'dst_len': 64,
-            'family': socket.AF_INET6,
-            'proto': 2,
-            'tos': 0,
-            'dst': '1111:1111:1111:1111::/64',
-            'pref': '00',
-            'ipdb_priority': 0,
-            'priority': 256,
-            'flags': 0,
-            'encap': {},
-            'src_len': 0,
-            'table': 254,
-            'multipath': ({'oif': 1, 'family': socket.AF_INET6},
-                          {'oif': 2, 'dst_len': 64, 'family': socket.AF_INET6,
-                           'proto': 2, 'tos': 0, 'pref': '00',
-                           'priority': 256, 'flags': 0, 'encap': {},
-                           'src_len': 0, 'table': 254, 'type': 1,
-                           'scope': 0}),
-            'type': 1,
-            'scope': 0,
-            'ipdb_scope': 'system'
-        }
-    ]
-
-    def setUp(self):
-        super(TestGetRoutingTable, self).setUp()
-        self.addCleanup(privileged.default.set_client_mode, True)
-        privileged.default.set_client_mode(False)
-
-    @mock.patch.object(pyroute2, 'IPDB')
-    @mock.patch.object(pyroute2, 'NetNS')
-    def test_get_routing_table_nonexistent_namespace(self,
-                                                     mock_netns, mock_ip_db):
-        mock_netns.side_effect = OSError(errno.ENOENT, None)
-        with testtools.ExpectedException(ip_lib.NetworkNamespaceNotFound):
-            ip_lib.get_routing_table(4, 'ns')
-
-    @mock.patch.object(pyroute2, 'IPDB')
-    @mock.patch.object(pyroute2, 'NetNS')
-    def test_get_routing_table_other_error(self, mock_netns, mock_ip_db):
-        expected_exception = OSError(errno.EACCES, None)
-        mock_netns.side_effect = expected_exception
-        with testtools.ExpectedException(expected_exception.__class__):
-            ip_lib.get_routing_table(4, 'ns')
-
-    @mock.patch.object(pyroute2, 'IPDB')
-    @mock.patch.object(pyroute2, 'NetNS')
-    def _test_get_routing_table(self, version, ip_db_routes, expected,
-                                mock_netns, mock_ip_db):
-        mock_ip_db_instance = mock_ip_db.return_value
-        mock_ip_db_enter = mock_ip_db_instance.__enter__.return_value
-        mock_ip_db_enter.interfaces = self.ip_db_interfaces
-        mock_ip_db_enter.routes = ip_db_routes
-        self.assertEqual(expected, ip_lib.get_routing_table(version))
-
-    def test_get_routing_table_4(self):
-        expected = [{'destination': '10.0.1.0/24',
-                     'nexthop': '10.0.0.1',
-                     'device': 'tap-1',
-                     'scope': 'universe'},
-                    {'destination': '10.0.0.0/24',
-                     'nexthop': None,
-                     'device': 'tap-1',
-                     'scope': 'link'},
-                    {'destination': 'default',
-                     'nexthop': '10.0.0.2',
-                     'device': 'tap-1',
-                     'scope': 'universe'}]
-        self._test_get_routing_table(4, self.ip_db_routes, expected)
-
-    def test_get_routing_table_6(self):
-        expected = [{'destination': '1111:1111:1111:1111::/64',
-                     'nexthop': None,
-                     'device': 'tap-1',
-                     'scope': 'universe'},
-                    {'destination': '1111:1111:1111:1112::/64',
-                     'nexthop': '1111:1111:1111:1111::1',
-                     'device': 'tap-1',
-                     'scope': 'universe'}]
-        self._test_get_routing_table(6, self.ip_db_routes, expected)
-
-    def test_get_routing_table_multipath_4(self):
-        expected = [{'destination': '10.0.1.0/24',
-                     'nexthop': '10.0.0.1',
-                     'device': 'lo',
-                     'scope': 'universe'},
-                    {'destination': '10.0.1.0/24',
-                     'nexthop': '10.0.0.1',
-                     'device': 'tap-1',
-                     'scope': 'universe'}]
-        self._test_get_routing_table(4, self.ip_db_multipath_routes, expected)
-
-    def test_get_routing_table_multipath_6(self):
-        expected = [{'destination': '1111:1111:1111:1111::/64',
-                     'nexthop': None,
-                     'device': 'lo',
-                     'scope': 'universe'},
-                    {'destination': '1111:1111:1111:1111::/64',
-                     'nexthop': None,
-                     'device': 'tap-1',
-                     'scope': 'universe'}]
-        self._test_get_routing_table(6, self.ip_db_multipath_routes, expected)
-
-
 class TestIpNeighCommand(TestIPCmdBase):
     def setUp(self):
-        super(TestIpNeighCommand, self).setUp()
+        super().setUp()
         self.parent.name = 'tap0'
         self.command = 'neigh'
         self.neigh_cmd = ip_lib.IpNeighCommand(self.parent)
@@ -1343,7 +1050,8 @@ class TestIpNeighCommand(TestIPCmdBase):
     @mock.patch.object(priv_lib, '_run_iproute_neigh')
     def test_delete_entry_not_exist(self, mock_run_iproute):
         # trying to delete a non-existent entry shouldn't raise an error
-        mock_run_iproute.side_effect = NetlinkError(errno.ENOENT, None)
+        mock_run_iproute.side_effect = netlink_exceptions.NetlinkError(
+            errno.ENOENT, None)
         self.neigh_cmd.delete('192.168.45.100', 'cc:dd:ee:ff:ab:cd')
 
     @mock.patch.object(pyroute2, 'NetNS')
@@ -1359,15 +1067,28 @@ class TestIpNeighCommand(TestIPCmdBase):
             ifindex=1)
 
     def test_flush(self):
-        self.neigh_cmd.flush(4, '192.168.0.1')
-        self._assert_sudo([4], ('flush', 'to', '192.168.0.1'))
+        with mock.patch.object(self.neigh_cmd, 'dump') as mock_dump, \
+                mock.patch.object(self.neigh_cmd, 'delete') as mock_delete:
+            mock_dump.return_value = (
+                {'state': 'permanent', 'dst': '1.2.3.4', 'lladdr': 'mac_1'},
+                {'state': 'reachable', 'dst': '1.2.3.5', 'lladdr': 'mac_2'})
+            self.neigh_cmd.flush(4, '1.2.3.4')
+            mock_delete.assert_not_called()
+            self.neigh_cmd.flush(4, '1.2.3.5')
+            mock_delete.assert_called_once_with('1.2.3.5', 'mac_2')
 
 
 class TestArpPing(TestIPCmdBase):
+    @mock.patch.object(ip_lib, 'ARPING_SLEEP', 0)
     @mock.patch.object(ip_lib, 'IPWrapper')
-    @mock.patch('eventlet.spawn_n')
-    def test_send_ipv4_addr_adv_notif(self, spawn_n, mIPWrapper):
-        spawn_n.side_effect = lambda f: f()
+    @mock.patch('threading.Thread')
+    def test_send_ipv4_addr_adv_notif(self, mock_thread, mIPWrapper):
+        def Thread(target):
+            target()
+            return mock.MagicMock()
+
+        mock_thread.side_effect = Thread
+
         ARPING_COUNT = 3
         address = '20.0.0.1'
         ip_lib.send_ip_addr_adv_notif(mock.sentinel.ns_name,
@@ -1375,15 +1096,21 @@ class TestArpPing(TestIPCmdBase):
                                       address,
                                       ARPING_COUNT)
 
-        self.assertTrue(spawn_n.called)
+        self.assertTrue(mock_thread.called)
         mIPWrapper.assert_has_calls([
             mock.call(namespace=mock.sentinel.ns_name),
-            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1]),
-            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1]),
-            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1, 2]),
-            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1, 2]),
-            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1, 2]),
-            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1, 2])])
+            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1],
+                                      privsep_exec=True),
+            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1],
+                                      privsep_exec=True),
+            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1, 2],
+                                      privsep_exec=True),
+            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1, 2],
+                                      privsep_exec=True),
+            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1, 2],
+                                      privsep_exec=True),
+            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1, 2],
+                                      privsep_exec=True)])
 
         ip_wrapper = mIPWrapper(namespace=mock.sentinel.ns_name)
 
@@ -1395,12 +1122,17 @@ class TestArpPing(TestIPCmdBase):
                           '-w', mock.ANY,
                           address]
             ip_wrapper.netns.execute.assert_any_call(arping_cmd,
-                                                     extra_ok_codes=mock.ANY)
+                                                     extra_ok_codes=mock.ANY,
+                                                     privsep_exec=True)
 
     @mock.patch.object(ip_lib, 'IPWrapper')
-    @mock.patch('eventlet.spawn_n')
-    def test_send_ipv4_addr_adv_notif_nodev(self, spawn_n, mIPWrapper):
-        spawn_n.side_effect = lambda f: f()
+    @mock.patch('threading.Thread')
+    def test_send_ipv4_addr_adv_notif_nodev(self, mock_thread, mIPWrapper):
+        def Thread(target):
+            target()
+            return mock.MagicMock()
+
+        mock_thread.side_effect = Thread
         ip_wrapper = mIPWrapper(namespace=mock.sentinel.ns_name)
         ip_wrapper.netns.execute.side_effect = RuntimeError
         ARPING_COUNT = 3
@@ -1415,17 +1147,18 @@ class TestArpPing(TestIPCmdBase):
         # should return early with a single call when ENODEV
         mIPWrapper.assert_has_calls([
             mock.call(namespace=mock.sentinel.ns_name),
-            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1])
+            mock.call().netns.execute(mock.ANY, extra_ok_codes=[1],
+                                      privsep_exec=True)
         ] * 1)
 
-    @mock.patch('eventlet.spawn_n')
-    def test_no_ipv6_addr_notif(self, spawn_n):
+    @mock.patch('threading.Thread')
+    def test_no_ipv6_addr_notif(self, mock_thread):
         ipv6_addr = 'fd00::1'
         ip_lib.send_ip_addr_adv_notif(mock.sentinel.ns_name,
                                       mock.sentinel.iface_name,
                                       ipv6_addr,
                                       3)
-        self.assertFalse(spawn_n.called)
+        self.assertFalse(mock_thread.called)
 
 
 class TestAddNamespaceToCmd(base.BaseTestCase):
@@ -1448,7 +1181,7 @@ class TestSetIpNonlocalBindForHaNamespace(base.BaseTestCase):
 
 class TestSysctl(base.BaseTestCase):
     def setUp(self):
-        super(TestSysctl, self).setUp()
+        super().setUp()
         self.execute_p = mock.patch.object(ip_lib.IpNetnsCommand, 'execute')
         self.execute = self.execute_p.start()
 
@@ -1458,7 +1191,7 @@ class TestSysctl(base.BaseTestCase):
             dev.disable_ipv6()
             self.execute.assert_called_once_with(
                 ['sysctl', '-w', 'net.ipv6.conf.tap0.disable_ipv6=1'],
-                log_fail_as_error=True, run_as_root=True)
+                log_fail_as_error=True, run_as_root=True, privsep_exec=True)
 
     def test_disable_ipv6_when_ipv6_globally_disabled(self):
         dev = ip_lib.IPDevice('tap0', 'ns1')
@@ -1468,9 +1201,27 @@ class TestSysctl(base.BaseTestCase):
             self.assertFalse(self.execute.called)
 
 
+class TestGetSysctl(base.BaseTestCase):
+    @mock.patch.object(ip_lib, 'IPWrapper')
+    def test_get_ip_nonlocal_bind(self, mIPWrapper):
+        cmd = ['sysctl', '-bn', ip_lib.IP_NONLOCAL_BIND]
+        ip_lib.get_ip_nonlocal_bind()
+        mIPWrapper.assert_has_calls([
+            mock.call().netns.execute(cmd, run_as_root=True, privsep_exec=True)
+        ])
+
+    @mock.patch.object(ip_lib, 'IPWrapper')
+    def test_get_ipv6_forwarding(self, mIPWrapper):
+        cmd = ['sysctl', '-b', 'net.ipv6.conf.tap0.forwarding']
+        ip_lib.get_ipv6_forwarding('tap0')
+        mIPWrapper.assert_has_calls([
+            mock.call().netns.execute(cmd, run_as_root=True, privsep_exec=True)
+        ])
+
+
 class TestConntrack(base.BaseTestCase):
     def setUp(self):
-        super(TestConntrack, self).setUp()
+        super().setUp()
         self.execute_p = mock.patch.object(ip_lib.IpNetnsCommand, 'execute')
         self.execute = self.execute_p.start()
 
@@ -1483,7 +1234,8 @@ class TestConntrack(base.BaseTestCase):
                       '--dport', dport]
         device.delete_socket_conntrack_state(ip_str, dport, protocol)
         self.execute.assert_called_once_with(expect_cmd, check_exit_code=True,
-                                             extra_ok_codes=[1])
+                                             extra_ok_codes=[1],
+                                             privsep_exec=True)
 
 
 class ParseIpRuleTestCase(base.BaseTestCase):
@@ -1497,7 +1249,7 @@ class ParseIpRuleTestCase(base.BaseTestCase):
         'table': 255, 'action': 1, 'src_len': 0, 'event': 'RTM_NEWRULE'}
 
     def setUp(self):
-        super(ParseIpRuleTestCase, self).setUp()
+        super().setUp()
         self.rule = copy.deepcopy(self.BASE_RULE)
 
     def test_parse_priority(self):
@@ -1519,7 +1271,7 @@ class ParseIpRuleTestCase(base.BaseTestCase):
 
     def test_parse_from_any_ipv4(self):
         parsed_rule = ip_lib._parse_ip_rule(self.rule, 4)
-        self.assertEqual('0.0.0.0/0', parsed_rule['from'])
+        self.assertEqual(constants.IPv4_ANY, parsed_rule['from'])
 
     def test_parse_from_any_ipv6(self):
         parsed_rule = ip_lib._parse_ip_rule(self.rule, 6)
@@ -1598,42 +1350,9 @@ class ListIpRulesTestCase(base.BaseTestCase):
         reference = [
             {'type': 'unicast', 'from': '10.0.0.1/24', 'priority': '0',
              'table': '100'},
-            {'type': 'blackhole', 'from': '0.0.0.0/0', 'priority': '0',
+            {'type': 'blackhole', 'from': constants.IPv4_ANY, 'priority': '0',
              'table': 'local'}]
         self.assertEqual(reference, retval)
-
-
-class ParseLinkDeviceTestCase(base.BaseTestCase):
-
-    def setUp(self):
-        super(ParseLinkDeviceTestCase, self).setUp()
-        self._mock_get_ip_addresses = mock.patch.object(priv_lib,
-                                                        'get_ip_addresses')
-        self.mock_get_ip_addresses = self._mock_get_ip_addresses.start()
-        self.addCleanup(self._stop_mock)
-
-    def _stop_mock(self):
-        self._mock_get_ip_addresses.stop()
-
-    def test_parse_link_devices(self):
-        device = ({'index': 1, 'attrs': [['IFLA_IFNAME', 'int_name']]})
-        self.mock_get_ip_addresses.return_value = [
-            {'prefixlen': 24, 'scope': 200, 'event': 'RTM_NEWADDR', 'attrs': [
-                ['IFA_ADDRESS', '192.168.10.20'],
-                ['IFA_FLAGS', ifaddrmsg.IFA_F_PERMANENT]]},
-            {'prefixlen': 64, 'scope': 200, 'event': 'RTM_DELADDR', 'attrs': [
-                ['IFA_ADDRESS', '2001:db8::1'],
-                ['IFA_FLAGS', ifaddrmsg.IFA_F_PERMANENT]]}]
-
-        retval = ip_lib._parse_link_device('namespace', device)
-        expected = [{'scope': 'site', 'cidr': '192.168.10.20/24',
-                     'dynamic': False, 'dadfailed': False, 'name': 'int_name',
-                     'broadcast': None, 'tentative': False, 'event': 'added'},
-                    {'scope': 'site', 'cidr': '2001:db8::1/64',
-                     'dynamic': False, 'dadfailed': False, 'name': 'int_name',
-                     'broadcast': None, 'tentative': False,
-                     'event': 'removed'}]
-        self.assertEqual(expected, retval)
 
 
 class GetDevicesInfoTestCase(base.BaseTestCase):
@@ -1699,7 +1418,7 @@ class GetDevicesInfoTestCase(base.BaseTestCase):
     }
 
     def setUp(self):
-        super(GetDevicesInfoTestCase, self).setUp()
+        super().setUp()
         self.mock_getdevs = mock.patch.object(priv_lib,
                                               'get_link_devices').start()
 

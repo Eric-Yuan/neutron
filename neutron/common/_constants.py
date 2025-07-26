@@ -45,6 +45,13 @@ IPTABLES_MULTIPORT_ONLY_PROTOCOLS = [
 IPV6_ICMP_LEGACY_PROTO_LIST = [constants.PROTO_NAME_ICMP,
                                constants.PROTO_NAME_IPV6_ICMP_LEGACY]
 
+# Protocol 'any', which is treated the same way as 'no protocol' in the API.
+# The openstack client changes 'any' to None for the API call, but we want
+# to accept both as being the same, for example, if it was passed directly
+# via the curl command.
+PROTO_NAME_ANY = 'any'
+SG_RULE_PROTO_ANY = (None, PROTO_NAME_ANY)
+
 # Number of resources for neutron agent side functions to deal
 # with large sets.
 # Setting this value does not count on special conditions, it is just a human
@@ -63,7 +70,33 @@ RPC_RES_PROCESSING_STEP = 20
 
 # IPtables version to support --random-fully option.
 # Do not move this constant to neutron-lib, since it is temporary
-IPTABLES_RANDOM_FULLY_VERSION = '1.6.2'
+IPTABLES_RANDOM_FULLY_VERSION = '1.6.0'
 
-# Segmentation ID pool; DB select limit to improve the performace.
+# Segmentation ID pool; DB select limit to improve the performance.
 IDPOOL_SELECT_SIZE = 100
+
+# Ports with the following 'device_owner' values will not prevent
+# network deletion.  If delete_network() finds that all ports on a
+# network have these owners, it will explicitly delete each port
+# and allow network deletion to continue.  Similarly, if delete_subnet()
+# finds out that all existing IP Allocations are associated with ports
+# with these owners, it will allow subnet deletion to proceed with the
+# IP allocations being cleaned up by cascade.
+AUTO_DELETE_PORT_OWNERS = [constants.DEVICE_OWNER_DHCP,
+                           constants.DEVICE_OWNER_DISTRIBUTED,
+                           constants.DEVICE_OWNER_AGENT_GW]
+
+# TODO(ralonsoh): move this constant to neutron_lib.placement.constants
+# Tunnelled networks resource provider default name.
+RP_TUNNELLED = 'rp_tunnelled'
+TRAIT_NETWORK_TUNNEL = 'CUSTOM_NETWORK_TUNNEL_PROVIDER'
+
+# The lowest binding index for L3 agents and DHCP agents.
+LOWEST_AGENT_BINDING_INDEX = 1
+
+# TODO(ralonsoh): move this constant to neutron_lib.plugins.ml2.ovs_constants
+DEFAULT_BR_INT = 'br-int'
+
+# TODO(bpetermann): Remove here after neutron-lib is bumped
+DEVICE_OWNER_VPN_ROUTER_GW = (constants.DEVICE_OWNER_NETWORK_PREFIX +
+                              "vpn_router_gateway")

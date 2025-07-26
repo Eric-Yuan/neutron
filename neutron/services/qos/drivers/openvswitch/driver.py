@@ -20,8 +20,6 @@ from neutron_lib.services.qos import base
 from neutron_lib.services.qos import constants as qos_consts
 from oslo_log import log as logging
 
-from neutron.objects import network as network_object
-
 
 LOG = logging.getLogger(__name__)
 
@@ -36,6 +34,14 @@ SUPPORTED_RULES = {
         qos_consts.DIRECTION: {
             'type:values': constants.VALID_DIRECTIONS}
     },
+    qos_consts.RULE_TYPE_PACKET_RATE_LIMIT: {
+        qos_consts.MAX_KPPS: {
+            'type:range': [0, db_consts.DB_INTEGER_MAX_VALUE]},
+        qos_consts.MAX_BURST_KPPS: {
+            'type:range': [0, db_consts.DB_INTEGER_MAX_VALUE]},
+        qos_consts.DIRECTION: {
+            'type:values': constants.VALID_DIRECTIONS}
+    },
     qos_consts.RULE_TYPE_DSCP_MARKING: {
         qos_consts.DSCP_MARK: {'type:values': constants.VALID_DSCP_MARKS}
     },
@@ -43,7 +49,13 @@ SUPPORTED_RULES = {
         qos_consts.MIN_KBPS: {
             'type:range': [0, db_consts.DB_INTEGER_MAX_VALUE]},
         qos_consts.DIRECTION: {'type:values': constants.VALID_DIRECTIONS}
-    }
+    },
+    qos_consts.RULE_TYPE_MINIMUM_PACKET_RATE: {
+        qos_consts.MIN_KPPS: {
+            'type:range': [0, db_consts.DB_INTEGER_MAX_VALUE]},
+        qos_consts.DIRECTION: {
+            'type:values': constants.VALID_DIRECTIONS_AND_ANY},
+    },
 }
 
 
@@ -60,15 +72,7 @@ class OVSDriver(base.DriverBase):
             requires_rpc_notifications=True)
 
     def validate_rule_for_port(self, context, rule, port):
-        # Minimum-bandwidth rule is only supported on networks whose
-        # first segment is backed by a physnet.
-        if rule.rule_type == qos_consts.RULE_TYPE_MINIMUM_BANDWIDTH:
-            net = network_object.Network.get_object(
-                context, id=port.network_id)
-            physnet = net.segments[0].physical_network
-            if physnet is None:
-                return False
-        return True
+        return self.validate_rule_for_network(context, rule, port.network_id)
 
 
 def register():

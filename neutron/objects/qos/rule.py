@@ -23,7 +23,6 @@ from neutron_lib.utils import helpers
 from oslo_utils import versionutils
 from oslo_versionedobjects import exception
 from oslo_versionedobjects import fields as obj_fields
-import six
 
 from neutron.db.qos import models as qos_db_model
 from neutron.objects import base
@@ -33,6 +32,9 @@ DSCP_MARK = 'dscp_mark'
 
 def get_rules(obj_cls, context, qos_policy_id):
     all_rules = []
+    if not qos_policy_id:
+        return all_rules
+
     with obj_cls.db_context_reader(context):
         for rule_type in qos_consts.VALID_RULE_TYPES:
             rule_cls_name = 'Qos%sRule' % helpers.camelize(rule_type)
@@ -43,17 +45,18 @@ def get_rules(obj_cls, context, qos_policy_id):
     return all_rules
 
 
-@six.add_metaclass(abc.ABCMeta)
-class QosRule(base.NeutronDbObject):
+class QosRule(base.NeutronDbObject, metaclass=abc.ABCMeta):
     # Version 1.0: Initial version, only BandwidthLimitRule
     #         1.1: Added DscpMarkingRule
     #         1.2: Added QosMinimumBandwidthRule
     #         1.3: Added direction for BandwidthLimitRule
+    #         1.4: Added PacketRateLimitRule
+    #         1.5: Added QosMinimumPacketRateRule
     #
     # NOTE(mangelajo): versions need to be handled from the top QosRule object
     #                  because it's the only reference QosPolicy can make
     #                  to them via obj_relationships version map
-    VERSION = '1.3'
+    VERSION = '1.5'
 
     fields = {
         'id': common_types.UUIDField(),
@@ -62,10 +65,9 @@ class QosRule(base.NeutronDbObject):
 
     fields_no_update = ['id', 'qos_policy_id']
 
-    # should be redefined in subclasses
-    rule_type = None
-
-    duplicates_compare_fields = ()
+    # must be redefined in subclasses
+    rule_type: str
+    duplicates_compare_fields: tuple[str, ...] = ()
 
     def duplicates(self, other_rule):
         """Returns True if rules have got same values in fields defined in
@@ -85,7 +87,7 @@ class QosRule(base.NeutronDbObject):
         return True
 
     def to_dict(self):
-        dict_ = super(QosRule, self).to_dict()
+        dict_ = super().to_dict()
         dict_['type'] = self.rule_type
         return dict_
 
@@ -136,7 +138,7 @@ class QosBandwidthLimitRule(QosRule):
             default=constants.EGRESS_DIRECTION)
     }
 
-    duplicates_compare_fields = ['direction']
+    duplicates_compare_fields = ('direction',)
 
     rule_type = qos_consts.RULE_TYPE_BANDWIDTH_LIMIT
 
@@ -163,6 +165,38 @@ class QosMinimumBandwidthRule(QosRule):
         'direction': common_types.FlowDirectionEnumField(),
     }
 
-    duplicates_compare_fields = ['direction']
+    duplicates_compare_fields = ('direction',)
 
     rule_type = qos_consts.RULE_TYPE_MINIMUM_BANDWIDTH
+
+
+@base.NeutronObjectRegistry.register
+class QosPacketRateLimitRule(QosRule):
+
+    db_model = qos_db_model.QosPacketRateLimitRule
+
+    fields = {
+        'max_kpps': obj_fields.IntegerField(nullable=True),
+        'max_burst_kpps': obj_fields.IntegerField(nullable=True),
+        'direction': common_types.FlowDirectionEnumField(
+            default=constants.EGRESS_DIRECTION)
+    }
+
+    duplicates_compare_fields = ('direction',)
+
+    rule_type = qos_consts.RULE_TYPE_PACKET_RATE_LIMIT
+
+
+@base.NeutronObjectRegistry.register
+class QosMinimumPacketRateRule(QosRule):
+
+    db_model = qos_db_model.QosMinimumPacketRateRule
+
+    fields = {
+        'min_kpps': obj_fields.IntegerField(nullable=False),
+        'direction': common_types.FlowDirectionAndAnyEnumField(),
+    }
+
+    duplicates_compare_fields = ('direction',)
+
+    rule_type = qos_consts.RULE_TYPE_MINIMUM_PACKET_RATE

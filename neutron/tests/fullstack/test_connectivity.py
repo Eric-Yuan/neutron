@@ -19,12 +19,10 @@ from oslo_log import log as logging
 from oslo_utils import uuidutils
 import testscenarios
 
-from neutron.common import utils as common_utils
 from neutron.tests.common import net_helpers
 from neutron.tests.fullstack import base
 from neutron.tests.fullstack.resources import config
 from neutron.tests.fullstack.resources import environment
-from neutron.tests.fullstack.resources import machine
 from neutron.tests.unit import testlib_api
 
 load_tests = testlib_api.module_load_tests
@@ -37,7 +35,7 @@ LOG = logging.getLogger(__name__)
 class BaseConnectivitySameNetworkTest(base.BaseFullStackTestCase):
 
     arp_responder = False
-    use_dhcp = True
+    use_dhcp = False
 
     num_hosts = 3
 
@@ -58,7 +56,7 @@ class BaseConnectivitySameNetworkTest(base.BaseFullStackTestCase):
                 l2_pop=self.l2_pop,
                 arp_responder=self.arp_responder),
             host_descriptions)
-        super(BaseConnectivitySameNetworkTest, self).setUp(env)
+        super().setUp(env)
 
     def _prepare_network(self, tenant_uuid):
         net_args = {'network_type': self.network_type}
@@ -74,44 +72,14 @@ class BaseConnectivitySameNetworkTest(base.BaseFullStackTestCase):
 
         return network
 
-    def _prepare_vms_in_net(self, tenant_uuid, network):
-        vms = machine.FakeFullstackMachinesList(
-            self.useFixture(
-                machine.FakeFullstackMachine(
-                    host,
-                    network['id'],
-                    tenant_uuid,
-                    self.safe_client,
-                    use_dhcp=self.use_dhcp))
-            for host in self.environment.hosts)
-
-        vms.block_until_all_boot()
-        return vms
-
     def _prepare_vms_in_single_network(self):
         tenant_uuid = uuidutils.generate_uuid()
         network = self._prepare_network(tenant_uuid)
-        return self._prepare_vms_in_net(tenant_uuid, network)
+        return self._prepare_vms_in_net(tenant_uuid, network, self.use_dhcp)
 
     def _test_connectivity(self):
         vms = self._prepare_vms_in_single_network()
         vms.ping_all()
-
-
-class TestOvsConnectivitySameNetwork(BaseConnectivitySameNetworkTest):
-
-    l2_agent_type = constants.AGENT_TYPE_OVS
-    scenarios = [
-        ('VXLAN', {'network_type': 'vxlan',
-                   'l2_pop': False}),
-        ('GRE-l2pop-arp_responder', {'network_type': 'gre',
-                                     'l2_pop': True,
-                                     'arp_responder': True}),
-        ('VLANs', {'network_type': 'vlan',
-                   'l2_pop': False})]
-
-    def test_connectivity(self):
-        self._test_connectivity()
 
 
 class TestOvsConnectivitySameNetworkOnOvsBridgeControllerStop(
@@ -151,7 +119,7 @@ class TestOvsConnectivitySameNetworkOnOvsBridgeControllerStop(
         # by itself when the fail type settings is not set to secure (see
         # ovs-vsctl man page for further details)
         with net_helpers.async_ping(ns0, [ip1], timeout=2, count=25) as done:
-            common_utils.wait_until_true(
+            base.wait_until_true(
                 done,
                 exception=RuntimeError("Networking interrupted after "
                                        "controllers have vanished"))
@@ -164,48 +132,10 @@ class TestOvsConnectivitySameNetworkOnOvsBridgeControllerStop(
             signal.SIGKILL)
 
 
-class TestLinuxBridgeConnectivitySameNetwork(BaseConnectivitySameNetworkTest):
-
-    l2_agent_type = constants.AGENT_TYPE_LINUXBRIDGE
-    scenarios = [
-        ('VXLAN', {'network_type': 'vxlan',
-                   'l2_pop': False}),
-        ('VLANs', {'network_type': 'vlan',
-                   'l2_pop': False}),
-        ('VXLAN and l2pop', {'network_type': 'vxlan',
-                             'l2_pop': True})
-    ]
-
-    def test_connectivity(self):
-        self._test_connectivity()
-
-
-class TestConnectivitySameNetworkNoDhcp(BaseConnectivitySameNetworkTest):
-
-    scenarios = [
-        (constants.AGENT_TYPE_OVS,
-         {'l2_agent_type': constants.AGENT_TYPE_OVS}),
-        (constants.AGENT_TYPE_LINUXBRIDGE,
-         {'l2_agent_type': constants.AGENT_TYPE_LINUXBRIDGE})
-    ]
-
-    use_dhcp = False
-    network_type = 'vxlan'
-    l2_pop = False
-
-    def test_connectivity(self):
-        self._test_connectivity()
-
-
-class TestUninterruptedConnectivityOnL2AgentRestart(
+class _TestUninterruptedConnectivityOnL2AgentRestart(
         BaseConnectivitySameNetworkTest):
 
     num_hosts = 2
-
-    ovs_agent_scenario = [('OVS',
-                           {'l2_agent_type': constants.AGENT_TYPE_OVS})]
-    lb_agent_scenario = [('LB',
-                          {'l2_agent_type': constants.AGENT_TYPE_LINUXBRIDGE})]
 
     network_scenarios = [
         ('Flat network', {'network_type': 'flat',
@@ -215,13 +145,8 @@ class TestUninterruptedConnectivityOnL2AgentRestart(
         ('VXLAN', {'network_type': 'vxlan',
                    'l2_pop': False}),
     ]
-    scenarios = (
-        testscenarios.multiply_scenarios(ovs_agent_scenario,
-                                         network_scenarios) +
-        testscenarios.multiply_scenarios(lb_agent_scenario, network_scenarios)
-    )
 
-    def test_l2_agent_restart(self, agent_restart_timeout=20):
+    def _test_l2_agent_restart(self, agent_restart_timeout=30):
         # Environment preparation is effectively the same as connectivity test
         vms = self._prepare_vms_in_single_network()
         vms.ping_all()
@@ -236,3 +161,18 @@ class TestUninterruptedConnectivityOnL2AgentRestart(
         self._assert_ping_during_agents_restart(
             agents, ns0, [ip1], restart_timeout=agent_restart_timeout,
             ping_timeout=2, count=agent_restart_timeout)
+
+
+class TestUninterruptedConnectivityOnL2AgentRestartOvs(
+        _TestUninterruptedConnectivityOnL2AgentRestart):
+
+    scenario = [('OVS',
+                 {'l2_agent_type': constants.AGENT_TYPE_OVS})]
+
+    scenarios = (
+        testscenarios.multiply_scenarios(
+            scenario,
+            _TestUninterruptedConnectivityOnL2AgentRestart.network_scenarios))
+
+    def test_l2_agent_restart(self, agent_restart_timeout=30):
+        self._test_l2_agent_restart(agent_restart_timeout)

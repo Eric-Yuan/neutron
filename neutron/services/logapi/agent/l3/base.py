@@ -29,7 +29,7 @@ LOG = logging.getLogger(__name__)
 log_cfg.register_log_driver_opts()
 
 
-class L3LoggingExtensionBase(object):
+class L3LoggingExtensionBase:
     """Base class for l3 logging extension like
 
     SNATLogExtension, FWaaSV2LogExtension
@@ -40,9 +40,9 @@ class L3LoggingExtensionBase(object):
     def consume_api(self, agent_api):
         self.agent_api = agent_api
 
-    def _load_driver_cls(self, namesapce, driver_name):
+    def _load_driver_cls(self, namespace, driver_name):
         return manager.NeutronManager.load_class_for_provider(
-            namesapce, driver_name)
+            namespace, driver_name)
 
     def _register_rpc_consumers(self):
         registry.register(
@@ -105,4 +105,7 @@ class L3LoggingExtensionBase(object):
         self.log_driver.stop_logging(context, router_info=data)
 
     def ha_state_change(self, context, data):
+        pass
+
+    def update_network(self, context, data):
         pass

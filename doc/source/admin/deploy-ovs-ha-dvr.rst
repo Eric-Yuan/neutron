@@ -106,6 +106,11 @@ Network node
       [DEFAULT]
       agent_mode = dvr_snat
 
+.. note::
+
+   ``agent_mode = dvr_snat`` is not supported on compute nodes.
+   For discussion please see: `bug #1934666 <https://bugs.launchpad.net/neutron/+bug/1934666>`_
+
 
 #. Restart the following services:
 
@@ -129,7 +134,6 @@ Compute nodes
    .. code-block:: ini
 
       [DEFAULT]
-      interface_driver = openvswitch
       agent_mode = dvr
 
 #. Restart the following services:
@@ -153,7 +157,6 @@ Verify service operation
       | 1236bbcb-e0ba-48a9-80fc-81202ca4fa51 | Metadata agent     | compute2 | None              | True  | UP    | neutron-metadata-agent    |
       | 2a2e9a90-51b8-4163-a7d6-3e199ba2374b | L3 agent           | compute2 | nova              | True  | UP    | neutron-l3-agent          |
       | 457d6898-b373-4bb3-b41f-59345dcfb5c5 | Open vSwitch agent | compute2 | None              | True  | UP    | neutron-openvswitch-agent |
-      | 513caa68-0391-4e53-a530-082e2c23e819 | Linux bridge agent | compute1 | None              | True  | UP    | neutron-linuxbridge-agent |
       | 71f15e84-bc47-4c2a-b9fb-317840b2d753 | DHCP agent         | compute2 | nova              | True  | UP    | neutron-dhcp-agent        |
       | 8805b962-de95-4e40-bdc2-7a0add7521e8 | L3 agent           | network1 | nova              | True  | UP    | neutron-l3-agent          |
       | a33cac5a-0266-48f6-9cac-4cef4f8b0358 | Open vSwitch agent | network1 | None              | True  | UP    | neutron-openvswitch-agent |

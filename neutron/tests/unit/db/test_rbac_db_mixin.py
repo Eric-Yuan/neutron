@@ -26,25 +26,26 @@ from neutron.db import rbac_db_models
 from neutron.extensions import rbac as ext_rbac
 from neutron.objects import network as network_obj
 from neutron.objects.qos import policy as qos_policy_obj
-from neutron.tests.unit.db import test_db_base_plugin_v2 as test_plugin
+from neutron.tests.common import test_db_base_plugin_v2 as test_plugin
 
 
 class NetworkRbacTestcase(test_plugin.NeutronDbPluginV2TestCase):
     def setUp(self):
+        super().setUp(plugin='ml2')
         self.context = context.get_admin_context()
-        super(NetworkRbacTestcase, self).setUp(plugin='ml2')
 
-    def _make_networkrbac(self, network, target, action='access_as_shared'):
+    def _make_networkrbac(self, network, target,
+                          action=rbac_db_models.ACCESS_SHARED):
         policy = {
             'rbac_policy': {'project_id': network['network']['project_id'],
                             'object_id': network['network']['id'],
                             'object_type': 'network',
                             'action': action,
-                            'target_tenant': target}}
+                            'target_project': target}}
         return policy
 
-    def _setup_networkrbac_and_port(self, network, target_tenant):
-        policy = self._make_networkrbac(network, target_tenant)
+    def _setup_networkrbac_and_port(self, network, target_project):
+        policy = self._make_networkrbac(network, target_project)
         netrbac = self.plugin.create_rbac_policy(self.context, policy)
 
         test_port = {'port': {'name': 'test-port',
@@ -54,8 +55,8 @@ class NetworkRbacTestcase(test_plugin.NeutronDbPluginV2TestCase):
                               'admin_state_up': True,
                               'device_id': 'device_id',
                               'device_owner': 'device_owner',
-                              'project_id': target_tenant,
-                              'tenant_id': target_tenant}}
+                              'project_id': target_project,
+                              'tenant_id': target_project}}
 
         port = self.plugin.create_port(self.context, test_port)
         return netrbac, port
@@ -71,7 +72,7 @@ class NetworkRbacTestcase(test_plugin.NeutronDbPluginV2TestCase):
             self._assert_external_net_state(net_id, is_external=False)
             policy = self._make_networkrbac(ext_net,
                                             '*',
-                                            'access_as_external')
+                                            rbac_db_models.ACCESS_EXTERNAL)
             self.plugin.create_rbac_policy(self.context, policy)
             self._assert_external_net_state(net_id, is_external=True)
 
@@ -96,15 +97,15 @@ class NetworkRbacTestcase(test_plugin.NeutronDbPluginV2TestCase):
         with self.network() as ext_net:
             policy = self._make_networkrbac(ext_net,
                                             orig_target,
-                                            'access_as_external')
+                                            rbac_db_models.ACCESS_EXTERNAL)
             netrbac = self.plugin.create_rbac_policy(self.context, policy)
-            update_policy = {'rbac_policy': {'target_tenant': new_target}}
+            update_policy = {'rbac_policy': {'target_project': new_target}}
 
             netrbac2 = self.plugin.update_rbac_policy(self.context,
                                                       netrbac['id'],
                                                       update_policy)
 
-            policy['rbac_policy']['target_tenant'] = new_target
+            policy['rbac_policy']['target_project'] = new_target
             for k, v in policy['rbac_policy'].items():
                 self.assertEqual(netrbac2[k], v)
 
@@ -114,7 +115,7 @@ class NetworkRbacTestcase(test_plugin.NeutronDbPluginV2TestCase):
             self._assert_external_net_state(net_id, is_external=False)
             policy = self._make_networkrbac(ext_net,
                                             '*',
-                                            'access_as_external')
+                                            rbac_db_models.ACCESS_EXTERNAL)
             net_rbac = self.plugin.create_rbac_policy(self.context, policy)
             self._assert_external_net_state(net_id, is_external=True)
             self.plugin.delete_rbac_policy(self.context, net_rbac['id'])
@@ -126,12 +127,12 @@ class NetworkRbacTestcase(test_plugin.NeutronDbPluginV2TestCase):
             self._assert_external_net_state(net_id, is_external=False)
             policy1 = self._make_networkrbac(ext_net,
                                              'test-tenant-1',
-                                             'access_as_external')
+                                             rbac_db_models.ACCESS_EXTERNAL)
             net_rbac1 = self.plugin.create_rbac_policy(self.context, policy1)
             self._assert_external_net_state(net_id, is_external=True)
             policy2 = self._make_networkrbac(ext_net,
                                              'test-tenant-2',
-                                             'access_as_external')
+                                             rbac_db_models.ACCESS_EXTERNAL)
             self.plugin.create_rbac_policy(self.context, policy2)
             self._assert_external_net_state(net_id, is_external=True)
             self.plugin.delete_rbac_policy(self.context, net_rbac1['id'])
@@ -157,20 +158,20 @@ class NetworkRbacTestcase(test_plugin.NeutronDbPluginV2TestCase):
         with self.network() as net:
             policy = self._make_networkrbac(net, orig_target)
             netrbac = self.plugin.create_rbac_policy(self.context, policy)
-            update_policy = {'rbac_policy': {'target_tenant': new_target}}
+            update_policy = {'rbac_policy': {'target_project': new_target}}
 
             netrbac2 = self.plugin.update_rbac_policy(self.context,
                                                       netrbac['id'],
                                                       update_policy)
 
-            policy['rbac_policy']['target_tenant'] = new_target
+            policy['rbac_policy']['target_project'] = new_target
             for k, v in policy['rbac_policy'].items():
                 self.assertEqual(netrbac2[k], v)
 
     def test_delete_networkrbac_in_use_fail(self):
         with self.network() as net:
             netrbac, _ = self._setup_networkrbac_and_port(
-                network=net, target_tenant='test-tenant-2')
+                network=net, target_project='test-tenant-2')
 
             self.assertRaises(ext_rbac.RbacPolicyInUse,
                               self.plugin.delete_rbac_policy,
@@ -179,7 +180,7 @@ class NetworkRbacTestcase(test_plugin.NeutronDbPluginV2TestCase):
     def test_port_presence_prevents_network_rbac_policy_deletion(self):
         with self.network() as net:
             netrbac, port = self._setup_networkrbac_and_port(
-                network=net, target_tenant='alice')
+                network=net, target_project='alice')
             self.assertRaises(ext_rbac.RbacPolicyInUse,
                               self.plugin.delete_rbac_policy,
                               self.context, netrbac['id'])
@@ -198,7 +199,7 @@ class NetworkRbacTestcase(test_plugin.NeutronDbPluginV2TestCase):
                               self.context, wild_policy['id'])
 
             # similarly, we can't update the policy to a different tenant
-            update_policy = {'rbac_policy': {'target_tenant': 'bob'}}
+            update_policy = {'rbac_policy': {'target_project': 'bob'}}
             self.assertRaises(ext_rbac.RbacPolicyInUse,
                               self.plugin.update_rbac_policy,
                               self.context, wild_policy['id'],
@@ -227,7 +228,7 @@ class NetworkRbacTestcase(test_plugin.NeutronDbPluginV2TestCase):
 
         with mock.patch.object(db_plugin_v2, '_get_network') as get_net,\
             mock.patch.object(db_plugin_v2,
-                              'ensure_no_tenant_ports_on_network') as ensure:
+                              'ensure_no_project_ports_on_network') as ensure:
             get_net.return_value = net['network']
             payload = events.DBEventPayload(
                 self.context, states=(policy,),
@@ -249,11 +250,11 @@ class NetworkRbacTestcase(test_plugin.NeutronDbPluginV2TestCase):
 
         with mock.patch.object(db_plugin_v2, '_get_network') as get_net,\
             mock.patch.object(db_plugin_v2,
-                              'ensure_no_tenant_ports_on_network') as ensure:
+                              'ensure_no_project_ports_on_network') as ensure:
             get_net.return_value = net['network']
             payload = events.DBEventPayload(
                 self.context, states=(policy,),
-                request_body={'target_tenant': 'new-target-tenant'},
+                request_body={'target_project': 'new-target-tenant'},
                 metadata={'object_type': 'network'})
             self.plugin.validate_network_rbac_policy_change(
                 None, events.BEFORE_UPDATE, None,
@@ -264,7 +265,7 @@ class NetworkRbacTestcase(test_plugin.NeutronDbPluginV2TestCase):
         return _class(id=uuidutils.generate_uuid(),
                       project_id='project_id',
                       object_id=uuidutils.generate_uuid(),
-                      target_tenant='target_tenant',
+                      target_project='target_project',
                       action=rbac_db_models.ACCESS_SHARED)
 
     @mock.patch.object(qos_policy_obj.QosPolicyRBAC, 'get_objects')

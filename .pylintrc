@@ -1,8 +1,16 @@
 # The format of this file isn't really documented; just use --generate-rcfile
-[MASTER]
+[MAIN]
 # Add <file or directory> to the black list. It should be a base name, not a
 # path. You may set this option multiple times.
 ignore=.git,tests
+
+# List of plugins (as comma separated values of python module names) to load,
+# usually to register additional checkers.
+load-plugins=pylint.extensions.no_self_use
+
+# When enabled, pylint would attempt to guess common misconfiguration and emit
+# user-friendly hints instead of false-positive error messages.
+suggestion-mode=yes
 
 [MESSAGES CONTROL]
 # NOTE(gus): This is a long list.  A number of these are important and
@@ -12,69 +20,52 @@ disable=
 # "F" Fatal errors that prevent further processing
  import-error,
 # "I" Informational noise
- c-extension-no-member,
- locally-disabled,
 # "E" Error for important programming issues (likely bugs)
  access-member-before-definition,
  no-member,
  no-method-argument,
  no-self-argument,
  not-an-iterable,
+ possibly-used-before-assignment,
 # "W" Warnings for stylistic problems or minor programming issues
  abstract-method,
  arguments-differ,
  attribute-defined-outside-init,
- bad-builtin,
- bad-indentation,
  broad-except,
- dangerous-default-value,
- deprecated-lambda,
- expression-not-assigned,
  fixme,
  global-statement,
- keyword-arg-before-vararg,
- literal-comparison,
- no-init,
- non-parent-init-called,
  not-callable,
  protected-access,
  redefined-builtin,
  redefined-outer-name,
  signature-differs,
- star-args,
  super-init-not-called,
- super-on-old-class,
  unpacking-non-sequence,
  unused-argument,
  unused-import,
  unused-variable,
- useless-super-delegation,
-# TODO(dougwig) - disable nonstandard-exception while we have neutron_lib shims
- nonstandard-exception,
+ unnecessary-pass,
+ raise-missing-from,
+ arguments-renamed,
+ broad-exception-raised,
+ unspecified-encoding,
+ unused-private-member,
 # "C" Coding convention violations
- bad-continuation,
  consider-iterating-dictionary,
  consider-using-enumerate,
  invalid-name,
- len-as-condition,
- misplaced-comparison-constant,
  missing-docstring,
  singleton-comparison,
  superfluous-parens,
  ungrouped-imports,
  wrong-import-order,
+ consider-using-f-string,
+ consider-using-dict-items,
 # "R" Refactor recommendations
- abstract-class-little-used,
- abstract-class-not-used,
- consider-merging-isinstance,
- consider-using-ternary,
  duplicate-code,
  inconsistent-return-statements,
- interface-not-implemented,
- no-else-return,
  no-self-use,
  redefined-argument-from-local,
- simplifiable-if-statement,
  too-few-public-methods,
  too-many-ancestors,
  too-many-arguments,
@@ -83,13 +74,11 @@ disable=
  too-many-lines,
  too-many-locals,
  too-many-nested-blocks,
+ too-many-positional-arguments,
  too-many-public-methods,
  too-many-return-statements,
  too-many-statements,
-# new for python3 version of pylint
- consider-using-set-comprehension,
- unnecessary-pass,
- useless-object-inheritance
+ use-dict-literal
 
 [BASIC]
 # Variable names can be 1 to 31 characters long, with lowercase and underscores
@@ -119,18 +108,26 @@ max-line-length=79
 additional-builtins=_
 
 [CLASSES]
-# List of interface methods to ignore, separated by a comma.
-ignore-iface-methods=
+# List of valid names for the first argument in a class method.
+valid-classmethod-first-arg=cls
+
+# List of valid names for the first argument in a metaclass class method.
+valid-metaclass-classmethod-first-arg=cls
 
 [IMPORTS]
 # Deprecated modules which should not be used, separated by a comma
 deprecated-modules=
 # should use oslo_serialization.jsonutils
- json
+ json,
+ six
 
 [TYPECHECK]
 # List of module names for which member attributes should not be checked
-ignored-modules=six.moves,_MovedItems
+ignored-modules=_MovedItems
+# List of decorators that change the signature of a decorated function
+signature-mutators=
+ unittest.mock.patch,
+ unittest.mock._patch_object
 
 [REPORTS]
 # Tells whether to display a full report or only the messages

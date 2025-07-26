@@ -89,7 +89,7 @@ class PortBindingLevel(model_base.BASEV2):
     port = orm.relationship(
         models_v2.Port,
         load_on_pending=True,
-        backref=orm.backref("binding_levels", lazy='subquery',
+        backref=orm.backref("binding_levels", lazy='selectin',
                             cascade='delete'))
     segment = orm.relationship(
         segment_models.NetworkSegment,
@@ -129,6 +129,5 @@ class DistributedPortBinding(model_base.BASEV2):
         models_v2.Port,
         load_on_pending=True,
         backref=orm.backref("distributed_port_binding",
-                            lazy='subquery',
                             cascade='delete'))
     revises_on_change = ('port', )

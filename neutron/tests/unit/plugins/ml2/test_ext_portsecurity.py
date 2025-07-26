@@ -30,15 +30,18 @@ class PSExtDriverTestCase(test_plugin.Ml2PluginV2TestCase,
         cfg.CONF.set_override('extension_drivers',
                               self._extension_drivers,
                               group='ml2')
-        super(PSExtDriverTestCase, self).setUp()
+        super().setUp()
 
     def test_create_net_port_security_default(self):
         _core_plugin = directory.get_plugin()
         admin_ctx = context.get_admin_context()
+        # Maximum MTU depends on the GENEVE max header size, which is variable.
+        mtu = 1530 - cfg.CONF.ml2_type_geneve.max_header_size
         args = {'network':
                 {'name': 'test',
                  'tenant_id': '',
                  'shared': False,
+                 'mtu': mtu,
                  'admin_state_up': True,
                  'status': 'ACTIVE'}}
         network = None

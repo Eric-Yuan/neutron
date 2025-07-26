@@ -14,19 +14,32 @@
 
 import contextlib
 
-from neutron.services.trunk import plugin as trunk_plugin
-from neutron.tests.functional import base
 from neutron_lib import constants as n_consts
 from neutron_lib.objects import registry as obj_reg
 from neutron_lib.plugins import utils
 from neutron_lib.services.trunk import constants as trunk_consts
 from oslo_utils import uuidutils
+from ovsdbapp.backend.ovs_idl import event
+
+from neutron.common.ovn import constants as ovn_const
+from neutron.services.trunk import plugin as trunk_plugin
+from neutron.tests.functional import base
+
+
+class WaitForPortBindingDeleteEvent(event.WaitEvent):
+    event_name = 'WaitForPortBindingDeleteEvent'
+
+    def __init__(self, port_id):
+        table = 'Port_Binding'
+        events = (self.ROW_DELETE, )
+        conditions = (('logical_port', '=', port_id), )
+        super().__init__(events, table, conditions, timeout=10)
 
 
 class TestOVNTrunkDriver(base.TestOVNFunctionalBase):
 
     def setUp(self):
-        super(TestOVNTrunkDriver, self).setUp()
+        super().setUp()
         self.trunk_plugin = trunk_plugin.TrunkPlugin()
         self.trunk_plugin.add_segmentation_type(
             trunk_consts.SEGMENTATION_TYPE_VLAN,
@@ -60,24 +73,35 @@ class TestOVNTrunkDriver(base.TestOVNFunctionalBase):
         for row in self.nb_api.tables[
                 'Logical_Switch_Port'].rows.values():
             if row.parent_name and row.tag:
+                device_owner = row.external_ids[
+                    ovn_const.OVN_DEVICE_OWNER_EXT_ID_KEY]
+                revision_number = row.external_ids[
+                    ovn_const.OVN_REV_NUM_EXT_ID_KEY]
                 ovn_trunk_info.append({'port_id': row.name,
                                        'parent_port_id': row.parent_name,
-                                       'tag': row.tag})
+                                       'tag': row.tag,
+                                       'device_owner': device_owner,
+                                       'revision_number': revision_number,
+                                       })
         return ovn_trunk_info
 
     def _verify_trunk_info(self, trunk, has_items):
         ovn_subports_info = self._get_ovn_trunk_info()
         neutron_subports_info = []
         for subport in trunk.get('sub_ports', []):
-            neutron_subports_info.append({'port_id': subport['port_id'],
-                                          'parent_port_id': [trunk['port_id']],
-                                          'tag': [subport['segmentation_id']]})
+            neutron_subports_info.append(
+                {'port_id': subport['port_id'],
+                 'parent_port_id': [trunk['port_id']],
+                 'tag': [subport['segmentation_id']],
+                 'device_owner': trunk_consts.TRUNK_SUBPORT_OWNER,
+                 'revision_number': '2',
+                 })
             # Check that the subport has the binding is active.
             binding = obj_reg.load_class('PortBinding').get_object(
                 self.context, port_id=subport['port_id'], host='')
             self.assertEqual(n_consts.PORT_STATUS_ACTIVE, binding['status'])
 
-        self.assertItemsEqual(ovn_subports_info, neutron_subports_info)
+        self.assertCountEqual(ovn_subports_info, neutron_subports_info)
         self.assertEqual(has_items, len(neutron_subports_info) != 0)
 
         if trunk.get('status'):
@@ -104,10 +128,14 @@ class TestOVNTrunkDriver(base.TestOVNFunctionalBase):
     def test_subport_delete(self):
         with self.subport() as subport:
             with self.trunk([subport]) as trunk:
+                pb_event = WaitForPortBindingDeleteEvent(subport['port_id'])
+                self.mech_driver.sb_ovn.idl.notify_handler.watch_event(
+                    pb_event)
                 self.trunk_plugin.remove_subports(self.context, trunk['id'],
                                                   {'sub_ports': [subport]})
                 new_trunk = self.trunk_plugin.get_trunk(self.context,
                                                         trunk['id'])
+                self.assertTrue(pb_event.wait())
                 self._verify_trunk_info(new_trunk, has_items=False)
 
     def test_trunk_delete(self):

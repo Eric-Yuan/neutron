@@ -18,13 +18,14 @@ from neutron_lib.callbacks import registry
 from neutron_lib.services.logapi import constants as log_const
 from oslo_log import log as logging
 
+from neutron.services.logapi import api_base
 from neutron.services.logapi.rpc import server as server_rpc
 
 LOG = logging.getLogger(__name__)
 
 
 @registry.has_registry_receivers
-class DriverBase(object):
+class DriverBase(api_base.LoggingApiBase):
 
     def __init__(self, name, vif_types, vnic_types,
                  supported_logging_types, requires_rpc=False):
@@ -57,6 +58,7 @@ class DriverBase(object):
     def register_rpc_methods(self, resource_type, rpc_methods):
         server_rpc.register_rpc_methods(resource_type, rpc_methods)
 
+    @property
     def is_loaded(self):
         """True if the driver is active for the Neutron Server.
 

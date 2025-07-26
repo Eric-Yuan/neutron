@@ -12,16 +12,21 @@
 
 import abc
 import collections
+from collections import abc as collections_abc
 import copy
 import functools
 import itertools
+import sys
+import traceback
 
 from neutron_lib.db import api as db_api
+from neutron_lib.db import model_base
+from neutron_lib.db import standard_attr
 from neutron_lib import exceptions as n_exc
 from neutron_lib.objects import exceptions as o_exc
 from neutron_lib.objects.extensions import standardattributes
+from oslo_config import cfg
 from oslo_db import exception as obj_exc
-from oslo_db.sqlalchemy import enginefacade
 from oslo_db.sqlalchemy import utils as db_utils
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
@@ -29,17 +34,44 @@ from oslo_utils import versionutils
 from oslo_versionedobjects import base as obj_base
 from oslo_versionedobjects import exception as obj_exception
 from oslo_versionedobjects import fields as obj_fields
-import six
 from sqlalchemy import orm
+from sqlalchemy.orm import query as sqla_query
 
 from neutron._i18n import _
-from neutron.db import standard_attr
 from neutron.objects.db import api as obj_db_api
 
 
 LOG = logging.getLogger(__name__)
+CONF = cfg.CONF
 
 _NO_DB_MODEL = object()
+
+
+# NOTE(ralonsoh): this is a method evaluated anytime an ORM session is
+# executing a SQL transaction.
+# If "autocommit" is disabled (the default value in SQLAlchemy 1.4 and the
+# only value in SQLAlchemy 2.0) and there is not active transaction, that
+# means the SQL transaction is being run on an "implicit transaction". Under
+# autocommit, this transaction is created, executed and discarded immediately;
+# under non-autocommit, a transaction must be explicitly created
+# (writer/reader) and sticks open.
+# This evaluation is done only in debug mode to monitor the Neutron code
+# compliance to SQLAlchemy 2.0.
+def do_orm_execute(orm_execute_state):
+    if not orm_execute_state.session.in_transaction():
+        trace_string = '\n'.join(traceback.format_stack(sys._getframe(1)))
+        LOG.warning('ORM session: SQL execution without transaction in '
+                    'progress, traceback:\n%s', trace_string)
+
+
+try:
+    _debug = cfg.CONF.debug
+except cfg.NoSuchOptError:
+    _debug = False
+
+
+if _debug:
+    db_api.sqla_listen(orm.Session, 'do_orm_execute', do_orm_execute)
 
 
 def get_object_class_by_model(model):
@@ -55,7 +87,7 @@ def register_filter_hook_on_model(model, filter_name):
     obj_class.add_extra_filter_name(filter_name)
 
 
-class LazyQueryIterator(six.Iterator):
+class LazyQueryIterator:
     def __init__(self, obj_class, lazy_query):
         self.obj_class = obj_class
         self.context = None
@@ -74,7 +106,7 @@ class LazyQueryIterator(six.Iterator):
         return item
 
 
-class Pager(object):
+class Pager:
     '''Pager class
 
     This class represents a pager object. It is consumed by get_objects to
@@ -142,10 +174,10 @@ class NeutronObjectRegistry(obj_base.VersionedObjectRegistry):
         return self
 
 
-@six.add_metaclass(abc.ABCMeta)
 class NeutronObject(obj_base.VersionedObject,
                     obj_base.VersionedObjectDictCompat,
-                    obj_base.ComparableVersionedObject):
+                    obj_base.ComparableVersionedObject,
+                    metaclass=abc.ABCMeta):
 
     synthetic_fields = []
     extra_filter_names = set()
@@ -156,7 +188,7 @@ class NeutronObject(obj_base.VersionedObject,
     lazy_fields = set()
 
     def __init__(self, context=None, **kwargs):
-        super(NeutronObject, self).__init__(context, **kwargs)
+        super().__init__(context, **kwargs)
         self._load_synthetic_fields = True
         self.obj_set_defaults()
 
@@ -173,6 +205,7 @@ class NeutronObject(obj_base.VersionedObject,
             # is included in self.items()
             if name in self.fields and name not in self.synthetic_fields:
                 value = self.fields[name].to_primitive(self, name, value)
+            # TODO(ralonsoh): remove once bp/keystone-v3 migration finishes.
             if name == 'tenant_id':
                 if ('project_id' in self.fields and
                         not self.obj_attr_is_set('project_id')):
@@ -195,8 +228,9 @@ class NeutronObject(obj_base.VersionedObject,
 
     @classmethod
     def is_object_field(cls, field):
-        return (isinstance(cls.fields[field], obj_fields.ListOfObjectsField) or
-                isinstance(cls.fields[field], obj_fields.ObjectField))
+        return isinstance(
+                   cls.fields[field],
+                   obj_fields.ListOfObjectsField | obj_fields.ObjectField)
 
     @classmethod
     def obj_class_from_name(cls, objname, objver):
@@ -282,7 +316,7 @@ class NeutronObject(obj_base.VersionedObject,
 
     @classmethod
     def _update_objects(cls, objects, values):
-        if not isinstance(objects, collections.Sequence):
+        if not isinstance(objects, collections_abc.Sequence):
             objects = (objects, )
 
         for obj in objects:
@@ -341,7 +375,8 @@ def _guarantee_rw_subtransaction(func):
 class DeclarativeObject(abc.ABCMeta):
 
     def __init__(cls, name, bases, dct):
-        super(DeclarativeObject, cls).__init__(name, bases, dct)
+        super().__init__(name, bases, dct)
+        # TODO(ralonsoh): remove once bp/keystone-v3 migration finishes.
         if 'project_id' in cls.fields:
             obj_extra_fields_set = set(cls.obj_extra_fields)
             obj_extra_fields_set.add('tenant_id')
@@ -388,6 +423,7 @@ class DeclarativeObject(abc.ABCMeta):
             standardattributes.add_tag_filter_names(cls)
         # Instantiate extra filters per class
         cls.extra_filter_names = set(cls.extra_filter_names)
+        # TODO(ralonsoh): remove once bp/keystone-v3 migration finishes.
         # add tenant_id filter for objects that have project_id
         if 'project_id' in cls.fields and 'tenant_id' not in cls.fields:
             cls.extra_filter_names.add('tenant_id')
@@ -398,17 +434,13 @@ class DeclarativeObject(abc.ABCMeta):
             raise o_exc.NeutronObjectValidatorException(fields=invalid_fields)
 
 
-@six.add_metaclass(DeclarativeObject)
-class NeutronDbObject(NeutronObject):
+class NeutronDbObject(NeutronObject, metaclass=DeclarativeObject):
 
-    # should be overridden for all persistent objects
-    db_model = None
+    # should be set for all persistent objects
+    db_model: model_base.BASEV2 | None = None
 
-    # should be overridden for all rbac aware objects
-    rbac_db_cls = None
-
-    # whether to use new engine facade for the object
-    new_facade = False
+    # should be set for all rbac aware objects
+    rbac_db_cls: model_base.BASEV2 | None = None
 
     primary_keys = ['id']
 
@@ -426,7 +458,7 @@ class NeutronDbObject(NeutronObject):
     # E.g. all the port extension will use 'port_id' as key.
     foreign_keys = {}
 
-    fields_no_update = []
+    fields_no_update: list[str] = []
 
     # dict with name mapping: {'field_name_in_object': 'field_name_in_db'}
     # It can be used also as DB relationship mapping to synthetic fields name.
@@ -444,7 +476,7 @@ class NeutronDbObject(NeutronObject):
     # obj_extra_fields = []
 
     def __init__(self, *args, **kwargs):
-        super(NeutronDbObject, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self._captured_db_model = None
 
     @property
@@ -523,8 +555,14 @@ class NeutronDbObject(NeutronObject):
         # db.keys() so we must fetch data based on object fields definition
         potential_fields = (list(cls.fields.keys()) +
                             list(cls.fields_need_translation.values()))
-        result = {field: db_obj[field] for field in potential_fields
-                  if db_obj.get(field) is not None}
+        # NOTE(ralonsoh): fields dynamically loaded will be represented as
+        # ``sqla_query.Query``, because the value is load when needed executing
+        # a query to the DB.
+        result = {
+            field: db_obj[field] for field in potential_fields
+            if (db_obj.get(field) is not None and
+                not issubclass(db_obj.get(field).__class__, sqla_query.Query))
+        }
         for field, field_db in cls.fields_need_translation.items():
             if field_db in result:
                 result[field] = result.pop(field_db)
@@ -557,35 +595,22 @@ class NeutronDbObject(NeutronObject):
         try:
             is_attr_nullable = self.fields[attrname].nullable
         except KeyError:
-            return super(NeutronDbObject, self).obj_load_attr(attrname)
+            return super().obj_load_attr(attrname)
         if is_attr_nullable:
             self[attrname] = None
-
-    # TODO(ihrachys) remove once we switch plugin code to enginefacade
-    @staticmethod
-    def _use_db_facade(context):
-        try:
-            enginefacade._transaction_ctx_for_context(context)
-        except obj_exc.NoEngineContextEstablished:
-            return False
-        return True
 
     @classmethod
     def db_context_writer(cls, context):
         """Return read-write session activation decorator."""
-        if cls.new_facade or cls._use_db_facade(context):
-            return db_api.CONTEXT_WRITER.using(context)
-        return db_api.autonested_transaction(context.session)
+        return db_api.CONTEXT_WRITER.using(context)
 
     @classmethod
     def db_context_reader(cls, context):
         """Return read-only session activation decorator."""
-        if cls.new_facade or cls._use_db_facade(context):
-            return db_api.CONTEXT_READER.using(context)
-        return db_api.autonested_transaction(context.session)
+        return db_api.CONTEXT_READER.using(context)
 
     @classmethod
-    def get_object(cls, context, fields=None, **kwargs):
+    def get_object(cls, context, fields=None, return_db_obj=False, **kwargs):
         """Fetch a single object
 
         Return the first result of given context or None if the result doesn't
@@ -597,6 +622,8 @@ class NeutronDbObject(NeutronObject):
                        avoid loading synthetic fields when possible, and
                        does not affect db queries. Default is None, which
                        is the same as []. Example: ['id', 'name']
+        :param return_db_obj: return the DB model object instead of loading
+                              the OVO; that could save some time.
         :param kwargs: multiple keys defined by key=value pairs
         :return: single object of NeutronDbObject class or None
         """
@@ -610,12 +637,14 @@ class NeutronDbObject(NeutronObject):
         with cls.db_context_reader(context):
             db_obj = obj_db_api.get_object(
                 cls, context, **cls.modify_fields_to_db(kwargs))
+            if return_db_obj:
+                return db_obj
             if db_obj:
                 return cls._load_object(context, db_obj, fields=fields)
 
     @classmethod
     def get_objects(cls, context, _pager=None, validate_filters=True,
-                    fields=None, **kwargs):
+                    fields=None, return_db_obj=False, **kwargs):
         """Fetch a list of objects
 
         Fetch all results from DB and convert them to versioned objects.
@@ -630,6 +659,8 @@ class NeutronDbObject(NeutronObject):
                        avoid loading synthetic fields when possible, and
                        does not affect db queries. Default is None, which
                        is the same as []. Example: ['id', 'name']
+        :param return_db_obj: if 'True', the DB object is returned instead of
+                              the OVO, saving the conversion time.
         :param kwargs: multiple keys defined by key=value pairs
         :return: list of objects of NeutronDbObject class or empty list
         """
@@ -638,6 +669,8 @@ class NeutronDbObject(NeutronObject):
         with cls.db_context_reader(context):
             db_objs = obj_db_api.get_objects(
                 cls, context, _pager=_pager, **cls.modify_fields_to_db(kwargs))
+            if return_db_obj:
+                return db_objs
 
             return [cls._load_object(context, db_obj, fields=fields)
                     for db_obj in db_objs]
@@ -697,15 +730,13 @@ class NeutronDbObject(NeutronObject):
         # update revision numbers
         db_obj = None
         if cls.has_standard_attributes():
-            return super(NeutronDbObject, cls).update_object(
+            return super().update_object(
                 context, values, validate_filters=False, **kwargs)
-        else:
-            with cls.db_context_writer(context):
-                db_obj = obj_db_api.update_object(
-                    cls, context,
-                    cls.modify_fields_to_db(values),
-                    **cls.modify_fields_to_db(kwargs))
-                return cls._load_object(context, db_obj)
+        with cls.db_context_writer(context):
+            db_obj = obj_db_api.update_object(
+                cls, context, cls.modify_fields_to_db(values),
+                **cls.modify_fields_to_db(kwargs))
+            return cls._load_object(context, db_obj)
 
     @classmethod
     def update_objects(cls, context, values, validate_filters=True, **kwargs):
@@ -725,7 +756,7 @@ class NeutronDbObject(NeutronObject):
             # if we have standard attributes, we will need to fetch records to
             # update revision numbers
             if cls.has_standard_attributes():
-                return super(NeutronDbObject, cls).update_objects(
+                return super().update_objects(
                     context, values, validate_filters=False, **kwargs)
             return obj_db_api.update_objects(
                 cls, context,
@@ -751,7 +782,7 @@ class NeutronDbObject(NeutronObject):
     @classmethod
     def is_accessible(cls, context, db_obj):
         return (context.is_admin or
-                context.tenant_id == db_obj.tenant_id)
+                context.project_id == db_obj.project_id)
 
     @staticmethod
     def filter_to_str(value):
@@ -831,7 +862,7 @@ class NeutronDbObject(NeutronObject):
                     parent=clsname, child=objclass.__name__)
             if len(foreign_keys.keys()) > 1:
                 raise o_exc.NeutronSyntheticFieldMultipleForeignKeys(
-                        field=field)
+                    field=field)
 
             synthetic_field_db_name = (
                 self.fields_need_translation.get(field, field))
@@ -913,6 +944,7 @@ class NeutronDbObject(NeutronObject):
         self._captured_db_model = None
 
     @classmethod
+    @db_api.CONTEXT_READER
     def count(cls, context, validate_filters=True, **kwargs):
         """Count the number of objects matching filtering criteria.
 
@@ -929,6 +961,7 @@ class NeutronDbObject(NeutronObject):
         )
 
     @classmethod
+    @db_api.CONTEXT_READER
     def objects_exist(cls, context, validate_filters=True, **kwargs):
         """Check if objects are present in DB.
 
@@ -942,5 +975,4 @@ class NeutronDbObject(NeutronObject):
             cls.validate_filters(**kwargs)
         # Succeed if at least a single object matches; no need to fetch more
         return bool(obj_db_api.count(
-            cls, context, **cls.modify_fields_to_db(kwargs))
-        )
+            cls, context, query_limit=1, **cls.modify_fields_to_db(kwargs)))

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import copy
-import random
+import secrets
 
 from neutron_lib.agent import topics
 from neutron_lib.api import extensions
@@ -27,6 +27,8 @@ from neutron_lib import rpc as n_rpc
 from oslo_config import cfg
 from oslo_log import log as logging
 import oslo_messaging
+
+from neutron.common import utils
 
 
 # Priorities - lower value is higher priority
@@ -63,7 +65,7 @@ METHOD_PRIORITY_MAP = {
 LOG = logging.getLogger(__name__)
 
 
-class DhcpAgentNotifyAPI(object):
+class DhcpAgentNotifyAPI:
     """API for plugin to notify DHCP agent.
 
     This class implements the client side of an rpc interface.  The server side
@@ -87,6 +89,8 @@ class DhcpAgentNotifyAPI(object):
         self._plugin = plugin
         target = oslo_messaging.Target(topic=topic, version='1.0')
         self.client = n_rpc.get_client(target)
+        if not cfg.CONF.dhcp_agent_notification:
+            return
         # register callbacks for router interface changes
         registry.subscribe(self._after_router_interface_created,
                            resources.ROUTER_INTERFACE, events.AFTER_CREATE)
@@ -101,8 +105,6 @@ class DhcpAgentNotifyAPI(object):
             resources.SUBNET,
             resources.SUBNETS,
         )
-        if not cfg.CONF.dhcp_agent_notification:
-            return
         for resource in callback_resources:
             registry.subscribe(self._send_dhcp_notification,
                                resource, events.BEFORE_RESPONSE)
@@ -143,11 +145,11 @@ class DhcpAgentNotifyAPI(object):
                         network['id'])
         return new_agents + existing_agents
 
-    def _get_enabled_agents(self, context, network, agents, method, payload):
+    def _get_enabled_agents(
+            self, context, network_id, network, agents, method, payload):
         """Get the list of agents who can provide services."""
         if not agents:
             return []
-        network_id = network['id']
         enabled_agents = agents
         if not cfg.CONF.enable_services_on_agents_with_admin_state_down:
             enabled_agents = [x for x in agents if x.admin_state_up]
@@ -165,6 +167,9 @@ class DhcpAgentNotifyAPI(object):
         if not enabled_agents:
             num_ports = self.plugin.get_ports_count(
                 context, {'network_id': [network_id]})
+            if not network:
+                admin_ctx = context if context.is_admin else context.elevated()
+                network = self.plugin.get_network(admin_ctx, network_id)
             notification_required = (
                 num_ports > 0 and len(network['subnets']) >= 1)
             if notification_required:
@@ -179,7 +184,9 @@ class DhcpAgentNotifyAPI(object):
     def _is_reserved_dhcp_port(self, port):
         return port.get('device_id') == constants.DEVICE_ID_RESERVED_DHCP_PORT
 
-    def _notify_agents(self, context, method, payload, network_id):
+    @utils.disable_notifications
+    def _notify_agents(
+            self, context, method, payload, network_id, network=None):
         """Notify all the agents that are hosting the network."""
         payload['priority'] = METHOD_PRIORITY_MAP.get(method)
         # fanout is required as we do not know who is "listening"
@@ -194,35 +201,39 @@ class DhcpAgentNotifyAPI(object):
         if fanout_required:
             self._fanout_message(context, method, payload)
         elif cast_required:
-            admin_ctx = (context if context.is_admin else context.elevated())
-            network = self.plugin.get_network(admin_ctx, network_id)
+            candidate_hosts = None
             if 'subnet' in payload and payload['subnet'].get('segment_id'):
                 # if segment_id exists then the segment service plugin
                 # must be loaded
                 segment_plugin = directory.get_plugin('segments')
                 segment = segment_plugin.get_segment(
                     context, payload['subnet']['segment_id'])
-                network['candidate_hosts'] = segment['hosts']
+                candidate_hosts = segment['hosts']
 
             agents = self.plugin.get_dhcp_agents_hosting_networks(
-                context, [network_id], hosts=network.get('candidate_hosts'))
+                context, [network_id], hosts=candidate_hosts)
             # schedule the network first, if needed
             schedule_required = (
                 method == 'subnet_create_end' or
                 method == 'port_create_end' and
                 not self._is_reserved_dhcp_port(payload['port']))
             if schedule_required:
+                admin_ctx = context if context.is_admin else context.elevated()
+                network = network or self.plugin.get_network(
+                    admin_ctx, network_id)
+                if candidate_hosts:
+                    network['candidate_hosts'] = candidate_hosts
                 agents = self._schedule_network(admin_ctx, network, agents)
             if not agents:
                 LOG.debug("Network %s is not hosted by any dhcp agent",
                           network_id)
                 return
             enabled_agents = self._get_enabled_agents(
-                context, network, agents, method, payload)
+                context, network_id, network, agents, method, payload)
 
-            if method == 'port_create_end':
+            if method == 'port_create_end' and enabled_agents:
                 high_agent = enabled_agents.pop(
-                    random.randint(0, len(enabled_agents) - 1))
+                    secrets.SystemRandom().randint(0, len(enabled_agents) - 1))
                 self._notify_high_priority_agent(
                     context, copy.deepcopy(payload), high_agent)
             for agent in enabled_agents:
@@ -234,12 +245,14 @@ class DhcpAgentNotifyAPI(object):
         self._cast_message(context, "port_create_end",
                            payload, agent.host, agent.topic)
 
+    @utils.disable_notifications
     def _cast_message(self, context, method, payload, host,
                       topic=topics.DHCP_AGENT):
         """Cast the payload to the dhcp agent running on the host."""
         cctxt = self.client.prepare(topic=topic, server=host)
         cctxt.cast(context, method, payload=payload)
 
+    @utils.disable_notifications
     def _fanout_message(self, context, method, payload):
         """Fanout the payload to all dhcp agents."""
         cctxt = self.client.prepare(fanout=True)
@@ -260,19 +273,23 @@ class DhcpAgentNotifyAPI(object):
                            {'admin_state_up': admin_state_up}, host)
 
     def _after_router_interface_created(self, resource, event, trigger,
-                                        **kwargs):
-        self._notify_agents(kwargs['context'], 'port_create_end',
-                            {'port': kwargs['port']},
-                            kwargs['port']['network_id'])
+                                        payload=None):
+        port = payload.metadata.get('port')
+        self._notify_agents(payload.context, 'port_create_end',
+                            {'port': port},
+                            port['network_id'])
 
     def _after_router_interface_deleted(self, resource, event, trigger,
-                                        **kwargs):
-        self._notify_agents(kwargs['context'], 'port_delete_end',
-                            {'port_id': kwargs['port']['id']},
-                            kwargs['port']['network_id'])
+                                        payload=None):
+        port = payload.metadata.get('port')
+        self._notify_agents(payload.context, 'port_delete_end',
+                            {'port_id': port['id'],
+                             'fixed_ips': port['fixed_ips'],
+                             'network_id': port['network_id']},
+                            port['network_id'])
 
     def _native_event_send_dhcp_notification(self, resource, event, trigger,
-                                             context, **kwargs):
+                                             payload):
         action = event.replace('after_', '')
         # we unsubscribe the _send_dhcp_notification method now that we know
         # the loaded core plugin emits native resource events
@@ -285,29 +302,25 @@ class DhcpAgentNotifyAPI(object):
                 registry.unsubscribe_by_resource(self._send_dhcp_notification,
                                                  resource)
         method_name = '.'.join((resource, action, 'end'))
-        payload = kwargs[resource]
-        data = {resource: payload}
-        if resource == resources.PORT:
-            if self._only_status_changed(kwargs.get('original_port'),
-                                         kwargs.get('port')):
+        data = {resource: payload.latest_state}
+        if resource == resources.PORT and event == events.AFTER_UPDATE:
+            if not self._notification_is_needed(payload.states[0],
+                                                payload.latest_state):
                 # don't waste time updating the DHCP agent for status updates
                 return
-        self.notify(context, data, method_name)
+        self.notify(payload.context, data, method_name)
 
-    def _only_status_changed(self, orig, new):
-        # a status change will manifest as a bumped revision number, a new
-        # updated_at timestamp, and a new status. If that's all that changed,
-        # return True, else False
+    def _notification_is_needed(self, orig, new):
+        # notification to the DHCP agent should be send only if DHCP related
+        # attributes of the port were changed, like: fixed_ips, mac_address,
+        # extra_dhcp_opts, dns_name, dns_assignment or dns_domain.
+        # Otherwise there is no need to waste DHCP agent's time for doing
+        # updates.
         if not orig or not new:
-            return False
-        if set(orig.keys()) != set(new.keys()):
-            return False
-        for k in orig.keys():
-            if k in ('status', 'updated_at', 'revision_number'):
-                continue
-            if orig[k] != new[k]:
-                return False
-        return True
+            return True
+        return any(orig.get(k) != new.get(k) for k in (
+            'fixed_ips', 'mac_address', 'extra_dhcp_opts',
+            'dns_name', 'dns_assignment', 'dns_domain'))
 
     def _send_dhcp_notification(self, resource, event, trigger, payload=None):
         action = payload.action.split('_')[0]
@@ -343,6 +356,10 @@ class DhcpAgentNotifyAPI(object):
                 payload = {obj_type + '_id': obj_value['id']}
                 if obj_type != 'network':
                     payload['network_id'] = network_id
-                self._notify_agents(context, method_name, payload, network_id)
+                if obj_type == 'port':
+                    payload['fixed_ips'] = obj_value['fixed_ips']
+                self._notify_agents(context, method_name, payload, network_id,
+                                    obj_value.get('network'))
         else:
-            self._notify_agents(context, method_name, data, network_id)
+            self._notify_agents(context, method_name, data, network_id,
+                                obj_value.get('network'))

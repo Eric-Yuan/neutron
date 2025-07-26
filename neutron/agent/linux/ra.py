@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import io
 import os
 import pwd
 
@@ -23,7 +24,6 @@ import netaddr
 from neutron_lib import constants
 from neutron_lib.utils import file as file_utils
 from oslo_log import log as logging
-import six
 
 from neutron.agent.linux import external_process
 from neutron.agent.linux import utils
@@ -42,23 +42,23 @@ CONFIG_TEMPLATE = jinja2.Template("""interface {{ interface_name }}
    MinRtrAdvInterval {{ min_rtr_adv_interval }};
    MaxRtrAdvInterval {{ max_rtr_adv_interval }};
 
-   {% if network_mtu >= constants.IPV6_MIN_MTU %}
+   {%- if network_mtu >= constants.IPV6_MIN_MTU %}
    AdvLinkMTU {{network_mtu}};
    {% endif %}
 
-   {% if constants.DHCPV6_STATELESS in ra_modes %}
+   {%- if constants.DHCPV6_STATELESS in ra_modes %}
    AdvOtherConfigFlag on;
    {% endif %}
 
-   {% if constants.DHCPV6_STATEFUL in ra_modes %}
+   {%- if constants.DHCPV6_STATEFUL in ra_modes %}
    AdvManagedFlag on;
    {% endif %}
 
-   {% if dns_servers %}
+   {%- if dns_servers %}
    RDNSS {% for dns in dns_servers %} {{ dns }} {% endfor %} {};
    {% endif %}
 
-   {% for prefix in auto_config_prefixes %}
+   {%- for prefix in auto_config_prefixes %}
    prefix {{ prefix }}
    {
         AdvOnLink on;
@@ -66,18 +66,21 @@ CONFIG_TEMPLATE = jinja2.Template("""interface {{ interface_name }}
    };
    {% endfor %}
 
-   {% for prefix in stateful_config_prefixes %}
+   {%- for prefix in stateful_config_prefixes %}
    prefix {{ prefix }}
    {
         AdvOnLink on;
         AdvAutonomous off;
    };
    {% endfor %}
+
+   route fe80::a9fe:a9fe/128 {
+   };
 };
 """)
 
 
-class DaemonMonitor(object):
+class DaemonMonitor:
     """Manage the data and state of an radvd process."""
 
     def __init__(self, router_id, router_ns, process_monitor, dev_name_helper,
@@ -93,7 +96,7 @@ class DaemonMonitor(object):
                                               self._router_id,
                                               'radvd.conf',
                                               True)
-        buf = six.StringIO()
+        buf = io.StringIO()
         for p in router_ports:
             subnets = p.get('subnets', [])
             v6_subnets = [subnet for subnet in subnets if

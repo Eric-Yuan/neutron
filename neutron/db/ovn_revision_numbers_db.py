@@ -16,6 +16,7 @@
 import datetime
 
 from neutron_lib.db import api as db_api
+from neutron_lib.db import standard_attr
 from neutron_lib import exceptions as n_exc
 from oslo_config import cfg
 from oslo_log import log
@@ -23,47 +24,33 @@ from oslo_utils import timeutils
 import sqlalchemy as sa
 from sqlalchemy.orm import exc
 
+from neutron.common.ovn import constants as ovn_const
 from neutron.common.ovn import utils as ovn_utils
+from neutron.db.models import address_group  # noqa
 from neutron.db.models import l3  # noqa
 from neutron.db.models import ovn as ovn_models
 from neutron.db.models import securitygroup  # noqa
 from neutron.db import models_v2  # noqa
-from neutron.db import standard_attr
 
 LOG = log.getLogger(__name__)
 CONF = cfg.CONF
 
 STD_ATTR_MAP = standard_attr.get_standard_attr_resource_model_map()
 
-# NOTE(ralonsoh): to be moved to neutron-lib
-TYPE_NETWORKS = 'networks'
-TYPE_PORTS = 'ports'
-TYPE_SECURITY_GROUP_RULES = 'security_group_rules'
-TYPE_ROUTERS = 'routers'
-TYPE_ROUTER_PORTS = 'router_ports'
-TYPE_SECURITY_GROUPS = 'security_groups'
-TYPE_FLOATINGIPS = 'floatingips'
-TYPE_SUBNETS = 'subnets'
-
-_TYPES_PRIORITY_ORDER = (
-    TYPE_NETWORKS,
-    TYPE_SECURITY_GROUPS,
-    TYPE_SUBNETS,
-    TYPE_ROUTERS,
-    TYPE_PORTS,
-    TYPE_ROUTER_PORTS,
-    TYPE_FLOATINGIPS,
-    TYPE_SECURITY_GROUP_RULES)
-
 # The order in which the resources should be created or updated by the
 # maintenance task: Root ones first and leafs at the end.
-MAINTENANCE_CREATE_UPDATE_TYPE_ORDER = {
-    t: n for n, t in enumerate(_TYPES_PRIORITY_ORDER, 1)}
+MAINTENANCE_CREATE_UPDATE_TYPE_ORDER = [
+    (ovn_models.OVNRevisionNumbers.resource_type == resource_type, idx)
+    for idx, resource_type in enumerate(ovn_const.TYPES_PRIORITY_ORDER, 1)
+]
 
 # The order in which the resources should be deleted by the maintenance
 # task: Leaf ones first and roots at the end.
-MAINTENANCE_DELETE_TYPE_ORDER = {
-    t: n for n, t in enumerate(reversed(_TYPES_PRIORITY_ORDER), 1)}
+MAINTENANCE_DELETE_TYPE_ORDER = [
+    (ovn_models.OVNRevisionNumbers.resource_type == resource_type, idx)
+    for idx, resource_type in
+    enumerate(reversed(ovn_const.TYPES_PRIORITY_ORDER), 1)
+]
 
 INITIAL_REV_NUM = -1
 
@@ -75,7 +62,8 @@ INCONSISTENCIES_OLDER_THAN = 60
 # 1:2 mapping for OVN, neutron router ports are simple ports, but
 # for OVN we handle LSP & LRP objects
 if STD_ATTR_MAP:
-    STD_ATTR_MAP[TYPE_ROUTER_PORTS] = STD_ATTR_MAP[TYPE_PORTS]
+    STD_ATTR_MAP[ovn_const.TYPE_ROUTER_PORTS] = (
+        STD_ATTR_MAP[ovn_const.TYPE_PORTS])
 
 
 # NOTE(ralonsoh): to be moved to neutron-lib
@@ -86,6 +74,12 @@ class StandardAttributeIDNotFound(n_exc.NeutronException):
 # NOTE(ralonsoh): to be moved to neutron-lib
 class UnknownResourceType(n_exc.NeutronException):
     message = 'Uknown resource type: %(resource_type)s'
+
+
+# NOTE(ralonsoh): to be moved to neutron-lib
+class RevisionNumberNotDefined(n_exc.NeutronException):
+    message = ('Unique revision number not found for %(resource_uuid)s, '
+               'the resource type is required in query')
 
 
 def _get_standard_attr_id(context, resource_uuid, resource_type):
@@ -100,12 +94,12 @@ def _get_standard_attr_id(context, resource_uuid, resource_type):
 @db_api.retry_if_session_inactive()
 def create_initial_revision(context, resource_uuid, resource_type,
                             revision_number=INITIAL_REV_NUM,
-                            may_exist=False):
+                            may_exist=False, std_attr_id=None):
     LOG.debug('create_initial_revision uuid=%s, type=%s, rev=%s',
               resource_uuid, resource_type, revision_number)
     db_func = context.session.merge if may_exist else context.session.add
-    with context.session.begin(subtransactions=True):
-        std_attr_id = _get_standard_attr_id(
+    with db_api.CONTEXT_WRITER.using(context):
+        std_attr_id = std_attr_id or _get_standard_attr_id(
             context, resource_uuid, resource_type)
         row = ovn_models.OVNRevisionNumbers(
             resource_uuid=resource_uuid, resource_type=resource_type,
@@ -116,7 +110,7 @@ def create_initial_revision(context, resource_uuid, resource_type,
 @db_api.retry_if_session_inactive()
 def delete_revision(context, resource_uuid, resource_type):
     LOG.debug('delete_revision(%s)', resource_uuid)
-    with context.session.begin(subtransactions=True):
+    with db_api.CONTEXT_WRITER.using(context):
         row = context.session.query(ovn_models.OVNRevisionNumbers).filter_by(
             resource_uuid=resource_uuid,
             resource_type=resource_type).one_or_none()
@@ -124,7 +118,19 @@ def delete_revision(context, resource_uuid, resource_type):
             context.session.delete(row)
 
 
-def _ensure_revision_row_exist(context, resource, resource_type):
+@db_api.retry_if_session_inactive()
+@db_api.CONTEXT_WRITER
+def delete_revisions(context, resource_uuids, resource_type):
+    if not resource_uuids:
+        return
+
+    LOG.debug('delete_revisions(%s)', resource_uuids)
+    return context.session.query(ovn_models.OVNRevisionNumbers).filter(
+        ovn_models.OVNRevisionNumbers.resource_uuid.in_(resource_uuids),
+        ovn_models.OVNRevisionNumbers.resource_type == resource_type).delete()
+
+
+def _ensure_revision_row_exist(context, resource, resource_type, std_attr_id):
     """Ensure the revision row exists.
 
     Ensure the revision row exist before we try to bump its revision
@@ -136,36 +142,51 @@ def _ensure_revision_row_exist(context, resource, resource_type):
     # deal with objects that already existed before the sync work. I believe
     # that we can remove this method after few development cycles. Or,
     # if we decide to make a migration script as well.
-    with context.session.begin(subtransactions=True):
-        if not context.session.query(ovn_models.OVNRevisionNumbers).filter_by(
-                resource_uuid=resource['id'],
-                resource_type=resource_type).one_or_none():
-            LOG.warning(
-                'No revision row found for %(res_uuid)s (type: '
-                '%(res_type)s) when bumping the revision number. '
-                'Creating one.', {'res_uuid': resource['id'],
-                                  'res_type': resource_type})
-            create_initial_revision(context, resource['id'], resource_type)
+    if context.session.query(ovn_models.OVNRevisionNumbers).filter_by(
+            resource_uuid=resource['id'],
+            resource_type=resource_type).one_or_none():
+        return
+
+    LOG.warning(
+        'No revision row found for %(res_uuid)s (type: '
+        '%(res_type)s) when bumping the revision number. '
+        'Creating one.', {'res_uuid': resource['id'],
+                          'res_type': resource_type})
+    create_initial_revision(context, resource['id'], resource_type,
+                            std_attr_id=std_attr_id)
 
 
 @db_api.retry_if_session_inactive()
-def get_revision_row(context, resource_uuid):
+@db_api.CONTEXT_READER
+def get_revision_row(context, resource_uuid, resource_type=None):
+    """Retrieve the resource revision number
+
+    Only the Neutron ports can have two revision number registers, one for the
+    Logical_Switch_Port and another for the Logical_Router_Port, if this port
+    is a router interface. It is not strictly needed to filter by resource_type
+    if the resource is not a port.
+    """
     try:
-        with context.session.begin(subtransactions=True):
-            return context.session.query(
-                ovn_models.OVNRevisionNumbers).filter_by(
-                resource_uuid=resource_uuid).one()
+        filters = {'resource_uuid': resource_uuid}
+        if resource_type:
+            filters['resource_type'] = resource_type
+        return context.session.query(
+            ovn_models.OVNRevisionNumbers).filter_by(
+            **filters).one()
     except exc.NoResultFound:
         pass
+    except exc.MultipleResultsFound:
+        raise RevisionNumberNotDefined(resource_uuid=resource_uuid)
 
 
 @db_api.retry_if_session_inactive()
 def bump_revision(context, resource, resource_type):
     revision_number = ovn_utils.get_revision_number(resource, resource_type)
-    with context.session.begin(subtransactions=True):
-        _ensure_revision_row_exist(context, resource, resource_type)
-        std_attr_id = _get_standard_attr_id(
-            context, resource['id'], resource_type)
+    with db_api.CONTEXT_WRITER.using(context):
+        std_attr_id = _get_standard_attr_id(context, resource['id'],
+                                            resource_type)
+        _ensure_revision_row_exist(context, resource, resource_type,
+                                   std_attr_id)
         row = context.session.merge(ovn_models.OVNRevisionNumbers(
             standard_attr_id=std_attr_id, resource_uuid=resource['id'],
             resource_type=resource_type))
@@ -176,6 +197,8 @@ def bump_revision(context, resource, resource_type):
                 'registered in the database (%(new_rev)d)',
                 {'res_type': resource_type, 'res_uuid': resource['id'],
                  'rev_num': revision_number, 'new_rev': row.revision_number})
+            return
+        if revision_number == row.revision_number:  # do nothing
             return
         row.revision_number = revision_number
         context.session.merge(row)
@@ -191,11 +214,10 @@ def get_inconsistent_resources(context):
     :returns: A list of objects which the revision number from the
               ovn_revision_number and standardattributes tables differs.
     """
-    sort_order = sa.case(value=ovn_models.OVNRevisionNumbers.resource_type,
-                         whens=MAINTENANCE_CREATE_UPDATE_TYPE_ORDER)
+    sort_order = sa.case(*MAINTENANCE_CREATE_UPDATE_TYPE_ORDER)
     time_ = (timeutils.utcnow() -
              datetime.timedelta(seconds=INCONSISTENCIES_OLDER_THAN))
-    with context.session.begin(subtransactions=True):
+    with db_api.CONTEXT_READER.using(context):
         query = context.session.query(ovn_models.OVNRevisionNumbers).join(
             standard_attr.StandardAttribute,
             ovn_models.OVNRevisionNumbers.standard_attr_id ==
@@ -222,8 +244,7 @@ def get_deleted_resources(context):
     the entry will be kept and returned in this list so the maintenance
     thread can later fix it.
     """
-    sort_order = sa.case(value=ovn_models.OVNRevisionNumbers.resource_type,
-                         whens=MAINTENANCE_DELETE_TYPE_ORDER)
-    with context.session.begin(subtransactions=True):
+    sort_order = sa.case(*MAINTENANCE_DELETE_TYPE_ORDER)
+    with db_api.CONTEXT_READER.using(context):
         return context.session.query(ovn_models.OVNRevisionNumbers).filter_by(
             standard_attr_id=None).order_by(sort_order).all()

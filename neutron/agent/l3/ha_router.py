@@ -24,12 +24,14 @@ from oslo_log import log as logging
 
 from neutron.agent.l3 import namespaces
 from neutron.agent.l3 import router_info as router
+from neutron.agent.linux import conntrackd
 from neutron.agent.linux import external_process
 from neutron.agent.linux import ip_lib
 from neutron.agent.linux import keepalived
 from neutron.common import utils as common_utils
 from neutron.extensions import revisions
 from neutron.extensions import timestamp
+from neutron.ipam import utils as ipam_utils
 
 LOG = logging.getLogger(__name__)
 HA_DEV_PREFIX = 'ha-'
@@ -50,29 +52,38 @@ THROTTLER_MULTIPLIER = 1.5
 class HaRouterNamespace(namespaces.RouterNamespace):
     """Namespace for HA router.
 
-    This namespace sets the ip_nonlocal_bind to 0 for HA router namespaces.
-    It does so to prevent sending gratuitous ARPs for interfaces that got VIP
-    removed in the middle of processing.
+    This namespace sets the ip_nonlocal_bind to 1 for HA router namespaces.
+    It allows to setup applications on both routers simulteniously like
+    ipsec from VPNaaS which speed up theirs failover. And let failover work
+    for VPNaaS even when python is down.
+    It is safe to set ip_nonlocal_bind to 1 as we use keepalived > 1.2.20
+    and we do not set GARP from python code anymore. More details may be
+    found in related bug #1639315.
     It also disables ipv6 forwarding by default. Forwarding will be
-    enabled during router configuration processing only for the master node.
+    enabled during router configuration processing only for the primary node.
     It has to be disabled on all other nodes to avoid sending MLD packets
     which cause lost connectivity to Floating IPs.
     """
     def create(self):
-        super(HaRouterNamespace, self).create(ipv6_forwarding=False)
-        # HA router namespaces should not have ip_nonlocal_bind enabled
-        ip_lib.set_ip_nonlocal_bind_for_namespace(self.name, 0)
+        super().create(ipv6_forwarding=False)
+        # HA router namespaces should have ip_nonlocal_bind enabled
+        ip_lib.set_ip_nonlocal_bind_for_namespace(self.name, 1)
+        # Linux should not automatically assign link-local addr for HA routers
+        # They are managed by keepalived
+        ip_wrapper = ip_lib.IPWrapper(namespace=self.name)
+        cmd = ['sysctl', '-w', 'net.ipv6.conf.all.addr_gen_mode=1']
+        ip_wrapper.netns.execute(cmd, privsep_exec=True)
 
 
 class HaRouter(router.RouterInfo):
-    def __init__(self, state_change_callback, *args, **kwargs):
-        super(HaRouter, self).__init__(*args, **kwargs)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
         self.ha_port = None
         self.keepalived_manager = None
-        self.state_change_callback = state_change_callback
         self._ha_state = None
         self._ha_state_path = None
+        self.conntrackd_manager = None
 
     def create_router_namespace_object(
             self, router_id, agent_conf, iface_driver, use_ipv6):
@@ -95,12 +106,14 @@ class HaRouter(router.RouterInfo):
         return self.router.get('ha_vr_id')
 
     def _check_and_set_real_state(self):
-        # When the physical host was down/up, the 'master' router may still
+        # When the physical host was down/up, the 'primary' router may still
         # have its original state in the _ha_state_path file. We directly
         # reset it to 'backup'.
         if (not self.keepalived_manager.check_processes() and
                 os.path.exists(self.ha_state_path) and
-                self.ha_state == 'master'):
+                self.ha_state == 'primary'):
+            LOG.debug("Setting ha_state of router %s to: backup",
+                      self.router_id)
             self.ha_state = 'backup'
 
     @property
@@ -108,10 +121,11 @@ class HaRouter(router.RouterInfo):
         if self._ha_state:
             return self._ha_state
         try:
-            with open(self.ha_state_path, 'r') as f:
+            with open(self.ha_state_path) as f:
                 self._ha_state = f.read()
-        except (OSError, IOError):
-            LOG.debug('Error while reading HA state for %s', self.router_id)
+        except OSError as error:
+            LOG.debug('Error while reading HA state for %s: %s',
+                      self.router_id, error)
         return self._ha_state or 'unknown'
 
     @ha_state.setter
@@ -120,22 +134,19 @@ class HaRouter(router.RouterInfo):
         try:
             with open(self.ha_state_path, 'w') as f:
                 f.write(new_state)
-        except (OSError, IOError):
-            LOG.error('Error while writing HA state for %s',
-                      self.router_id)
+        except OSError as error:
+            LOG.error('Error while writing HA state for %s: %s',
+                      self.router_id, error)
 
     @property
     def ha_namespace(self):
         return self.ns_name
 
-    def is_router_master(self):
+    def is_router_primary(self):
         """this method is normally called before the ha_router object is fully
         initialized
         """
-        if self.router.get('_ha_state') == 'active':
-            return True
-        else:
-            return False
+        return bool(self.router.get('_ha_state') == 'active')
 
     def initialize(self, process_monitor):
         ha_port = self.router.get(n_consts.HA_INTERFACE_KEY)
@@ -144,14 +155,33 @@ class HaRouter(router.RouterInfo):
                    self.router_id)
             LOG.exception(msg)
             raise Exception(msg)
-        super(HaRouter, self).initialize(process_monitor)
+        super().initialize(process_monitor)
 
         self.set_ha_port()
+        self._init_conntrackd_manager(process_monitor)
         self._init_keepalived_manager(process_monitor)
         self._check_and_set_real_state()
         self.ha_network_added()
-        self.update_initial_state(self.state_change_callback)
         self.spawn_state_change_monitor(process_monitor)
+
+    def _get_ha_port_fixed_ip_with_subnet(self, subnet):
+        for fixed_ip in self.ha_port.get('fixed_ips', []):
+            if fixed_ip['subnet_id'] == subnet['id']:
+                return fixed_ip['ip_address']
+        return None
+
+    def _get_conntrackd_ipv4_interface(self):
+        return self.ha_port['fixed_ips'][0]['ip_address']
+
+    def _init_conntrackd_manager(self, process_monitor):
+        self.conntrackd_manager = conntrackd.ConntrackdManager(
+            self.router['id'],
+            process_monitor,
+            self.agent_conf,
+            self._get_conntrackd_ipv4_interface(),
+            self.ha_vr_id,
+            self.get_ha_device_name(),
+            namespace=self.ha_namespace)
 
     def _init_keepalived_manager(self, process_monitor):
         self.keepalived_manager = keepalived.KeepalivedManager(
@@ -162,6 +192,10 @@ class HaRouter(router.RouterInfo):
             namespace=self.ha_namespace,
             throttle_restart_value=(
                 self.agent_conf.ha_vrrp_advert_int * THROTTLER_MULTIPLIER))
+
+        # The following call is required to ensure that if the state path does
+        # not exist it gets created.
+        self.keepalived_manager.get_full_config_file_path('test')
 
         config = self.keepalived_manager.config
 
@@ -178,7 +212,8 @@ class HaRouter(router.RouterInfo):
             priority=self.ha_priority,
             vrrp_health_check_interval=(
                 self.agent_conf.ha_vrrp_health_check_interval),
-            ha_conf_dir=self.keepalived_manager.get_conf_dir())
+            ha_conf_dir=self.keepalived_manager.get_conf_dir(),
+        )
         instance.track_interfaces.append(interface_name)
 
         if self.agent_conf.ha_vrrp_auth_password:
@@ -189,17 +224,31 @@ class HaRouter(router.RouterInfo):
 
         config.add_instance(instance)
 
+    def _disable_manager(self, manager, remove_config):
+        if not manager:
+            LOG.debug('Error while disabling manager for %s - no manager',
+                      self.router_id)
+            return
+        manager.disable()
+
+        if remove_config:
+            conf_dir = manager.get_conf_dir()
+            try:
+                shutil.rmtree(conf_dir)
+            except FileNotFoundError:
+                pass
+
     def enable_keepalived(self):
         self.keepalived_manager.spawn()
 
-    def disable_keepalived(self):
-        if not self.keepalived_manager:
-            LOG.debug('Error while disabling keepalived for %s - no manager',
-                      self.router_id)
-            return
-        self.keepalived_manager.disable()
-        conf_dir = self.keepalived_manager.get_conf_dir()
-        shutil.rmtree(conf_dir)
+    def disable_keepalived(self, remove_config=True):
+        self._disable_manager(self.keepalived_manager, remove_config)
+
+    def enable_conntrackd(self):
+        self.conntrackd_manager.spawn()
+
+    def disable_conntrackd(self, remove_config=True):
+        self._disable_manager(self.conntrackd_manager, remove_config)
 
     def _get_keepalived_instance(self):
         return self.keepalived_manager.config.get_instance(self.ha_vr_id)
@@ -264,13 +313,23 @@ class HaRouter(router.RouterInfo):
             keepalived.KeepalivedVirtualRoute(
                 route['destination'], route['nexthop'])
             for route in new_routes]
-        super(HaRouter, self).routes_updated(old_routes, new_routes)
+        if self.router.get('distributed', False):
+            super().routes_updated(old_routes, new_routes)
+        self.keepalived_manager.get_process().reload_cfg()
 
     def _add_default_gw_virtual_route(self, ex_gw_port, interface_name):
         gateway_ips = self._get_external_gw_ips(ex_gw_port)
 
         default_gw_rts = []
         instance = self._get_keepalived_instance()
+        for subnet in ex_gw_port.get('subnets', []):
+            is_gateway_not_in_subnet = (subnet['gateway_ip'] and
+                                        not ipam_utils.check_subnet_ip(
+                                            subnet['cidr'],
+                                            subnet['gateway_ip']))
+            if is_gateway_not_in_subnet:
+                default_gw_rts.append(keepalived.KeepalivedVirtualRoute(
+                    subnet['gateway_ip'], None, interface_name, scope='link'))
         for gw_ip in gateway_ips:
             # TODO(Carl) This is repeated everywhere.  A method would
             # be nice.
@@ -282,44 +341,45 @@ class HaRouter(router.RouterInfo):
     def _add_extra_subnet_onlink_routes(self, ex_gw_port, interface_name):
         extra_subnets = ex_gw_port.get('extra_subnets', [])
         instance = self._get_keepalived_instance()
-        onlink_route_cidrs = set(s['cidr'] for s in extra_subnets)
+        onlink_route_cidrs = {s['cidr'] for s in extra_subnets}
         instance.virtual_routes.extra_subnets = [
             keepalived.KeepalivedVirtualRoute(
                 onlink_route_cidr, None, interface_name, scope='link') for
             onlink_route_cidr in onlink_route_cidrs]
 
     def _should_delete_ipv6_lladdr(self, ipv6_lladdr):
-        """Only the master should have any IP addresses configured.
+        """Only the primary should have any IP addresses configured.
         Let keepalived manage IPv6 link local addresses, the same way we let
-        it manage IPv4 addresses. If the router is not in the master state,
+        it manage IPv4 addresses. If the router is not in the primary state,
         we must delete the address first as it is autoconfigured by the kernel.
         """
         manager = self.keepalived_manager
         if manager.get_process().active:
-            if self.ha_state != 'master':
-                conf = manager.get_conf_on_disk()
-                managed_by_keepalived = conf and ipv6_lladdr in conf
-                if managed_by_keepalived:
-                    return False
-            else:
+            if self.ha_state == 'primary':
+                return False
+            conf = manager.get_conf_on_disk()
+            managed_by_keepalived = conf and ipv6_lladdr in conf
+            if managed_by_keepalived:
                 return False
         return True
 
-    def _disable_ipv6_addressing_on_interface(self, interface_name):
+    def _disable_ipv6_addressing_on_interface(self, interface_name,
+                                              namespace=None):
         """Disable IPv6 link local addressing on the device and add it as
         a VIP to keepalived. This means that the IPv6 link local address
-        will only be present on the master.
+        will only be present on the primary.
         """
-        device = ip_lib.IPDevice(interface_name, namespace=self.ha_namespace)
+        namespace = namespace or self.ha_namespace
+        device = ip_lib.IPDevice(interface_name, namespace=namespace)
         ipv6_lladdr = ip_lib.get_ipv6_lladdr(device.link.address)
 
         if self._should_delete_ipv6_lladdr(ipv6_lladdr):
-            self.driver.configure_ipv6_ra(self.ha_namespace, interface_name,
+            self.driver.configure_ipv6_ra(namespace, interface_name,
                                           n_consts.ACCEPT_RA_DISABLED)
             device.addr.flush(n_consts.IP_VERSION_6)
         else:
             self.driver.configure_ipv6_ra(
-                self.ha_namespace, interface_name,
+                namespace, interface_name,
                 n_consts.ACCEPT_RA_WITHOUT_FORWARDING)
 
         self._remove_vip(ipv6_lladdr)
@@ -340,9 +400,12 @@ class HaRouter(router.RouterInfo):
         self._remove_vip(ip_cidr)
         to = common_utils.cidr_to_ip(ip_cidr)
         if device.addr.list(to=to):
-            super(HaRouter, self).remove_floating_ip(device, ip_cidr)
+            super().remove_floating_ip(device, ip_cidr)
 
-    def internal_network_updated(self, interface_name, ip_cidrs, mtu):
+    def internal_network_updated(self, port):
+        interface_name = self.get_internal_device_name(port['id'])
+        ip_cidrs = common_utils.fixed_ip_cidrs(port['fixed_ips'])
+        mtu = port['mtu']
         self.driver.set_mtu(interface_name, mtu, namespace=self.ns_name,
                             prefix=router.INTERNAL_DEV_PREFIX)
         self._clear_vips(interface_name)
@@ -369,7 +432,7 @@ class HaRouter(router.RouterInfo):
             port, self.get_internal_device_name, router.INTERNAL_DEV_PREFIX)
 
     def internal_network_removed(self, port):
-        super(HaRouter, self).internal_network_removed(port)
+        super().internal_network_removed(port)
 
         interface_name = self.get_internal_device_name(port['id'])
         self._clear_vips(interface_name)
@@ -403,6 +466,13 @@ class HaRouter(router.RouterInfo):
                 '--state_path=%s' % self.agent_conf.state_path,
                 '--user=%s' % os.geteuid(),
                 '--group=%s' % os.getegid()]
+
+            if self.agent_conf.ha_conntrackd_enabled:
+                cmd.append('--enable_conntrackd')
+
+            if self.agent_conf.debug:
+                cmd.append('--debug')
+
             return cmd
 
         return callback
@@ -412,10 +482,18 @@ class HaRouter(router.RouterInfo):
         pm.enable()
         process_monitor.register(
             self.router_id, IP_MONITOR_PROCESS_SERVICE, pm)
-        LOG.debug("Router %(router_id)s %(process)s pid %(pid)d",
-                  {"router_id": self.router_id,
-                   "process": KEEPALIVED_STATE_CHANGE_MONITOR_SERVICE_NAME,
-                   "pid": pm.pid})
+        pid = pm.pid
+        process = KEEPALIVED_STATE_CHANGE_MONITOR_SERVICE_NAME
+        if pid:
+            LOG.debug("Router %(router_id)s %(process)s pid %(pid)d",
+                      {"router_id": self.router_id,
+                       "process": process,
+                       "pid": pid})
+        else:
+            LOG.warning("Could not determine pid for router %(router_id)s "
+                        "%(process)s, might still be spawning",
+                        {"router_id": self.router_id,
+                         "process": process})
 
     def destroy_state_change_monitor(self, process_monitor):
         if not self.ha_port:
@@ -432,37 +510,26 @@ class HaRouter(router.RouterInfo):
         except common_utils.WaitTimeout:
             pm.disable(sig=str(int(signal.SIGKILL)))
 
-    def update_initial_state(self, callback):
-        addresses = ip_lib.get_devices_with_ip(self.ha_namespace,
-                                               name=self.get_ha_device_name())
-        cidrs = (address['cidr'] for address in addresses)
-        ha_cidr = self._get_primary_vip()
-        state = 'master' if ha_cidr in cidrs else 'backup'
-        self.ha_state = state
-        callback(self.router_id, state)
-
     @staticmethod
     def _gateway_ports_equal(port1, port2):
         def _get_filtered_dict(d, ignore):
             return {k: v for k, v in d.items() if k not in ignore}
 
-        keys_to_ignore = set([portbindings.HOST_ID, timestamp.UPDATED,
-                              revisions.REVISION])
+        keys_to_ignore = {portbindings.HOST_ID, timestamp.UPDATED,
+                          revisions.REVISION}
         port1_filtered = _get_filtered_dict(port1, keys_to_ignore)
         port2_filtered = _get_filtered_dict(port2, keys_to_ignore)
         return port1_filtered == port2_filtered
 
     def external_gateway_added(self, ex_gw_port, interface_name):
-        link_up = self.external_gateway_link_up()
-        self._plug_external_gateway(ex_gw_port, interface_name,
-                                    self.ns_name, link_up=link_up)
+        self._plug_external_gateway(ex_gw_port, interface_name, self.ns_name)
         self._add_gateway_vip(ex_gw_port, interface_name)
         self._disable_ipv6_addressing_on_interface(interface_name)
 
-        # Enable RA and IPv6 forwarding only for master instances. This will
+        # Enable RA and IPv6 forwarding only for primary instances. This will
         # prevent backup routers from sending packets to the upstream switch
         # and disrupt connections.
-        enable = self.ha_state == 'master'
+        enable = self.ha_state == 'primary'
         self._configure_ipv6_params_on_gw(ex_gw_port, self.ns_name,
                                           interface_name, enable)
 
@@ -477,11 +544,10 @@ class HaRouter(router.RouterInfo):
     def external_gateway_removed(self, ex_gw_port, interface_name):
         self._clear_vips(interface_name)
 
-        if self.ha_state == 'master':
-            super(HaRouter, self).external_gateway_removed(ex_gw_port,
-                                                           interface_name)
+        if self.ha_state == 'primary':
+            super().external_gateway_removed(ex_gw_port, interface_name)
         else:
-            # We are not the master node, so no need to delete ip addresses.
+            # We are not the primary node, so no need to delete ip addresses.
             self.driver.unplug(interface_name,
                                namespace=self.ns_name,
                                prefix=router.EXTERNAL_DEV_PREFIX)
@@ -489,9 +555,18 @@ class HaRouter(router.RouterInfo):
     def delete(self):
         if self.process_monitor:
             self.destroy_state_change_monitor(self.process_monitor)
-        self.disable_keepalived()
+
+        # Only remove the conf_dir after keepalived and conntrackd have been
+        # disabled. They share the same configuration directory.
+        self.disable_keepalived(
+            remove_config=not self.agent_conf.ha_conntrackd_enabled,
+        )
+
+        if self.agent_conf.ha_conntrackd_enabled:
+            self.disable_conntrackd(remove_config=True)
+
         self.ha_network_removed()
-        super(HaRouter, self).delete()
+        super().delete()
 
     def set_ha_port(self):
         ha_port = self.router.get(n_consts.HA_INTERFACE_KEY)
@@ -506,40 +581,23 @@ class HaRouter(router.RouterInfo):
             self.ha_port = ha_port
 
     def process(self):
-        super(HaRouter, self).process()
+        super().process()
 
         self.set_ha_port()
-        LOG.debug("Processing HA router with HA port: %s", self.ha_port)
+        LOG.debug("Processing HA router %(router_id)s with HA port: %(port)s",
+                  {"router_id": self.router_id,
+                   "port": self.ha_port})
         if (self.ha_port and
                 self.ha_port['status'] == n_consts.PORT_STATUS_ACTIVE):
+            # Conntrackd needs to be enabled first, otherwise the keepalived
+            # script would try to start it (possibly with the wrong
+            # configuration).
+            if self.agent_conf.ha_conntrackd_enabled:
+                self.enable_conntrackd()
             self.enable_keepalived()
 
     @runtime.synchronized('enable_radvd')
     def enable_radvd(self, internal_ports=None):
         if (self.keepalived_manager.get_process().active and
-                self.ha_state == 'master'):
-            super(HaRouter, self).enable_radvd(internal_ports)
-
-    def external_gateway_link_up(self):
-        # Check HA router ha_state for its gateway port link state.
-        # 'backup' instance will not link up the gateway port.
-        return self.ha_state == 'master'
-
-    def set_external_gw_port_link_status(self, link_up, set_gw=False):
-        link_state = "up" if link_up else "down"
-        LOG.info('Set router %s gateway device link state to %s.',
-                 self.router_id, link_state)
-
-        ex_gw_port = self.get_ex_gw_port()
-        ex_gw_port_id = (ex_gw_port and ex_gw_port['id'] or
-                         self.ex_gw_port and self.ex_gw_port['id'])
-        if ex_gw_port_id:
-            interface_name = self.get_external_device_name(ex_gw_port_id)
-            ns_name = self.get_gw_ns_name()
-            self.driver.set_link_status(interface_name, ns_name,
-                                        link_up=link_up)
-            if link_up and set_gw:
-                preserve_ips = self.get_router_preserve_ips()
-                self._external_gateway_settings(ex_gw_port, interface_name,
-                                                ns_name, preserve_ips)
-                self.routes_updated([], self.routes)
+                self.ha_state == 'primary'):
+            super().enable_radvd(internal_ports)

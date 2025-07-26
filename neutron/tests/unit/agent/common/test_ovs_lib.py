@@ -15,7 +15,9 @@
 import collections
 from unittest import mock
 
+from neutron_lib import constants as lib_const
 from neutron_lib import exceptions
+from neutron_lib.plugins.ml2 import ovs_constants as p_const
 from oslo_serialization import jsonutils
 from oslo_utils import uuidutils
 import tenacity
@@ -24,11 +26,11 @@ import testtools
 from neutron.agent.common import ovs_lib
 from neutron.agent.common import utils
 from neutron.plugins.ml2.drivers.openvswitch.agent.common \
-    import constants as p_const
+    import exceptions as ovs_exc
 from neutron.tests import base
 
 
-class OFCTLParamListMatcher(object):
+class OFCTLParamListMatcher:
 
     def _parse(self, params):
         actions_pos = params.find('actions')
@@ -46,7 +48,7 @@ class OFCTLParamListMatcher(object):
     __repr__ = __str__
 
 
-class StringSetMatcher(object):
+class StringSetMatcher:
     """A helper object for unordered CSV strings
 
     Will compare equal if both strings, when read as a comma-separated set
@@ -66,7 +68,24 @@ class StringSetMatcher(object):
 
     def __repr__(self):
         sep = '' if self.separator == ',' else " on %s" % self.separator
-        return '<comma-separated string for %s%s>' % (self.set, sep)
+        return f'<comma-separated string for {self.set}{sep}>'
+
+
+class OVS_Lib_Test_Common(base.BaseTestCase):
+    """A test suite to exercise the OVS libraries common functions"""
+
+    def test_get_gre_tunnel_port_type(self):
+        ptype = ovs_lib.get_gre_tunnel_port_type('192.168.1.2', '192.168.1.1')
+        self.assertEqual(lib_const.TYPE_GRE, ptype)
+
+    def test_get_gre_tunnel_port_type_ipv6(self):
+        ptype = ovs_lib.get_gre_tunnel_port_type('2001:db8::1:2',
+                                                 '2001:db8::1:1')
+        self.assertEqual(lib_const.TYPE_GRE_IP6, ptype)
+
+    def test_version_from_protocol(self):
+        ofproto = ovs_lib.version_from_protocol(p_const.OPENFLOW10)
+        self.assertEqual(1, ofproto)
 
 
 class OVS_Lib_Test(base.BaseTestCase):
@@ -77,7 +96,7 @@ class OVS_Lib_Test(base.BaseTestCase):
     """
 
     def setUp(self):
-        super(OVS_Lib_Test, self).setUp()
+        super().setUp()
         self.BR_NAME = "br-int"
 
         # Don't attempt to connect to ovsdb
@@ -139,7 +158,7 @@ class OVS_Lib_Test(base.BaseTestCase):
             ('cookie', 1754),
             ('priority', 3),
             ('tun_id', lsw_id),
-            ('actions', "mod_vlan_vid:%s,output:%s" % (vid, ofport))])
+            ('actions', f"mod_vlan_vid:{vid},output:{ofport}")])
         flow_dict_7 = collections.OrderedDict([
             ('cookie', 1256),
             ('priority', 4),
@@ -200,12 +219,114 @@ class OVS_Lib_Test(base.BaseTestCase):
 
     def _ofctl_mock(self, cmd, *args, **kwargs):
         cmd = self._ofctl_args(cmd, *args)
-        return mock.call(cmd, run_as_root=True, **kwargs)
+        return mock.call(cmd, run_as_root=True, privsep_exec=True, **kwargs)
 
     def _verify_ofctl_mock(self, cmd, *args, **kwargs):
         cmd = self._ofctl_args(cmd, *args)
-        return self.execute.assert_called_once_with(cmd, run_as_root=True,
-                                                    **kwargs)
+        return self.execute.assert_called_once_with(
+            cmd, run_as_root=True, privsep_exec=True, **kwargs)
+
+    def test_add_protocols_all_already_set(self):
+        self.br = ovs_lib.OVSBridge(self.BR_NAME)
+        with mock.patch.object(self.br, 'db_get_val') as db_get_val, \
+                mock.patch.object(self.br.ovsdb, 'db_add') as db_add:
+            db_get_val.return_value = [p_const.OPENFLOW10,
+                                       p_const.OPENFLOW13]
+            self.br.add_protocols(p_const.OPENFLOW10, p_const.OPENFLOW13)
+            db_get_val.assert_called_once_with(
+                'Bridge', self.BR_NAME, 'protocols')
+            db_add.assert_not_called()
+
+    def test_add_protocols_some_already_set(self):
+        self.br = ovs_lib.OVSBridge(self.BR_NAME)
+        with mock.patch.object(self.br, 'db_get_val') as db_get_val, \
+                mock.patch.object(self.br.ovsdb, 'db_add') as db_add:
+            db_get_val.return_value = [p_const.OPENFLOW10]
+            self.br.add_protocols(p_const.OPENFLOW10, p_const.OPENFLOW13)
+            db_get_val.assert_called_once_with(
+                'Bridge', self.BR_NAME, 'protocols')
+            db_add.assert_has_calls([
+                mock.call('Bridge', self.BR_NAME,
+                          'protocols', p_const.OPENFLOW13)])
+
+    def test_get_port_tag_by_name(self):
+        self.br = ovs_lib.OVSBridge(self.BR_NAME)
+        port_name = "fake-port"
+        with mock.patch.object(self.br, 'db_get_val') as db_get_val:
+            self.br.get_port_tag_by_name(port_name)
+            db_get_val.assert_called_once_with(
+                'Port', port_name, 'other_config')
+
+    def test_get_value_from_other_config(self):
+        self.br = ovs_lib.OVSBridge(self.BR_NAME)
+        value = "test_value"
+        other_config = {"test_key": value}
+        port_name = "fake-port"
+        with mock.patch.object(self.br, 'db_get_val') as db_get_val:
+            db_get_val.return_value = other_config
+            v = self.br.get_value_from_other_config(port_name, "test_key")
+            self.assertEqual(value, v)
+
+    def test_get_value_from_other_config_value_error(self):
+        self.br = ovs_lib.OVSBridge(self.BR_NAME)
+        value = "test_value"
+        other_config = {"test_key": value}
+        port_name = "fake-port"
+        with mock.patch.object(self.br, 'db_get_val') as db_get_val:
+            db_get_val.return_value = other_config
+            self.assertRaises(ovs_exc.OVSDBPortError,
+                              self.br.get_value_from_other_config,
+                              port_name, "test_key", int)
+
+    def test_get_value_from_other_config_not_found(self):
+        self.br = ovs_lib.OVSBridge(self.BR_NAME)
+        value = "test_value"
+        other_config = {"test_key": value}
+        port_name = "fake-port"
+        with mock.patch.object(self.br, 'db_get_val') as db_get_val:
+            db_get_val.return_value = other_config
+            self.assertIsNone(
+                self.br.get_value_from_other_config(
+                    port_name, "key_not_exist"))
+
+    def test_set_value_to_other_config(self):
+        self.br = ovs_lib.OVSBridge(self.BR_NAME)
+        value = "test_value"
+        other_config = {"test_key": value}
+        port_name = "fake-port"
+        with mock.patch.object(self.br, 'db_get_val') as db_get_val, \
+                mock.patch.object(self.br.ovsdb, 'db_set') as set_db:
+            new_key = "new_key"
+            new_value = "new_value"
+            db_get_val.return_value = other_config
+            self.br.set_value_to_other_config(port_name, key=new_key,
+                                              value=new_value)
+
+            db_get_val.assert_called_once_with('Port', port_name,
+                                               'other_config')
+            other_config.update({new_key: new_value})
+            set_db.assert_called_once_with(
+                'Port', port_name, ('other_config', other_config))
+
+    def test_remove_value_from_other_config(self):
+        self.br = ovs_lib.OVSBridge(self.BR_NAME)
+        old_key = "old_key"
+        old_value = "old_value"
+        other_config = {old_key: old_value}
+        port_name = "fake-port"
+
+        with mock.patch.object(self.br, 'db_get_val') as db_get_val, \
+                mock.patch.object(self.br.ovsdb, 'db_clear') as db_clear, \
+                mock.patch.object(self.br.ovsdb, 'db_set') as set_db:
+            db_get_val.return_value = other_config
+            self.br.remove_value_from_other_config(port_name, key=old_key)
+
+            db_get_val.assert_called_once_with('Port', port_name,
+                                               'other_config')
+            db_clear.assert_called_once_with(
+                'Port', port_name, "other_config")
+            set_db.assert_called_once_with(
+                'Port', port_name, ('other_config', {}))
 
     def test_add_flow_timeout_set(self):
         flow_dict = collections.OrderedDict([
@@ -264,10 +385,10 @@ class OVS_Lib_Test(base.BaseTestCase):
                                  "%s,in_port=%d" % (cookie_spec, ofport))),
             self._ofctl_mock("del-flows", self.BR_NAME, '-',
                              process_input=StringSetMatcher(
-                                 "%s,tun_id=%s" % (cookie_spec, lsw_id))),
+                                 f"{cookie_spec},tun_id={lsw_id}")),
             self._ofctl_mock("del-flows", self.BR_NAME, '-',
                              process_input=StringSetMatcher(
-                                 "%s,dl_vlan=%s" % (cookie_spec, vid))),
+                                 f"{cookie_spec},dl_vlan={vid}")),
             self._ofctl_mock("del-flows", self.BR_NAME, '-',
                              process_input="%s" % cookie_spec),
         ]
@@ -396,7 +517,7 @@ class OVS_Lib_Test(base.BaseTestCase):
             ovs_row = []
             r["data"].append(ovs_row)
             for cell in row:
-                if isinstance(cell, (str, int, list)):
+                if isinstance(cell, str | int | list):
                     ovs_row.append(cell)
                 elif isinstance(cell, dict):
                     ovs_row.append(["map", cell.items()])
@@ -471,7 +592,8 @@ class OVS_Lib_Test(base.BaseTestCase):
         ) as port_exists_mock:
             self.br.delete_egress_bw_limit_for_port("test_port")
             port_exists_mock.assert_called_once_with("test_port")
-            set_egress_mock.assert_called_once_with("test_port", 0, 0)
+            set_egress_mock.assert_called_once_with("test_port", 0, 0,
+                                                    check_error=False)
 
     def test_delete_egress_bw_limit_for_port_port_not_exists(self):
         with mock.patch.object(
@@ -497,9 +619,9 @@ class OVS_Lib_Test(base.BaseTestCase):
         self.br.ovsdb.list_ports.return_value.execute.return_value = [
             'qvo1', 'qvo2', 'qvo4']
         by_id = self.br.get_vifs_by_ids(['pid1', 'pid2', 'pid3', 'pid4'])
-        # pid3 isn't on bridge and pid4 doesn't have a valid ofport
+        # pid3 isn't on bridge
         self.assertIsNone(by_id['pid3'])
-        self.assertIsNone(by_id['pid4'])
+        self.assertEqual(-1, by_id['pid4'].ofport)
         self.assertEqual('pid1', by_id['pid1'].vif_id)
         self.assertEqual('qvo1', by_id['pid1'].port_name)
         self.assertEqual(1, by_id['pid1'].ofport)
@@ -511,6 +633,8 @@ class OVS_Lib_Test(base.BaseTestCase):
                        if_exists=True)])
 
     def test_get_port_ofport_retry(self):
+        # Increase this value to avoid a timeout during the test execution
+        self.br.ovsdb.ovsdb_connection.timeout = 10
         with mock.patch.object(
                 self.br, 'db_get_val',
                 side_effect=[[], [], [], [], 1]):
@@ -518,7 +642,7 @@ class OVS_Lib_Test(base.BaseTestCase):
 
     def test_get_port_ofport_retry_fails(self):
         # reduce timeout for faster execution
-        self.br.ovsdb_timeout = 1
+        self.br.ovsdb.ovsdb_connection.timeout = 1
         # after 7 calls the retry will timeout and raise
         with mock.patch.object(
                 self.br, 'db_get_val',
@@ -583,11 +707,11 @@ class OVS_Lib_Test(base.BaseTestCase):
 class TestDeferredOVSBridge(base.BaseTestCase):
 
     def setUp(self):
-        super(TestDeferredOVSBridge, self).setUp()
+        super().setUp()
 
         self.br = mock.Mock()
-        self.mocked_do_action_flows = mock.patch.object(
-            self.br, 'do_action_flows').start()
+        self.mock_do_action_flows_by_group_id = mock.patch.object(
+            self.br, 'do_action_flows_by_group_id').start()
 
         self.add_flow_dict1 = dict(in_port=11, actions='drop')
         self.add_flow_dict2 = dict(in_port=12, actions='drop')
@@ -602,15 +726,15 @@ class TestDeferredOVSBridge(base.BaseTestCase):
                          ovs_lib.DeferredOVSBridge.ALLOWED_PASSTHROUGHS)
 
     def _verify_mock_call(self, expected_calls):
-        self.mocked_do_action_flows.assert_has_calls(expected_calls)
+        self.mock_do_action_flows_by_group_id.assert_has_calls(expected_calls)
         self.assertEqual(len(expected_calls),
-                         len(self.mocked_do_action_flows.mock_calls))
+                         len(self.mock_do_action_flows_by_group_id.mock_calls))
 
     def test_apply_on_exit(self):
         expected_calls = [
-            mock.call('add', [self.add_flow_dict1], False),
-            mock.call('mod', [self.mod_flow_dict1], False),
-            mock.call('del', [self.del_flow_dict1], False),
+            mock.call('add', {None: [self.add_flow_dict1]}, False),
+            mock.call('mod', {None: [self.mod_flow_dict1]}, False),
+            mock.call('del', {None: [self.del_flow_dict1]}, False),
         ]
 
         with ovs_lib.DeferredOVSBridge(self.br) as deferred_br:
@@ -629,18 +753,19 @@ class TestDeferredOVSBridge(base.BaseTestCase):
                 raise Exception()
         except Exception:
             self._verify_mock_call([])
-        else:
-            self.fail('Exception would be reraised')
 
     def test_apply(self):
         expected_calls = [
-            mock.call('add', [self.add_flow_dict1], False),
-            mock.call('mod', [self.mod_flow_dict1], False),
-            mock.call('del', [self.del_flow_dict1], False),
+            mock.call('add',
+                      {11: [self.add_flow_dict1], 12: [self.add_flow_dict2]},
+                      False),
+            mock.call('mod', {None: [self.mod_flow_dict1]}, False),
+            mock.call('del', {None: [self.del_flow_dict1]}, False),
         ]
 
         with ovs_lib.DeferredOVSBridge(self.br) as deferred_br:
-            deferred_br.add_flow(**self.add_flow_dict1)
+            deferred_br.add_flow(flow_group_id=11, **self.add_flow_dict1)
+            deferred_br.add_flow(flow_group_id=12, **self.add_flow_dict2)
             deferred_br.mod_flow(**self.mod_flow_dict1)
             deferred_br.delete_flows(**self.del_flow_dict1)
             self._verify_mock_call([])
@@ -650,12 +775,15 @@ class TestDeferredOVSBridge(base.BaseTestCase):
 
     def test_apply_order(self):
         expected_calls = [
-            mock.call(
-                'del', [self.del_flow_dict1, self.del_flow_dict2], False),
-            mock.call(
-                'mod', [self.mod_flow_dict1, self.mod_flow_dict2], False),
-            mock.call(
-                'add', [self.add_flow_dict1, self.add_flow_dict2], False),
+            mock.call('del',
+                      {None: [self.del_flow_dict1, self.del_flow_dict2]},
+                      False),
+            mock.call('mod',
+                      {None: [self.mod_flow_dict1, self.mod_flow_dict2]},
+                      False),
+            mock.call('add',
+                      {None: [self.add_flow_dict1, self.add_flow_dict2]},
+                      False),
         ]
 
         order = 'del', 'mod', 'add'
@@ -670,12 +798,13 @@ class TestDeferredOVSBridge(base.BaseTestCase):
 
     def test_apply_full_ordered(self):
         expected_calls = [
-            mock.call('add', [self.add_flow_dict1], False),
-            mock.call('mod', [self.mod_flow_dict1], False),
-            mock.call(
-                'del', [self.del_flow_dict1, self.del_flow_dict2], False),
-            mock.call('add', [self.add_flow_dict2], False),
-            mock.call('mod', [self.mod_flow_dict2], False),
+            mock.call('add', {None: [self.add_flow_dict1]}, False),
+            mock.call('mod', {None: [self.mod_flow_dict1]}, False),
+            mock.call('del',
+                      {None: [self.del_flow_dict1, self.del_flow_dict2]},
+                      False),
+            mock.call('add', {None: [self.add_flow_dict2]}, False),
+            mock.call('mod', {None: [self.mod_flow_dict2]}, False),
         ]
 
         with ovs_lib.DeferredOVSBridge(self.br,

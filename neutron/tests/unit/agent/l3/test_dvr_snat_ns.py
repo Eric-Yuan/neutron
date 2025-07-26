@@ -27,7 +27,7 @@ _uuid = uuidutils.generate_uuid
 
 class TestDvrSnatNs(base.BaseTestCase):
     def setUp(self):
-        super(TestDvrSnatNs, self).setUp()
+        super().setUp()
         self.conf = mock.Mock()
         self.conf.state_path = cfg.CONF.state_path
         self.driver = mock.Mock()
@@ -50,7 +50,8 @@ class TestDvrSnatNs(base.BaseTestCase):
         loose_cmd = ['sysctl', '-w', 'net.netfilter.nf_conntrack_tcp_loose=0']
         expected = [mock.call(netns_cmd + loose_cmd,
                               check_exit_code=True, extra_ok_codes=None,
-                              log_fail_as_error=True, run_as_root=True)]
+                              log_fail_as_error=True, run_as_root=True,
+                              privsep_exec=True)]
 
         create.assert_called_once_with(self.snat_ns.name)
         execute.assert_has_calls(expected)

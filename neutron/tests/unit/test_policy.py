@@ -15,6 +15,8 @@
 
 """Test of Policy Engine For Neutron"""
 
+import copy
+import re
 from unittest import mock
 
 from neutron_lib.api import attributes
@@ -24,7 +26,6 @@ from neutron_lib import exceptions
 from neutron_lib.plugins import constants as plugin_constants
 from neutron_lib.plugins import directory
 from oslo_config import cfg
-from oslo_db import exception as db_exc
 from oslo_policy import fixture as op_fixture
 from oslo_policy import policy as oslo_policy
 from oslo_serialization import jsonutils
@@ -40,7 +41,7 @@ _uuid = uuidutils.generate_uuid
 
 class PolicyFileTestCase(base.BaseTestCase):
     def setUp(self):
-        super(PolicyFileTestCase, self).setUp()
+        super().setUp()
         self.context = context.Context('fake', 'fake', is_admin=False)
         self.target = {'tenant_id': 'fake'}
 
@@ -64,7 +65,7 @@ class PolicyFileTestCase(base.BaseTestCase):
 
 class PolicyTestCase(base.BaseTestCase):
     def setUp(self):
-        super(PolicyTestCase, self).setUp()
+        super().setUp()
         # NOTE(vish): preload rules to circumvent reloading from file
         rules = {
             "true": '@',
@@ -76,12 +77,90 @@ class PolicyTestCase(base.BaseTestCase):
             "example:early_or_success": "@ or !",
             "example:lowercase_admin": "role:admin or role:sysadmin",
             "example:uppercase_admin": "role:ADMIN or role:sysadmin",
+            "example:only_system_admin_allowed": (
+                "role:admin and system_scope:all"),
+            "example:only_project_user_allowed": (
+                "role:reader and tenant_id:%(tenant_id)s")
         }
         policy.refresh()
+        self._register_default_rules()
         # NOTE(vish): then overload underlying rules
         policy.set_rules(oslo_policy.Rules.from_dict(rules))
         self.context = context.Context('fake', 'fake', roles=['member'])
         self.target = {}
+
+    def _register_default_rules(self):
+        rules_with_scope = [
+            oslo_policy.DocumentedRuleDefault(
+                name='get_example:only_project_user_allowed',
+                description="Test rule only",
+                check_str='role:reader and project_id:%(project_id)s',
+                operations=[
+                    {
+                        'method': 'GET',
+                        'path': '/example',
+                    },
+                ],
+                scope_types=['project'])]
+        policy._ENFORCER.register_defaults(rules_with_scope)
+
+    def _test_check_system_admin_allowed_action(self, enforce_new_defaults):
+        action = "example:only_system_admin_allowed"
+        cfg.CONF.set_override(
+            'enforce_new_defaults', enforce_new_defaults, group='oslo_policy')
+        project_admin_ctx = context.Context(
+            user_id="fake", project_id="fake",
+            roles=['admin', 'member', 'reader'])
+        system_admin_ctx = context.Context(
+            user_id="fake",
+            roles=['admin', 'member', 'reader'],
+            system_scope='all')
+        if not enforce_new_defaults:
+            system_admin_ctx.project_id = 'fake'
+        self.assertTrue(policy.check(system_admin_ctx, action, self.target))
+        if enforce_new_defaults:
+            self.assertFalse(
+                policy.check(project_admin_ctx, action, self.target))
+        else:
+            self.assertTrue(
+                policy.check(project_admin_ctx, action, self.target))
+
+    def test_check_only_system_admin_new_defaults(self):
+        self._test_check_system_admin_allowed_action(enforce_new_defaults=True)
+
+    def test_check_only_system_admin_old_defaults(self):
+        self._test_check_system_admin_allowed_action(
+            enforce_new_defaults=False)
+
+    def _test_enforce_system_admin_allowed_action(self, enforce_new_defaults):
+        action = "example:only_system_admin_allowed"
+        cfg.CONF.set_override(
+            'enforce_new_defaults', enforce_new_defaults, group='oslo_policy')
+        project_admin_ctx = context.Context(
+            user_id="fake", project_id="fake",
+            roles=['admin', 'member', 'reader'])
+        system_admin_ctx = context.Context(
+            user_id="fake",
+            roles=['admin', 'member', 'reader'],
+            system_scope='all')
+        if not enforce_new_defaults:
+            system_admin_ctx.project_id = 'fake'
+        self.assertTrue(policy.enforce(system_admin_ctx, action, self.target))
+        if enforce_new_defaults:
+            self.assertRaises(
+                oslo_policy.PolicyNotAuthorized,
+                policy.enforce, project_admin_ctx, action, self.target)
+        else:
+            self.assertTrue(
+                policy.enforce(project_admin_ctx, action, self.target))
+
+    def test_enforce_only_system_admin_new_defaults(self):
+        self._test_enforce_system_admin_allowed_action(
+            enforce_new_defaults=True)
+
+    def test_enforce_only_system_admin_old_defaults(self):
+        self._test_enforce_system_admin_allowed_action(
+            enforce_new_defaults=False)
 
     def test_enforce_nonexistent_action_throws(self):
         action = "example:noexist"
@@ -106,6 +185,19 @@ class PolicyTestCase(base.BaseTestCase):
                                 might_not_exist=True)
         self.assertTrue(result_2)
 
+    def test_check_invalid_scope(self):
+        cfg.CONF.set_override(
+            'enforce_new_defaults', True, group='oslo_policy')
+        cfg.CONF.set_override(
+            'enforce_scope', True, group='oslo_policy')
+        action = "get_example:only_project_user_allowed"
+        target = {'project_id': 'some-project'}
+        system_admin_ctx = context.Context(
+            user_id="fake",
+            roles=['admin', 'member', 'reader'],
+            system_scope='all')
+        self.assertFalse(policy.check(system_admin_ctx, action, target))
+
     def test_enforce_good_action(self):
         action = "example:allowed"
         result = policy.enforce(self.context, action, self.target)
@@ -125,6 +217,21 @@ class PolicyTestCase(base.BaseTestCase):
         self.assertRaises(oslo_policy.PolicyNotAuthorized,
                           policy.enforce, self.context,
                           action, target)
+
+    def test_enforce_invalid_scope(self):
+        cfg.CONF.set_override(
+            'enforce_new_defaults', True, group='oslo_policy')
+        cfg.CONF.set_override(
+            'enforce_scope', True, group='oslo_policy')
+        action = "get_example:only_project_user_allowed"
+        target = {'project_id': 'some-project'}
+        system_admin_ctx = context.Context(
+            user_id="fake",
+            roles=['admin', 'member', 'reader'],
+            system_scope='all')
+        self.assertRaises(
+            oslo_policy.InvalidScope,
+            policy.enforce, system_admin_ctx, action, target)
 
     def test_templatized_enforcement(self):
         target_mine = {'tenant_id': 'fake'}
@@ -156,8 +263,8 @@ class PolicyTestCase(base.BaseTestCase):
 class DefaultPolicyTestCase(base.BaseTestCase):
 
     def setUp(self):
-        super(DefaultPolicyTestCase, self).setUp()
-        tmpfilename = self.get_temp_file_path('policy.json')
+        super().setUp()
+        tmpfilename = self.get_temp_file_path('policy.yaml')
         self.rules = {
             "default": '',
             "example:exist": '!',
@@ -178,6 +285,7 @@ class DefaultPolicyTestCase(base.BaseTestCase):
 
 FAKE_RESOURCE_NAME = 'fake_resource'
 FAKE_SPECIAL_RESOURCE_NAME = 'fake_policy'
+FAKE_RESOURCE_LIST_OF_DICTS = 'fake_list_of_dicts'
 FAKE_RESOURCES = {"%ss" % FAKE_RESOURCE_NAME:
                   {'attr': {'allow_post': True,
                             'allow_put': True,
@@ -204,7 +312,56 @@ FAKE_RESOURCES = {"%ss" % FAKE_RESOURCE_NAME:
                             'validate': {'type:dict':
                                          {'sub_attr_1': {'type:string': None},
                                           'sub_attr_2': {'type:string': None}}}
-                            }}}
+                            }},
+                  "%ss" % FAKE_RESOURCE_LIST_OF_DICTS:
+                  {'attr': {'allow_post': True,
+                            'allow_put': True,
+                            'is_visible': True,
+                            'default': None,
+                            'enforce_policy': True,
+                            'validate': {
+                                'type:list_of_dict_or_nodata:':
+                                    {'sub_attr_str': {'type:string': None},
+                                     'sub_attr_int': {'type:integer': None},
+                                     'sub_attr_bool': {'type:boolean': None},
+                                     }}
+                            }},
+                  }
+
+
+class CustomRulesTestCase(base.BaseTestCase):
+
+    def test_field_check__boolean_value(self):
+        check = policy.FieldCheck('field', 'networks:router:external=True')
+        self.assertEqual('networks', check.resource)
+        self.assertEqual('router:external', check.field)
+        # TODO(stephenfin): I expected this to get converted to a boolean :-\
+        self.assertEqual('True', check.value)
+        self.assertIsNone(check.regex)
+
+    def test_field_check__regex_value(self):
+        check = policy.FieldCheck('field', 'port:device_owner=~^network:')
+        self.assertEqual('port', check.resource)
+        self.assertEqual('device_owner', check.field)
+        self.assertEqual('~^network:', check.value)
+        self.assertEqual(re.compile('^network:'), check.regex)
+
+    def test_field_check_deepcopy(self):
+        check_a = policy.FieldCheck('field', 'port:device_owner=~^network:')
+        check_b = copy.deepcopy(check_a)
+
+        self.assertIsNot(check_a, check_b)
+        self.assertEqual(check_a.resource, check_b.resource)
+        self.assertEqual(check_a.field, check_b.field)
+        self.assertEqual(check_a.value, check_b.value)
+        self.assertEqual(check_a.regex, check_b.regex)
+
+    def test_owner_check_deepcopy(self):
+        check_a = policy.OwnerCheck('tenant_id', '%(tenant_id)s')
+        check_b = copy.deepcopy(check_a)
+
+        self.assertIsNot(check_a, check_b)
+        self.assertEqual(check_a.target_field, check_b.target_field)
 
 
 class NeutronPolicyTestCase(base.BaseTestCase):
@@ -214,7 +371,7 @@ class NeutronPolicyTestCase(base.BaseTestCase):
         policy._ENFORCER.set_rules(oslo_policy.Rules(self.rules))
 
     def setUp(self):
-        super(NeutronPolicyTestCase, self).setUp()
+        super().setUp()
         # Add Fake resources to RESOURCE_ATTRIBUTE_MAP
         attributes.RESOURCES.update(FAKE_RESOURCES)
         self._set_rules()
@@ -282,7 +439,7 @@ class NeutronPolicyTestCase(base.BaseTestCase):
 
     def _test_action_on_attr(self, context, action, obj, attr, value,
                              exception=None, **kwargs):
-        action = "%s_%s" % (action, obj)
+        action = f"{action}_{obj}"
         target = {'tenant_id': 'the_owner', attr: value}
         if kwargs:
             target.update(kwargs)
@@ -443,12 +600,69 @@ class NeutronPolicyTestCase(base.BaseTestCase):
             target))
         FAKE_RESOURCES['%ss' % FAKE_RESOURCE_NAME]['attr']['validate'] = bk
 
-    def test_build_subattribute_match_rule_empty_dict_validator(self):
+    def test__build_subattr_match_rule_empty_dict_validator(self):
         self._test_build_subattribute_match_rule({})
 
-    def test_build_subattribute_match_rule_wrong_validation_info(self):
+    def test__build_subattr_match_rule_wrong_validation_info(self):
         self._test_build_subattribute_match_rule(
             {'type:dict': 'wrong_stuff'})
+
+    def test__build_subattr_match_rule_list_of_dict_rule(self):
+        action = 'create_' + FAKE_RESOURCE_LIST_OF_DICTS
+        attrs = [{'sub_attr_str': 'x', 'sub_attr_int': 1},
+                 {'sub_attr_str': 'y', 'sub_attr_bool': True},
+                 {'sub_attr_bool': False},
+                 {}]
+        target = {'tenant_id': 'fake', 'attr': attrs}
+        result_policy = policy._build_subattr_match_rule(
+            'attr',
+            FAKE_RESOURCES['%ss' % FAKE_RESOURCE_LIST_OF_DICTS]['attr'],
+            action,
+            target)
+        self.assertEqual(3, len(result_policy.rules))
+        matches = (action + ':attr:sub_attr_str',
+                   action + ':attr:sub_attr_int',
+                   action + ':attr:sub_attr_bool')
+        for rule in result_policy.rules:
+            self.assertIn(rule.match, matches)
+
+    def test__build_subattr_match_rule_list_of_dict_rule_missing_sattr(self):
+        action = 'create_' + FAKE_RESOURCE_LIST_OF_DICTS
+        attrs = [{'sub_attr_str': 'x', 'sub_attr_int': 1},
+                 {'sub_attr_str': 'y'}]
+        target = {'tenant_id': 'fake', 'attr': attrs}
+        result_policy = policy._build_subattr_match_rule(
+            'attr',
+            FAKE_RESOURCES['%ss' % FAKE_RESOURCE_LIST_OF_DICTS]['attr'],
+            action,
+            target)
+        self.assertEqual(2, len(result_policy.rules))
+        matches = (action + ':attr:sub_attr_str',
+                   action + ':attr:sub_attr_int')
+        for rule in result_policy.rules:
+            self.assertIn(rule.match, matches)
+
+    def test__build_subattr_match_rule_list_of_dict_rule_empty_list(self):
+        action = 'create_' + FAKE_RESOURCE_LIST_OF_DICTS
+        attrs = []
+        target = {'tenant_id': 'fake', 'attr': attrs}
+        result_policy = policy._build_subattr_match_rule(
+            'attr',
+            FAKE_RESOURCES['%ss' % FAKE_RESOURCE_LIST_OF_DICTS]['attr'],
+            action,
+            target)
+        self.assertEqual(0, len(result_policy.rules))
+
+    def test__build_subattr_match_rule_list_of_dict_rule_empty_dict(self):
+        action = 'create_' + FAKE_RESOURCE_LIST_OF_DICTS
+        attrs = [{}]
+        target = {'tenant_id': 'fake', 'attr': attrs}
+        result_policy = policy._build_subattr_match_rule(
+            'attr',
+            FAKE_RESOURCES['%ss' % FAKE_RESOURCE_LIST_OF_DICTS]['attr'],
+            action,
+            target)
+        self.assertEqual(0, len(result_policy.rules))
 
     def test_build_match_rule_special_pluralized(self):
         action = "create_" + FAKE_SPECIAL_RESOURCE_NAME
@@ -553,14 +767,16 @@ class NeutronPolicyTestCase(base.BaseTestCase):
     def test_retryrequest_on_notfound(self):
         failure = exceptions.NetworkNotFound(net_id='whatever')
         action = "create_port:mac"
-        with mock.patch.object(directory.get_plugin(),
-                               'get_network', side_effect=failure):
+        with mock.patch.object(
+                directory.get_plugin(),
+                'get_network', side_effect=failure) as get_network_mock:
             target = {'network_id': 'whatever'}
             try:
                 policy.enforce(self.context, action, target)
-                self.fail("Did not raise RetryRequest")
-            except db_exc.RetryRequest as e:
-                self.assertEqual(failure, e.inner_exc)
+                self.fail("Did not raise NotFound exception and retry "
+                          "DB request.")
+            except exceptions.NetworkNotFound:
+                self.assertEqual(2, get_network_mock.call_count)
 
     def test_enforce_tenant_id_check_parent_resource_bw_compatibility(self):
 
@@ -616,9 +832,9 @@ class NeutronPolicyTestCase(base.BaseTestCase):
         # Construct RuleChecks for an action, attribute and subattribute
         match_rule = oslo_policy.RuleCheck('rule', action)
         attr_rule = oslo_policy.RuleCheck(
-            'rule', '%s:%ss' % (action, FAKE_RESOURCE_NAME))
+            'rule', f'{action}:{FAKE_RESOURCE_NAME}s')
         sub_attr_rules = [oslo_policy.RuleCheck(
-            'rule', '%s:%s:%s' % (action, 'attr', 'sub_attr_1'))]
+            'rule', '{}:{}:{}'.format(action, 'attr', 'sub_attr_1'))]
         # Build an AndCheck from the given RuleChecks
         # Make the checks nested to better check the recursion
         sub_attr_rules = oslo_policy.AndCheck(sub_attr_rules)

@@ -20,16 +20,17 @@ from neutron.objects import base
 @base.NeutronObjectRegistry.register
 class ExtraDhcpOpt(base.NeutronDbObject):
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Add validation for ip_version field
+    VERSION = '1.1'
 
     db_model = models.ExtraDhcpOpt
 
     fields = {
-         'id': common_types.UUIDField(),
-         'port_id': common_types.UUIDField(),
-         'opt_name': obj_fields.StringField(),
-         'opt_value': obj_fields.StringField(),
-         'ip_version': obj_fields.IntegerField(),
+        'id': common_types.UUIDField(),
+        'port_id': common_types.UUIDField(),
+        'opt_name': obj_fields.StringField(),
+        'opt_value': obj_fields.StringField(),
+        'ip_version': common_types.IPVersionEnumField(),
     }
 
     fields_no_update = ['port_id']

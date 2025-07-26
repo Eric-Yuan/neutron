@@ -24,18 +24,15 @@ from neutron_lib.plugins import constants as plugin_constants
 from neutron_lib.plugins import directory
 from neutron_lib import rpc as n_rpc
 from oslo_log import log as logging
-import six
 import webob.exc
 
 from neutron._i18n import _
 from neutron.api import extensions
 from neutron.api.v2 import resource
+from neutron.api import wsgi
 from neutron import policy
-from neutron import wsgi
-
 
 LOG = logging.getLogger(__name__)
-
 
 L3_ROUTER = 'l3-router'
 L3_ROUTERS = L3_ROUTER + 's'
@@ -187,8 +184,7 @@ class RouterDoesntSupportScheduling(exceptions.Conflict):
     message = _("Router %(router_id)s does not support agent scheduling.")
 
 
-@six.add_metaclass(abc.ABCMeta)
-class L3AgentSchedulerPluginBase(object):
+class L3AgentSchedulerPluginBase(metaclass=abc.ABCMeta):
     """REST API to operate the l3 agent scheduler.
 
     All of method must be in an admin context.

@@ -17,6 +17,7 @@ from neutron_lib.agent import topics
 from neutron_lib.api.definitions import dvr
 from neutron_lib.api.definitions import extraroute
 from neutron_lib.api.definitions import extraroute_atomic
+from neutron_lib.api.definitions import fip_pf_detail
 from neutron_lib.api.definitions import fip_port_details
 from neutron_lib.api.definitions import floatingip_pools
 from neutron_lib.api.definitions import l3 as l3_apidef
@@ -24,7 +25,10 @@ from neutron_lib.api.definitions import l3_ext_gw_mode
 from neutron_lib.api.definitions import l3_ext_ha_mode
 from neutron_lib.api.definitions import l3_flavors
 from neutron_lib.api.definitions import l3_port_ip_change_not_allowed
+from neutron_lib.api.definitions import network_ha
 from neutron_lib.api.definitions import qos_gateway_ip
+from neutron_lib.api.definitions import \
+    router_admin_state_down_before_update as r_admin_state_down_before_update
 from neutron_lib.api.definitions import router_availability_zone
 from neutron_lib import constants as n_const
 from neutron_lib.db import resource_extend
@@ -49,7 +53,6 @@ from neutron.db import l3_gateway_ip_qos
 from neutron.db import l3_hamode_db
 from neutron.db import l3_hascheduler_db
 from neutron.db.models import l3 as l3_models
-from neutron.extensions import _admin_state_down_before_update_lib
 from neutron.quota import resource_registry
 from neutron import service
 from neutron.services.l3_router.service_providers import driver_controller
@@ -63,6 +66,8 @@ def disable_dvr_extension_by_config(aliases):
         LOG.info('Disabled DVR extension.')
         if 'dvr' in aliases:
             aliases.remove('dvr')
+        if r_admin_state_down_before_update.ALIAS in aliases:
+            aliases.remove(r_admin_state_down_before_update.ALIAS)
 
 
 def disable_l3_qos_extension_by_plugins(ext, aliases):
@@ -101,10 +106,13 @@ class L3RouterPlugin(service_base.ServicePluginBase,
                                     router_availability_zone.ALIAS,
                                     l3_flavors.ALIAS, "qos-fip",
                                     fip_port_details.ALIAS,
+                                    fip_pf_detail.ALIAS,
                                     floatingip_pools.ALIAS,
                                     qos_gateway_ip.ALIAS,
                                     l3_port_ip_change_not_allowed.ALIAS,
-                                    _admin_state_down_before_update_lib.ALIAS]
+                                    r_admin_state_down_before_update.ALIAS,
+                                    network_ha.ALIAS,
+                                    ]
 
     __native_pagination_support = True
     __native_sorting_support = True
@@ -123,7 +131,7 @@ class L3RouterPlugin(service_base.ServicePluginBase,
         self.router_scheduler = importutils.import_object(
             cfg.CONF.router_scheduler_driver)
         self.add_periodic_l3_agent_status_check()
-        super(L3RouterPlugin, self).__init__()
+        super().__init__()
         if 'dvr' in self.supported_extension_aliases:
             l3_dvrscheduler_db.subscribe()
         if 'l3-ha' in self.supported_extension_aliases:
@@ -180,7 +188,7 @@ class L3RouterPlugin(service_base.ServicePluginBase,
         leveraging the l3 agent, the initial status for the floating
         IP object will be DOWN.
         """
-        return super(L3RouterPlugin, self).create_floatingip(
+        return super().create_floatingip(
             context, floatingip,
             initial_status=n_const.FLOATINGIP_STATUS_DOWN)
 

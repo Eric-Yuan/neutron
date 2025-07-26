@@ -19,7 +19,7 @@ from oslo_utils import uuidutils
 from neutron.agent.linux import iptables_firewall
 from neutron.agent.linux import iptables_manager
 from neutron.cmd.sanity import checks
-from neutron.common import utils as common_utils
+from neutron.cmd import sanity_check
 from neutron.tests.common import net_helpers
 from neutron.tests.fullstack import base
 from neutron.tests.fullstack.resources import environment
@@ -33,8 +33,10 @@ class StatelessRulesNotConfiguredException(Exception):
     pass
 
 
-class OVSVersionChecker(object):
+class OVSVersionChecker:
     conntrack_supported = None
+
+    sanity_check.setup_conf()
 
     @classmethod
     def supports_ovsfirewall(cls):
@@ -52,13 +54,13 @@ class BaseSecurityGroupsSameNetworkTest(base.BaseFullStackTestCase):
             environment.HostDescription(
                 l2_agent_type=self.l2_agent_type,
                 firewall_driver=self.firewall_driver,
-                dhcp_agent=True) for _ in range(self.num_hosts)]
+                dhcp_agent=False) for _ in range(self.num_hosts)]
         env = environment.Environment(
             environment.EnvironmentDescription(
                 network_type=self.network_type,
                 debug_iptables=debug_iptables),
             host_descriptions)
-        super(BaseSecurityGroupsSameNetworkTest, self).setUp(env)
+        super().setUp(env)
 
         if (self.firewall_driver == 'openvswitch' and
                 not OVSVersionChecker.supports_ovsfirewall()):
@@ -75,14 +77,14 @@ class BaseSecurityGroupsSameNetworkTest(base.BaseFullStackTestCase):
                 return False
 
         try:
-            common_utils.wait_until_true(test_connectivity)
+            base.wait_until_true(test_connectivity)
         finally:
             netcat.stop_processes()
 
     def assert_no_connection(self, *args, **kwargs):
         netcat = net_helpers.NetcatTester(*args, **kwargs)
         try:
-            common_utils.wait_until_true(netcat.test_no_connectivity)
+            base.wait_until_true(netcat.test_no_connectivity)
         finally:
             netcat.stop_processes()
 
@@ -91,9 +93,6 @@ class TestSecurityGroupsSameNetwork(BaseSecurityGroupsSameNetworkTest):
 
     network_type = 'vxlan'
     scenarios = [
-        # TODO(njohnston): Re-add the linuxbridge scenario once it is stable
-        # The iptables_hybrid driver lacks isolation between agents and
-        # because of that using only one host is enough
         ('ovs-hybrid', {
             'firewall_driver': 'iptables_hybrid',
             'l2_agent_type': constants.AGENT_TYPE_OVS,
@@ -133,15 +132,15 @@ class TestSecurityGroupsSameNetwork(BaseSecurityGroupsSameNetworkTest):
             tenant_uuid, subnet_cidr)
 
         # 0. check that traffic is allowed when port security is disabled
+        vms[0].block_until_ping(vms[1].ip)
+        vms[0].block_until_ping(vms[2].ip)
+        vms[1].block_until_ping(vms[2].ip)
         self.assert_connection(
             vms[1].namespace, vms[0].namespace, vms[0].ip, 3333,
             net_helpers.NetcatTester.TCP)
         self.assert_connection(
             vms[2].namespace, vms[0].namespace, vms[0].ip, 3333,
             net_helpers.NetcatTester.TCP)
-        vms[0].block_until_ping(vms[1].ip)
-        vms[0].block_until_ping(vms[2].ip)
-        vms[1].block_until_ping(vms[2].ip)
 
         # Apply security groups to the ports
         for port, sg in zip(ports, self.index_to_sg):
@@ -155,7 +154,7 @@ class TestSecurityGroupsSameNetwork(BaseSecurityGroupsSameNetworkTest):
             vms[2].namespace, vms[0].namespace, vms[0].ip, 3333,
             net_helpers.NetcatTester.TCP)
         # Wait until port update takes effect on the ports
-        common_utils.wait_until_true(
+        base.wait_until_true(
             netcat.test_no_connectivity,
             exception=AssertionError(
                 "Still can connect to the VM from different host.")
@@ -246,22 +245,20 @@ class TestSecurityGroupsSameNetwork(BaseSecurityGroupsSameNetworkTest):
                     tenant_uuid,
                     self.safe_client,
                     neutron_port=ports[-1],
-                    use_dhcp=True)))
+                    use_dhcp=False)))
         self.assertEqual(5, len(vms))
 
         vms[4].block_until_boot()
 
-        netcat = net_helpers.NetcatTester(vms[4].namespace,
-            vms[0].namespace, vms[0].ip, 3355,
+        self.assert_connection(
+            vms[4].namespace, vms[0].namespace, vms[0].ip, 3355,
             net_helpers.NetcatTester.TCP)
 
-        self.addCleanup(netcat.stop_processes)
-        self.assertTrue(netcat.test_connectivity())
-
         self.client.delete_security_group_rule(rule2['id'])
-        common_utils.wait_until_true(lambda: netcat.test_no_connectivity(),
-                                     sleep=8)
-        netcat.stop_processes()
+
+        self.assert_no_connection(
+            vms[4].namespace, vms[0].namespace, vms[0].ip, 3355,
+            net_helpers.NetcatTester.TCP)
 
         # 8. check if multiple overlapping remote rules work
         self.safe_client.create_security_group_rule(
@@ -514,7 +511,7 @@ class TestSecurityGroupsSameNetwork(BaseSecurityGroupsSameNetworkTest):
                 namespace=vm.host.host_namespace)
             vm_tap_device = iptables_firewall.get_hybrid_port_name(
                 vm.neutron_port['id'])
-            common_utils.wait_until_true(
+            base.wait_until_true(
                 lambda: self._is_stateless_configured(iptables,
                                                       vm_tap_device),
                 exception=StatelessRulesNotConfiguredException(
@@ -565,10 +562,9 @@ class TestSecurityGroupsSameNetwork(BaseSecurityGroupsSameNetworkTest):
                     tenant_uuid,
                     self.safe_client,
                     neutron_port=ports[port],
-                    use_dhcp=True))
+                    use_dhcp=False))
             for port, host in enumerate(index_to_host)]
         map(lambda vm: vm.block_until_boot(), vms)
-        map(lambda vm: vm.block_until_dhcp_config_done(), vms)
 
         return vms, ports, sgs, network, index_to_host
 
@@ -665,27 +661,3 @@ class TestSecurityGroupsSameNetwork(BaseSecurityGroupsSameNetworkTest):
                 vm1, vm2, net_helpers.NetcatTester.TCP, port + 1)
             self.verify_no_connectivity_between_vms(
                 vm2, vm1, net_helpers.NetcatTester.TCP, port + 1)
-
-
-class SecurityGroupRulesTest(base.BaseFullStackTestCase):
-
-    def setUp(self):
-        host_descriptions = [environment.HostDescription()]
-        env = environment.Environment(environment.EnvironmentDescription(),
-                                      host_descriptions)
-        super(SecurityGroupRulesTest, self).setUp(env)
-
-    def test_security_group_rule_quota(self):
-        project_id = uuidutils.generate_uuid()
-        quota = self.client.show_quota_details(project_id)
-        sg_rules_used = quota['quota']['security_group_rule']['used']
-        self.assertEqual(0, sg_rules_used)
-
-        self.safe_client.create_security_group(project_id)
-        quota = self.client.show_quota_details(project_id)
-        sg_rules_used = quota['quota']['security_group_rule']['used']
-        self.safe_client.update_quota(project_id, 'security_group_rule',
-                                      sg_rules_used)
-
-        self.assertRaises(nc_exc.OverQuotaClient,
-                          self.safe_client.create_security_group, project_id)

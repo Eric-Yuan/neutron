@@ -17,21 +17,21 @@ from neutron_lib import constants
 from neutron_lib.db import api as db_api
 from neutron_lib.db import utils as db_utils
 from neutron_lib.exceptions import metering as metering_exc
+
 from oslo_db import exception as db_exc
+from oslo_log import log as logging
 from oslo_utils import uuidutils
 
-from neutron.api.rpc.agentnotifiers import metering_rpc_agent_api
 from neutron.db import l3_dvr_db
 from neutron.extensions import metering
 from neutron.objects import base as base_obj
 from neutron.objects import metering as metering_objs
 from neutron.objects import router as l3_obj
 
+LOG = logging.getLogger(__name__)
+
 
 class MeteringDbMixin(metering.MeteringPluginBase):
-
-    def __init__(self):
-        self.meter_rpc = metering_rpc_agent_api.MeteringAgentNotifyAPI()
 
     @staticmethod
     def _make_metering_label_dict(metering_label, fields=None):
@@ -39,7 +39,7 @@ class MeteringDbMixin(metering.MeteringPluginBase):
                'name': metering_label['name'],
                'description': metering_label['description'],
                'shared': metering_label['shared'],
-               'tenant_id': metering_label['tenant_id']}
+               'project_id': metering_label['project_id']}
         return db_utils.resource_fields(res, fields)
 
     def create_metering_label(self, context, metering_label):
@@ -47,7 +47,7 @@ class MeteringDbMixin(metering.MeteringPluginBase):
 
         metering_obj = metering_objs.MeteringLabel(
             context, id=uuidutils.generate_uuid(),
-            description=m['description'], project_id=m['tenant_id'],
+            description=m['description'], project_id=m['project_id'],
             name=m['name'], shared=m['shared'])
         metering_obj.create()
         return self._make_metering_label_dict(metering_obj)
@@ -84,7 +84,10 @@ class MeteringDbMixin(metering.MeteringPluginBase):
         res = {'id': metering_label_rule['id'],
                'metering_label_id': metering_label_rule['metering_label_id'],
                'direction': metering_label_rule['direction'],
-               'remote_ip_prefix': metering_label_rule['remote_ip_prefix'],
+               'remote_ip_prefix': metering_label_rule.get('remote_ip_prefix'),
+               'source_ip_prefix': metering_label_rule.get('source_ip_prefix'),
+               'destination_ip_prefix': metering_label_rule.get(
+                   'destination_ip_prefix'),
                'excluded': metering_label_rule['excluded']}
         return db_utils.resource_fields(res, fields)
 
@@ -109,44 +112,32 @@ class MeteringDbMixin(metering.MeteringPluginBase):
         return self._make_metering_label_rule_dict(
             self._get_metering_label_rule(context, rule_id), fields)
 
-    def _validate_cidr(self, context, label_id, remote_ip_prefix,
-                       direction, excluded):
-        r_ips = self.get_metering_label_rules(context,
-                                              filters={'metering_label_id':
-                                                       [label_id],
-                                                       'direction':
-                                                       [direction],
-                                                       'excluded':
-                                                       [excluded]},
-                                              fields=['remote_ip_prefix'])
-
-        cidrs = [r['remote_ip_prefix'] for r in r_ips]
-        new_cidr_ipset = netaddr.IPSet([remote_ip_prefix])
-        if (netaddr.IPSet(cidrs) & new_cidr_ipset):
-            raise metering_exc.MeteringLabelRuleOverlaps(
-                remote_ip_prefix=remote_ip_prefix)
-
     def create_metering_label_rule(self, context, metering_label_rule):
-        m = metering_label_rule['metering_label_rule']
+        label_id = metering_label_rule['metering_label_id']
+
         try:
             with db_api.CONTEXT_WRITER.using(context):
-                label_id = m['metering_label_id']
-                ip_prefix = m['remote_ip_prefix']
-                direction = m['direction']
-                excluded = m['excluded']
-
-                self._validate_cidr(context, label_id, ip_prefix, direction,
-                                    excluded)
                 rule = metering_objs.MeteringLabelRule(
                     context, id=uuidutils.generate_uuid(),
-                    metering_label_id=label_id, direction=direction,
-                    excluded=m['excluded'],
-                    remote_ip_prefix=netaddr.IPNetwork(ip_prefix))
+                    metering_label_id=label_id,
+                    direction=metering_label_rule['direction'],
+                    excluded=metering_label_rule['excluded'],
+                )
+                if metering_label_rule.get('remote_ip_prefix'):
+                    rule.remote_ip_prefix = netaddr.IPNetwork(
+                        metering_label_rule['remote_ip_prefix'])
+
+                if metering_label_rule.get('source_ip_prefix'):
+                    rule.source_ip_prefix = netaddr.IPNetwork(
+                        metering_label_rule['source_ip_prefix'])
+
+                if metering_label_rule.get('destination_ip_prefix'):
+                    rule.destination_ip_prefix = netaddr.IPNetwork(
+                        metering_label_rule['destination_ip_prefix'])
                 rule.create()
+                return self._make_metering_label_rule_dict(rule)
         except db_exc.DBReferenceError:
             raise metering_exc.MeteringLabelNotFound(label_id=label_id)
-
-        return self._make_metering_label_rule_dict(rule)
 
     def delete_metering_label_rule(self, context, rule_id):
         with db_api.CONTEXT_WRITER.using(context):
@@ -167,7 +158,7 @@ class MeteringDbMixin(metering.MeteringPluginBase):
         distributed = l3_dvr_db.is_distributed_router(router)
         res = {'id': router['id'],
                'name': router['name'],
-               'tenant_id': router['tenant_id'],
+               'project_id': router['project_id'],
                'admin_state_up': router['admin_state_up'],
                'status': router['status'],
                'gw_port_id': router['gw_port_id'],
@@ -198,7 +189,8 @@ class MeteringDbMixin(metering.MeteringPluginBase):
 
                 rules = self._get_metering_rules_dict(label)
 
-                data = {'id': label['id'], 'rules': rules}
+                data = {'id': label['id'], 'rules': rules,
+                        'shared': label['shared'], 'name': label['name']}
                 router_dict[constants.METERING_LABEL_KEY].append(data)
 
                 routers_dict[router['id']] = router_dict

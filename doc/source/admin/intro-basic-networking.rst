@@ -84,7 +84,7 @@ are connected to the same switch but on different VLANs do not see
 each other's traffic. OpenStack is able to take advantage of VLANs to
 isolate the traffic of different projects, even if the projects happen
 to have instances running on the same compute host. Each VLAN has an
-associated numerical ID, between 1 and 4095. We say "VLAN 15" to refer
+associated numerical ID, between 1 and 4094. We say "VLAN 15" to refer
 to the VLAN with a numerical ID of 15.
 
 To understand how VLANs work, let's consider VLAN applications in a
@@ -173,7 +173,8 @@ IP address and netmask, and this example would be written as
 
    Creating CIDR subnets including a multicast address or a loopback address
    cannot be used in an OpenStack environment. For example, creating a subnet
-   using ``224.0.0.0/16`` or ``127.0.1.0/24`` is not supported.
+   which is part of ``224.0.0.0/4`` or ``127.0.0.0/8`` address blocks
+   is not supported.
 
 Sometimes we want to refer to a subnet, but not any particular IP
 address on the subnet. A common convention is to set the host

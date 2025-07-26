@@ -38,7 +38,7 @@ from neutron.services.trunk.rpc import constants as trunk_consts
 # For server-side stub and skeleton proxy code, please look at server.py
 
 
-class TrunkSkeleton(object):
+class TrunkSkeleton:
     """Skeleton proxy code for server->agent communication."""
 
     def __init__(self):
@@ -52,6 +52,9 @@ class TrunkSkeleton(object):
         topic = resources_rpc.resource_type_versioned_topic(resources.TRUNK)
         self._connection.create_consumer(topic, endpoints, fanout=True)
         self._connection.consume_in_threads()
+
+    def unregister(self):
+        self._connection.close()
 
     @abc.abstractmethod
     def handle_trunks(self, context, resource_type, trunks, event_type):
@@ -72,7 +75,7 @@ class TrunkSkeleton(object):
         # manage, the notification should be ignored.
 
 
-class TrunkStub(object):
+class TrunkStub:
     """Stub proxy code for agent->server communication."""
     # API HISTORY
     #   1.0 - initial version

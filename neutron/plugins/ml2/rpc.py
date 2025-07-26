@@ -31,6 +31,7 @@ from sqlalchemy.orm import exc
 
 from neutron.api.rpc.handlers import dvr_rpc
 from neutron.api.rpc.handlers import securitygroups_rpc as sg_rpc
+from neutron.common import utils
 from neutron.db import l3_hamode_db
 from neutron.db import provisioning_blocks
 from neutron.plugins.ml2 import db as ml2_db
@@ -44,7 +45,7 @@ LOG = log.getLogger(__name__)
 class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
 
     # history
-    #   1.0 Initial version (from openvswitch/linuxbridge)
+    #   1.0 Initial version (from openvswitch)
     #   1.1 Support Security Group RPC
     #   1.2 Support get_devices_details_list
     #   1.3 get_device_details rpc signature upgrade to obtain 'host' and
@@ -57,12 +58,18 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
     #   1.7 Support get_ports_by_vnic_type_and_host
     #   1.8 Rename agent_restarted to refresh_tunnels in
     #       update_device_list to reflect its expanded purpose
-
-    target = oslo_messaging.Target(version='1.8')
+    #   1.9 Support for device definition as DeviceInfo(mac, pci_info) for:
+    #       - get_device_details
+    #       - get_devices_details_list (indirectly, calls get_device_details)
+    #       - update_device_down
+    #       - update_device_up
+    #       - update_device_list (indirectly, called from update_device_down
+    #         and update_device_up)
+    target = oslo_messaging.Target(version='1.9')
 
     def __init__(self, notifier, type_manager):
         self.setup_tunnel_callback_mixin(notifier, type_manager)
-        super(RpcCallbacks, self).__init__()
+        super().__init__()
 
     def _get_new_status(self, host, port_context):
         port = port_context.current
@@ -78,6 +85,14 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                 kwargs.get('host'),
                 kwargs.get('device') or kwargs.get('network'))
 
+    @staticmethod
+    def _device_to_mac_pci_slot(device):
+        """This method will keep backwards compatibility with agents < 1.9"""
+        # NOTE(ralonsoh): this method can be removed in Z release.
+        if isinstance(device, list):  # RPC loads from agent_rpc.DeviceInfo
+            return device[0], device[1]
+        return device, None
+
     def get_device_details(self, rpc_context, **kwargs):
         """Agent requests device details."""
         agent_id, host, device = self._get_request_details(kwargs)
@@ -90,7 +105,9 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                   {'device': device, 'agent_id': agent_id, 'host': host})
 
         plugin = directory.get_plugin()
-        port_id = plugin._device_to_port_id(rpc_context, device)
+        mac_or_port_id, pci_slot = self._device_to_mac_pci_slot(device)
+        port_id = plugin._device_to_port_id(rpc_context, mac_or_port_id,
+                                            pci_slot=pci_slot)
         port_context = plugin.get_bound_port_context(rpc_context,
                                                      port_id,
                                                      host,
@@ -98,8 +115,8 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
         if not port_context:
             LOG.debug("Device %(device)s requested by agent "
                       "%(agent_id)s not found in database",
-                      {'device': device, 'agent_id': agent_id})
-            return {'device': device}
+                      {'device': mac_or_port_id, 'agent_id': agent_id})
+            return {'device': mac_or_port_id}
 
         port = port_context.current
         # caching information about networks for future use
@@ -108,7 +125,7 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                 cached_networks[port['network_id']] = (
                     port_context.network.current)
         result = self._get_device_details(rpc_context, agent_id=agent_id,
-                                          host=host, device=device,
+                                          host=host, device=mac_or_port_id,
                                           port_context=port_context)
         if 'network_id' in result:
             # success so we update status
@@ -117,8 +134,7 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                 plugin.update_port_status(rpc_context,
                                           port_id,
                                           new_status,
-                                          host,
-                                          port_context.network.current)
+                                          host)
         return result
 
     def _get_device_details(self, rpc_context, agent_id, host, device,
@@ -145,7 +161,7 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
             return {'device': device,
                     n_const.NO_ACTIVE_BINDING: True}
 
-        network_qos_policy_id = port_context.network._network.get(
+        qos_network_policy_id = port_context.network._network.get(
             qos_consts.QOS_POLICY_ID)
         entry = {'device': device,
                  'network_id': port['network_id'],
@@ -160,8 +176,8 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                  'device_owner': port['device_owner'],
                  'allowed_address_pairs': port['allowed_address_pairs'],
                  'port_security_enabled': port.get(psec.PORTSECURITY, True),
-                 'qos_policy_id': port.get(qos_consts.QOS_POLICY_ID),
-                 'network_qos_policy_id': network_qos_policy_id,
+                 qos_consts.QOS_POLICY_ID: port.get(qos_consts.QOS_POLICY_ID),
+                 qos_consts.QOS_NETWORK_POLICY_ID: qos_network_policy_id,
                  'profile': port[portbindings.PROFILE],
                  'propagate_uplink_status': port.get(
                      usp.PROPAGATE_UPLINK_STATUS, False)}
@@ -203,11 +219,11 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                 continue
             try:
                 devices.append(self._get_device_details(
-                               rpc_context,
-                               agent_id=kwargs.get('agent_id'),
-                               host=host,
-                               device=device,
-                               port_context=bound_contexts[device]))
+                    rpc_context,
+                    agent_id=kwargs.get('agent_id'),
+                    host=host,
+                    device=device,
+                    port_context=bound_contexts[device]))
             except Exception:
                 LOG.exception("Failed to get details for device %s",
                               device)
@@ -244,13 +260,15 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                   "%(agent_id)s",
                   {'device': device, 'agent_id': agent_id})
         plugin = directory.get_plugin()
-        port_id = plugin._device_to_port_id(rpc_context, device)
+        mac_or_device, pci_slot = self._device_to_mac_pci_slot(device)
+        port_id = plugin._device_to_port_id(rpc_context, mac_or_device,
+                                            pci_slot=pci_slot)
         port_exists = True
         if (host and not plugin.port_bound_to_host(rpc_context,
                                                    port_id, host)):
             LOG.debug("Device %(device)s not bound to the"
                       " agent host %(host)s",
-                      {'device': device, 'host': host})
+                      {'device': mac_or_device, 'host': host})
         else:
             try:
                 port_exists = bool(plugin.update_port_status(
@@ -259,12 +277,12 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                 port_exists = False
                 LOG.debug("delete_port and update_device_down are being "
                           "executed concurrently. Ignoring StaleDataError.")
-                return {'device': device,
+                return {'device': mac_or_device,
                         'exists': port_exists}
         self.notify_l2pop_port_wiring(port_id, rpc_context,
                                       n_const.PORT_STATUS_DOWN, host)
 
-        return {'device': device,
+        return {'device': mac_or_device,
                 'exists': port_exists}
 
     @profiler.trace("rpc")
@@ -278,31 +296,32 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
         LOG.debug("Device %(device)s up at agent %(agent_id)s",
                   {'device': device, 'agent_id': agent_id})
         plugin = directory.get_plugin()
-        port_id = plugin._device_to_port_id(rpc_context, device)
+        mac_or_device, pci_slot = self._device_to_mac_pci_slot(device)
+        port_id = plugin._device_to_port_id(rpc_context, mac_or_device,
+                                            pci_slot=pci_slot)
         port = plugin.port_bound_to_host(rpc_context, port_id, host)
         if host and not port:
             LOG.debug("Device %(device)s not bound to the"
                       " agent host %(host)s",
-                      {'device': device, 'host': host})
+                      {'device': mac_or_device, 'host': host})
             # this might mean that a VM is in the process of live migration
             # and vif was plugged on the destination compute node;
             # need to notify nova explicitly
             port = ml2_db.get_port(rpc_context, port_id)
             # _device_to_port_id may have returned a truncated UUID if the
-            # agent did not provide a full one (e.g. Linux Bridge case).
+            # agent did not provide a full one.
             if not port:
                 LOG.debug("Port %s not found, will not notify nova.", port_id)
                 return
-            else:
-                if port.device_owner.startswith(
-                        n_const.DEVICE_OWNER_COMPUTE_PREFIX):
-                    # NOTE(haleyb): It is possible for a test to override a
-                    # config option after the plugin has been initialized so
-                    # the nova_notifier attribute is not set on the plugin.
-                    if (cfg.CONF.notify_nova_on_port_status_changes and
-                            hasattr(plugin, 'nova_notifier')):
-                        plugin.nova_notifier.notify_port_active_direct(port)
-                    return
+            if port.device_owner.startswith(
+                    n_const.DEVICE_OWNER_COMPUTE_PREFIX):
+                # NOTE(haleyb): It is possible for a test to override a
+                # config option after the plugin has been initialized so
+                # the nova_notifier attribute is not set on the plugin.
+                if (cfg.CONF.notify_nova_on_port_status_changes and
+                        hasattr(plugin, 'nova_notifier')):
+                    plugin.nova_notifier.notify_port_active_direct(port)
+                return
         else:
             self.update_port_status_to_active(port, rpc_context, port_id, host)
         self.notify_l2pop_port_wiring(port_id, rpc_context,
@@ -319,8 +338,8 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                                       n_const.PORT_STATUS_ACTIVE, host)
         else:
             # _device_to_port_id may have returned a truncated UUID if the
-            # agent did not provide a full one (e.g. Linux Bridge case). We
-            # need to look up the full one before calling provisioning_complete
+            # agent did not provide a full one. We need to look up the full one
+            # before calling provisioning_complete
             if not port:
                 port = ml2_db.get_port(rpc_context, port_id)
             if not port:
@@ -339,14 +358,14 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
         """
         plugin = directory.get_plugin()
         l2pop_driver = plugin.mechanism_manager.mech_drivers.get(
-                'l2population')
+            'l2population')
         if not l2pop_driver:
             return
         port = ml2_db.get_port(rpc_context, port_id)
         if not port:
             return
         port_context = plugin.get_bound_port_context(
-                rpc_context, port_id, host)
+            rpc_context, port_id, host)
         if not port_context:
             # port deleted
             return
@@ -455,11 +474,13 @@ class AgentNotifierApi(dvr_rpc.DVRAgentRpcApiMixin,
         target = oslo_messaging.Target(topic=topic, version='1.0')
         self.client = n_rpc.get_client(target)
 
+    @utils.disable_notifications
     def network_delete(self, context, network_id):
         cctxt = self.client.prepare(topic=self.topic_network_delete,
                                     fanout=True)
         cctxt.cast(context, 'network_delete', network_id=network_id)
 
+    @utils.disable_notifications
     def port_update(self, context, port, network_type, segmentation_id,
                     physical_network):
         cctxt = self.client.prepare(topic=self.topic_port_update,
@@ -468,22 +489,26 @@ class AgentNotifierApi(dvr_rpc.DVRAgentRpcApiMixin,
                    network_type=network_type, segmentation_id=segmentation_id,
                    physical_network=physical_network)
 
+    @utils.disable_notifications
     def port_delete(self, context, port_id):
         cctxt = self.client.prepare(topic=self.topic_port_delete,
                                     fanout=True)
         cctxt.cast(context, 'port_delete', port_id=port_id)
 
+    @utils.disable_notifications
     def network_update(self, context, network):
         cctxt = self.client.prepare(topic=self.topic_network_update,
                                     fanout=True, version='1.4')
         cctxt.cast(context, 'network_update', network=network)
 
+    @utils.disable_notifications
     def binding_deactivate(self, context, port_id, host, network_id):
         cctxt = self.client.prepare(topic=self.topic_port_binding_deactivate,
                                     fanout=True, version='1.5')
         cctxt.cast(context, 'binding_deactivate', port_id=port_id, host=host,
                    network_id=network_id)
 
+    @utils.disable_notifications
     def binding_activate(self, context, port_id, host):
         cctxt = self.client.prepare(topic=self.topic_port_binding_activate,
                                     fanout=True, version='1.5')

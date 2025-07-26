@@ -13,6 +13,7 @@
 from unittest import mock
 
 import netaddr
+from neutron_lib.api.definitions import portbindings
 from neutron_lib import constants
 from neutron_lib.tests import tools
 from oslo_utils import uuidutils
@@ -40,7 +41,7 @@ class SecurityGroupPortBindingDbObjectTestCase(
 class BasePortBindingDbObjectTestCase(obj_test_base._BaseObjectTestCase,
                                       testlib_api.SqlTestCase):
     def setUp(self):
-        super(BasePortBindingDbObjectTestCase, self).setUp()
+        super().setUp()
         self.update_obj_fields(
             {'port_id': lambda: self._create_test_port_id()})
 
@@ -52,6 +53,40 @@ class PortBindingIfaceObjTestCase(obj_test_base.BaseObjectIfaceTestCase):
 class PortBindingDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
                                   BasePortBindingDbObjectTestCase):
     _test_class = ports.PortBinding
+
+    def test_get_duplicated_port_bindings(self):
+        port_id = self._create_test_port_id()
+        self.update_obj_fields(
+            {'port_id': port_id, 'status': constants.ACTIVE},
+            obj_fields=[self.obj_fields[0]])
+        self.update_obj_fields(
+            {'port_id': port_id, 'status': constants.INACTIVE},
+            obj_fields=[self.obj_fields[1]])
+        for i in range(3):
+            _obj = self._make_object(self.obj_fields[i])
+            _obj.create()
+        dup_pb = ports.PortBinding.get_duplicated_port_bindings(self.context)
+        self.assertEqual(1, len(dup_pb))
+        self.assertEqual(port_id, dup_pb[0].port_id)
+        # The PB register returned is the INACTIVE one.
+        self.assertEqual(self.obj_fields[1]['host'], dup_pb[0].host)
+
+    def test_get_port_binding_by_vnic_type(self):
+        self.update_obj_fields({'vnic_type': portbindings.VNIC_NORMAL},
+                               obj_fields=[self.obj_fields[0]])
+        self.update_obj_fields({'vnic_type': portbindings.VNIC_DIRECT},
+                               obj_fields=[self.obj_fields[1],
+                                           self.obj_fields[2]])
+        for i in range(3):
+            _obj = self._make_object(self.obj_fields[i])
+            _obj.create()
+
+        for vnic_type, pb_num in [(portbindings.VNIC_NORMAL, 1),
+                                  (portbindings.VNIC_DIRECT, 2),
+                                  (portbindings.VNIC_MACVTAP, 0)]:
+            pb = ports.PortBinding.get_port_binding_by_vnic_type(self.context,
+                                                                 vnic_type)
+            self.assertEqual(pb_num, len(pb))
 
 
 class DistributedPortBindingIfaceObjTestCase(
@@ -81,9 +116,10 @@ class PortBindingVifDetailsTestCase(testscenarios.WithScenarios,
     ]
 
     def setUp(self):
-        super(PortBindingVifDetailsTestCase, self).setUp()
+        super().setUp()
         self._create_test_network()
-        getter = lambda: self._create_port(network_id=self._network['id']).id
+        def getter():
+            return self._create_port(network_id=self._network['id']).id
         self.update_obj_fields({'port_id': getter})
 
     def _create_port(self, **port_attrs):
@@ -166,7 +202,7 @@ class IPAllocationDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
     _test_class = ports.IPAllocation
 
     def setUp(self):
-        super(IPAllocationDbObjectTestCase, self).setUp()
+        super().setUp()
         network_id = self._create_test_network_id()
         port_id = self._create_test_port_id(network_id=network_id)
         self.update_obj_fields(
@@ -185,7 +221,7 @@ class PortDNSDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
     _test_class = ports.PortDNS
 
     def setUp(self):
-        super(PortDNSDbObjectTestCase, self).setUp()
+        super().setUp()
         self.update_obj_fields(
             {'port_id': lambda: self._create_test_port_id()})
 
@@ -196,7 +232,7 @@ class PortBindingLevelIfaceObjTestCase(
     _test_class = ports.PortBindingLevel
 
     def setUp(self):
-        super(PortBindingLevelIfaceObjTestCase, self).setUp()
+        super().setUp()
         self.pager_map[self._test_class.obj_name()] = (
             obj_base.Pager(sorts=[('port_id', True), ('level', True)]))
 
@@ -207,7 +243,7 @@ class PortBindingLevelDbObjectTestCase(
     _test_class = ports.PortBindingLevel
 
     def setUp(self):
-        super(PortBindingLevelDbObjectTestCase, self).setUp()
+        super().setUp()
         self.update_obj_fields(
             {'port_id': lambda: self._create_test_port_id(),
              'segment_id': lambda: self._create_test_segment_id()})
@@ -218,7 +254,7 @@ class PortIfaceObjTestCase(obj_test_base.BaseObjectIfaceTestCase):
     _test_class = ports.Port
 
     def setUp(self):
-        super(PortIfaceObjTestCase, self).setUp()
+        super().setUp()
         self.pager_map[ports.PortBindingLevel.obj_name()] = (
             obj_base.Pager(sorts=[('port_id', True), ('level', True)]))
 
@@ -229,7 +265,7 @@ class PortDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
     _test_class = ports.Port
 
     def setUp(self):
-        super(PortDbObjectTestCase, self).setUp()
+        super().setUp()
         network_id = self._create_test_network_id()
         segment_id = self._create_test_segment_id(network_id)
         subnet_id = self._create_test_subnet_id(network_id)
@@ -379,12 +415,6 @@ class PortDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
         self.skipTest(
             'Port object loads segment info without relationships')
 
-    def test_v1_1_to_v1_0_drops_data_plane_status(self):
-        port_new = self._create_test_port()
-        port_v1_0 = port_new.obj_to_primitive(target_version='1.0')
-        self.assertNotIn('data_plane_status',
-                         port_v1_0['versioned_object.data'])
-
     def test_v1_2_to_v1_1_drops_segment_id_in_binding_levels(self):
         port_new = self._create_test_port()
         segment = network.NetworkSegment(
@@ -488,6 +518,30 @@ class PortDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
         self.assertNotIn('qos_network_policy_id',
                          port_v1_4['versioned_object.data'])
 
+    def test_v1_6_to_v1_5_drops_numa_affinity_policy(self):
+        port_new = self._create_test_port()
+        port_v1_5 = port_new.obj_to_primitive(target_version='1.5')
+        self.assertNotIn('numa_affinity_policy',
+                         port_v1_5['versioned_object.data'])
+
+    def test_v1_7_to_v1_6_drops_device_profile(self):
+        port_new = self._create_test_port()
+        port_v1_6 = port_new.obj_to_primitive(target_version='1.6')
+        self.assertNotIn('device_profile',
+                         port_v1_6['versioned_object.data'])
+
+    def test_v1_8_to_v1_7_drops_hints(self):
+        port_new = self._create_test_port()
+        port_v1_7 = port_new.obj_to_primitive(target_version='1.7')
+        self.assertNotIn('hints',
+                         port_v1_7['versioned_object.data'])
+
+    def test_v1_10_to_v1_9_drops_trusted(self):
+        port_new = self._create_test_port(trusted=True)
+        port_v1_9 = port_new.obj_to_primitive(target_version='1.9')
+        self.assertNotIn('trusted',
+                         port_v1_9['versioned_object.data'])
+
     def test_get_ports_ids_by_security_groups_except_router(self):
         sg_id = self._create_test_security_group_id()
         filter_owner = constants.ROUTER_INTERFACE_OWNERS_SNAT
@@ -574,3 +628,63 @@ class PortDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
                                                                   subnet_id)
         self.assertEqual(1, len(ports_alloc))
         self.assertEqual(objs[0].id, ports_alloc[0].id)
+
+    def _test_get_auto_deletable_ports(self, device_owner):
+        network_id = self._create_test_network_id()
+        segment_id = self._create_test_segment_id(network_id)
+        port = self._create_test_port(device_owner=device_owner)
+        binding = ports.PortBindingLevel(
+            self.context, port_id=port.id,
+            host='host1', level=0, segment_id=segment_id)
+        binding.create()
+        return (
+            ports.Port.
+            get_auto_deletable_port_ids_and_proper_port_count_by_segment(
+                self.context, segment_id))
+
+    def test_get_auto_deletable_ports_dhcp(self):
+        dhcp_ports, count = self._test_get_auto_deletable_ports(
+            'network:dhcp')
+        self.assertEqual(
+            (1, 0),
+            (len(dhcp_ports), count),
+        )
+
+    def test_get_auto_deletable_ports_not_dhcp(self):
+        dhcp_ports, count = self._test_get_auto_deletable_ports(
+            'not_network_dhcp')
+        self.assertEqual(
+            (0, 1),
+            (len(dhcp_ports), count),
+        )
+
+    def test_get_port_from_mac_and_pci_slot_no_ports(self):
+        self.assertIsNone(
+            ports.Port.get_port_from_mac_and_pci_slot(self.context,
+                                                      'ca:fe:ca:fe:ca:fe'))
+
+    def test_get_port_from_mac_and_pci_slot_no_pci_slot(self):
+        obj = self._make_object(self.obj_fields[0])
+        obj.create()
+        mac_address = obj.mac_address
+        port = ports.Port.get_port_from_mac_and_pci_slot(self.context,
+                                                         mac_address)
+        self.assertEqual(obj.id, port.id)
+
+    def test_get_port_from_mac_and_pci_slot(self):
+        obj = self._make_object(self.obj_fields[0])
+        obj.create()
+        mac_address = obj.mac_address
+        pci_slot = '0000:04:00.1'
+        port = ports.Port.get_port_from_mac_and_pci_slot(
+            self.context, mac_address, pci_slot=pci_slot)
+        self.assertIsNone(port)
+
+        port_binding = ports.PortBinding(
+            self.context, port_id=obj.id, host='any_host',
+            vif_type=portbindings.VIF_TYPE_OTHER,
+            vnic_type=portbindings.VNIC_DIRECT, profile={'pci_slot': pci_slot})
+        port_binding.create()
+        port = ports.Port.get_port_from_mac_and_pci_slot(
+            self.context, mac_address, pci_slot=pci_slot)
+        self.assertEqual(obj.id, port.id)

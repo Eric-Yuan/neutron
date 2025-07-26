@@ -30,12 +30,12 @@ from neutron.services.logapi.common import sg_validate
 from neutron.tests.unit.services.logapi import base
 
 DB_PLUGIN_KLASS = 'neutron.db.db_base_plugin_v2.NeutronDbPluginV2'
-SUPPORTED_LOGGING_TYPES = ['security_group']
+SUPPORTED_LOGGING_TYPES = ('security_group',)
 
 
 class TestLoggingPlugin(base.BaseLogTestCase):
     def setUp(self):
-        super(TestLoggingPlugin, self).setUp()
+        super().setUp()
         self.setup_coreplugin(load_plugins=False)
 
         mock.patch('neutron.objects.db.api.create_object').start()
@@ -73,8 +73,8 @@ class TestLoggingPlugin(base.BaseLogTestCase):
                 as get_objects_mock:
             filters = {'filter': 'filter_id'}
             self.log_plugin.get_logs(self.ctxt, filters=filters)
-            get_objects_mock.assert_called_once_with(self.ctxt,
-                _pager=mock.ANY, filter='filter_id')
+            get_objects_mock.assert_called_once_with(
+                self.ctxt, _pager=mock.ANY, filter='filter_id')
 
     def test_get_log_without_return_value(self):
         with mock.patch.object(log_object.Log, 'get_object',

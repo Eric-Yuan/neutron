@@ -46,7 +46,7 @@ cfg.CONF.import_group('ml2', 'neutron.conf.plugins.ml2.config')
 class RpcCallbacksTestCase(base.BaseTestCase):
 
     def setUp(self):
-        super(RpcCallbacksTestCase, self).setUp()
+        super().setUp()
         self.type_manager = managers.TypeManager()
         self.notifier = plugin_rpc.AgentNotifierApi(topics.AGENT)
         self.callbacks = plugin_rpc.RpcCallbacks(self.notifier,
@@ -153,7 +153,7 @@ class RpcCallbacksTestCase(base.BaseTestCase):
             {"id": "fake_network",
              qos_consts.QOS_POLICY_ID: 'test-policy-id'})
         res = self.callbacks.get_device_details(mock.Mock(), host='fake')
-        self.assertEqual('test-policy-id', res['network_qos_policy_id'])
+        self.assertEqual('test-policy-id', res['qos_network_policy_id'])
 
     def test_get_device_details_port_no_active_in_host(self):
         port = collections.defaultdict(lambda: 'fake_port')
@@ -316,7 +316,7 @@ class RpcCallbacksTestCase(base.BaseTestCase):
 
         devices_up_side_effect = [1, Exception('testdevice'), 3]
         devices_down_side_effect = [{'device': 4, 'exists': True},
-                        Exception('testdevice')]
+                                    Exception('testdevice')]
         expected = {'devices_up': [1, 3],
                     'failed_devices_up': [2],
                     'devices_down':
@@ -436,7 +436,8 @@ class RpcApiTestCase(base.BaseTestCase):
                            'get_device_details', rpc_method='call',
                            device='fake_device',
                            agent_id='fake_agent_id',
-                           host='fake_host')
+                           host='fake_host',
+                           version='1.9')
 
     def test_devices_details_list(self):
         rpcapi = agent_rpc.PluginApi(topics.PLUGIN)
@@ -444,7 +445,7 @@ class RpcApiTestCase(base.BaseTestCase):
                            'get_devices_details_list', rpc_method='call',
                            devices=['fake_device1', 'fake_device2'],
                            agent_id='fake_agent_id', host='fake_host',
-                           version='1.3')
+                           version='1.9')
 
     def test_update_device_down(self):
         rpcapi = agent_rpc.PluginApi(topics.PLUGIN)
@@ -452,7 +453,8 @@ class RpcApiTestCase(base.BaseTestCase):
                            'update_device_down', rpc_method='call',
                            device='fake_device',
                            agent_id='fake_agent_id',
-                           host='fake_host')
+                           host='fake_host',
+                           version='1.9')
 
     def test_tunnel_sync(self):
         rpcapi = agent_rpc.PluginApi(topics.PLUGIN)
@@ -469,7 +471,8 @@ class RpcApiTestCase(base.BaseTestCase):
                            'update_device_up', rpc_method='call',
                            device='fake_device',
                            agent_id='fake_agent_id',
-                           host='fake_host')
+                           host='fake_host',
+                           version='1.9')
 
     def test_update_device_list(self):
         rpcapi = agent_rpc.PluginApi(topics.PLUGIN)
@@ -480,7 +483,7 @@ class RpcApiTestCase(base.BaseTestCase):
                            agent_id='fake_agent_id',
                            host='fake_host',
                            refresh_tunnels=False,
-                           version='1.8')
+                           version='1.9')
 
     def test_get_devices_details_list_and_failed_devices(self):
         rpcapi = agent_rpc.PluginApi(topics.PLUGIN)

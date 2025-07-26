@@ -19,6 +19,7 @@
 
 import copy
 import functools
+from unittest import mock
 
 import netaddr
 from neutron_lib import constants
@@ -96,7 +97,7 @@ class BaseFirewallTestCase(linux_base.BaseOVSLinuxTestCase):
     def setUp(self):
         security_config.register_securitygroups_opts()
         self.net_id = uuidutils.generate_uuid()
-        super(BaseFirewallTestCase, self).setUp()
+        super().setUp()
         self.tester, self.firewall = getattr(self, self.initialize)()
         if self.firewall_name == "openvswitch":
             self.assign_vlan_to_peers()
@@ -139,6 +140,8 @@ class BaseFirewallTestCase(linux_base.BaseOVSLinuxTestCase):
             conn_testers.OVSConnectionTester(self.ip_cidr,
                                              self.of_helper.br_int_cls))
         firewall_drv = openvswitch_firewall.OVSFirewallDriver(tester.bridge)
+        mock.patch('neutron.agent.common.ovs_lib.'
+                   'OVSBridge._set_port_dead').start()
         return tester, firewall_drv
 
     def assign_vlan_to_peers(self):
@@ -180,9 +183,11 @@ class FirewallTestCase(BaseFirewallTestCase):
         sg_rules = [{'ethertype': 'IPv4', 'direction': 'egress'},
                     {'ethertype': 'IPv6', 'direction': 'egress'},
                     {'ethertype': 'IPv4', 'direction': 'ingress',
-                     'source_ip_prefix': '0.0.0.0/0', 'protocol': 'icmp'},
+                     'source_ip_prefix': constants.IPv4_ANY,
+                     'protocol': 'icmp'},
                     {'ethertype': 'IPv6', 'direction': 'ingress',
-                     'source_ip_prefix': '0::0/0', 'protocol': 'ipv6-icmp'}]
+                     'source_ip_prefix': constants.IPv6_ANY,
+                     'protocol': 'ipv6-icmp'}]
         # make sure port ranges converge on all protocols with and without
         # port ranges (prevents regression of bug 1502924)
         for proto in ('tcp', 'udp', 'icmp'):
@@ -269,8 +274,9 @@ class FirewallTestCase(BaseFirewallTestCase):
         self._assert_sg_out_tcp_rules_appear_in_order(sg_rules)
 
     def _assert_sg_out_tcp_rules_appear_in_order(self, sg_rules):
-        outgoing_rule_pref = '-A %s-o%s' % (self.firewall.iptables.wrap_name,
-                                            self.src_port_desc['device'][3:13])
+        outgoing_rule_pref = '-A {}-o{}'.format(
+            self.firewall.iptables.wrap_name,
+            self.src_port_desc['device'][3:13])
         rules = [
             r for r in self.firewall.iptables.get_rules_for_table('filter')
             if r.startswith(outgoing_rule_pref)
@@ -557,7 +563,7 @@ class FirewallTestCase(BaseFirewallTestCase):
         self._apply_security_group_rules(self.FAKE_SECURITY_GROUP_ID, sg_rules)
         self.tester.establish_connection(**connection)
 
-        self._apply_security_group_rules(self.FAKE_SECURITY_GROUP_ID, list())
+        self._apply_security_group_rules(self.FAKE_SECURITY_GROUP_ID, [])
         self.tester.assert_no_established_connection(**connection)
 
     def test_preventing_firewall_blink(self):
@@ -621,7 +627,7 @@ class FirewallTestCase(BaseFirewallTestCase):
         # destination net unreachable
         self.tester._peer.execute([
             'sysctl', '-w', 'net.ipv4.conf.%s.forwarding=1' %
-            self.tester._peer.port.name])
+            self.tester._peer.port.name], privsep_exec=True)
         self.tester.set_vm_default_gateway(self.tester.peer_ip_address)
         vm_sg_rules = [{'ethertype': 'IPv4', 'direction': 'egress',
                         'protocol': 'icmp'}]

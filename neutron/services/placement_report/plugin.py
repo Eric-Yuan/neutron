@@ -18,6 +18,7 @@ from neutron_lib.api.definitions import agent_resources_synced
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
+from neutron_lib import constants as n_const
 from neutron_lib.placement import client as place_client
 from neutron_lib.plugins import directory
 from neutron_lib.services import base as service_base
@@ -86,7 +87,7 @@ class PlacementReportPlugin(service_base.ServicePluginBase):
             # buggy behavior. There we assumed DEFAULT.host is the same as the
             # hypervisor name, which is true in many deployments, but not
             # always. (In nova terminology: The compute host's DEFAULT.host is
-            # not neccessarily the same as the compute node name. We may even
+            # not necessarily the same as the compute node name. We may even
             # have multiple compute nodes behind a compute host.)
             # TODO(bence romsics): This else branch can be removed when we no
             # longer want to support pre-Ussuri agents.
@@ -130,6 +131,17 @@ class PlacementReportPlugin(service_base.ServicePluginBase):
                 'resource_provider_bandwidths'],
             rp_inventory_defaults=configurations[
                 'resource_provider_inventory_defaults'],
+            # RP_PP_WITHOUT_DIRECTION and RP_PP_WITH_DIRECTION are mutually
+            # exclusive options. Use the one that was provided or fallback to
+            # an empty dict.
+            rp_pkt_processing=(
+                configurations[n_const.RP_PP_WITHOUT_DIRECTION]
+                if configurations.get(
+                    n_const.RP_PP_WITHOUT_DIRECTION)
+                else configurations.get(
+                    n_const.RP_PP_WITH_DIRECTION, {})),
+            rp_pkt_processing_inventory_defaults=configurations.get(
+                n_const.RP_PP_INVENTORY_DEFAULTS, {}),
             driver_uuid_namespace=uuid_ns,
             agent_type=agent['agent_type'],
             hypervisor_rps=hypervisor_rps,
@@ -159,13 +171,21 @@ class PlacementReportPlugin(service_base.ServicePluginBase):
 
             for deferred in deferred_batch:
                 try:
-                    LOG.debug('placement client: {}'.format(deferred))
+                    LOG.debug('placement client: %s', deferred)
                     deferred.execute()
-                except Exception:
+                except Exception as e:
                     errors = True
-                    LOG.exception(
-                        'placement client call failed: %s',
-                        str(deferred))
+                    placement_error_str = \
+                        're-parenting a provider is not currently allowed'
+                    if (placement_error_str in str(e)):
+                        msg = (
+                            'placement client call failed'
+                            ' (this may be due to bug'
+                            ' https://launchpad.net/bugs/1921150): %s'
+                        )
+                    else:
+                        msg = 'placement client call failed: %s'
+                    LOG.exception(msg, str(deferred))
 
             resources_synced = not errors
             agent_db.resources_synced = resources_synced
@@ -199,7 +219,7 @@ class PlacementReportPlugin(service_base.ServicePluginBase):
             LOG.warning(
                 "The mechanism driver claims agent type supports "
                 "placement reports, but the agent does not report "
-                "'resoure_provider_bandwidths' in its configurations. "
+                "'resource_provider_bandwidths' in its configurations. "
                 "host: %(host)s, type: %(type)s",
                 {'host': agent['agent_type'],
                  'type': agent['host']})
@@ -228,7 +248,7 @@ class PlacementReportPlugin(service_base.ServicePluginBase):
                 agent['agent_type'], agent['host'])
 
 
-class PlacementReporterAgents(object):
+class PlacementReporterAgents:
 
     # Yep, this is meant to depend on ML2.
     def __init__(self, ml2_plugin):
@@ -242,12 +262,12 @@ class PlacementReporterAgents(object):
                 "You likely want to remove 'placement' from "
                 "neutron.conf: DEFAULT.service_plugins")
             raise
-        self._supported_agent_types = []
+        self._supported_agent_types = None
         self._agent_type_to_mech_driver = {}
 
     @property
     def supported_agent_types(self):
-        if not self._supported_agent_types:
+        if self._supported_agent_types is None:
             # NOTE(bence romsics): We treat the presence of the
             # RP uuid namespace a proxy for supporting placement reports from
             # the driver's agent type. But we could introduce a property/logic
@@ -256,9 +276,12 @@ class PlacementReporterAgents(object):
             self._supported_agent_types = [
                 driver.obj.agent_type
                 for driver in self._mechanism_drivers
-                if driver.obj.resource_provider_uuid5_namespace is not None]
+                if (driver.obj.resource_provider_uuid5_namespace is
+                    not None and hasattr(driver.obj, 'agent_type') and
+                    driver.obj.agent_type)]
+            supported_agents = ', '.join(self._supported_agent_types) or 'None'
             LOG.debug('agent types supporting placement reports: %s',
-                      ', '.join(self._supported_agent_types))
+                      supported_agents)
         return self._supported_agent_types
 
     def mechanism_driver_by_agent_type(self, agent_type):

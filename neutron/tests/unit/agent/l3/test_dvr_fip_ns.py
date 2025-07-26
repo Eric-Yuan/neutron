@@ -33,7 +33,7 @@ _uuid = uuidutils.generate_uuid
 
 class TestDvrFipNs(base.BaseTestCase):
     def setUp(self):
-        super(TestDvrFipNs, self).setUp()
+        super().setUp()
         self.conf = mock.Mock()
         self.conf.state_path = cfg.CONF.state_path
         self.driver = mock.Mock()
@@ -43,6 +43,10 @@ class TestDvrFipNs(base.BaseTestCase):
                                               self.conf,
                                               self.driver,
                                               use_ipv6=True)
+        self.lladdr = "fe80::f816:3eff:fe5f:9d67"
+        get_ipv6_lladdr = mock.patch("neutron.agent.linux.ip_lib."
+                                     "get_ipv6_lladdr").start()
+        get_ipv6_lladdr.return_value = "%s/64" % self.lladdr
 
     def test_subscribe(self):
         is_first = self.fip_ns.subscribe(mock.sentinel.external_net_id)
@@ -98,10 +102,11 @@ class TestDvrFipNs(base.BaseTestCase):
     @mock.patch.object(ip_lib, 'IPWrapper')
     @mock.patch.object(ip_lib, 'device_exists')
     @mock.patch.object(dvr_fip_ns.FipNamespace, 'create')
-    def test_create_gateway_port(self, fip_create, device_exists, ip_wrapper):
+    def test_create_gateway_port(self, fip_create, device_exists, IPWrapper):
         agent_gw_port = self._get_agent_gw_port()
 
         device_exists.return_value = False
+        ip_wrapper = IPWrapper()
         with mock.patch.object(self.fip_ns.driver, 'set_onlink_routes') as \
                 mock_set_onlink_routes:
             self.fip_ns.create_or_update_gateway_port(agent_gw_port)
@@ -109,6 +114,14 @@ class TestDvrFipNs(base.BaseTestCase):
         self.assertEqual(1, self.driver.plug.call_count)
         self.assertEqual(1, self.driver.init_l3.call_count)
         interface_name = self.fip_ns.get_ext_device_name(agent_gw_port['id'])
+        sysctl1 = mock.call(['sysctl', '-w', 'net.ipv4.neigh.%s.proxy_delay=1'
+                             % interface_name], check_exit_code=False,
+                            privsep_exec=True)
+        sysctl2 = mock.call(['sysctl', '-w', 'net.ipv4.conf.%s.proxy_arp=1' %
+                             interface_name], check_exit_code=False,
+                            privsep_exec=True)
+        ip_wrapper.netns.execute.assert_has_calls([sysctl1, sysctl2])
+
         gw_cidrs = [sn['cidr'] for sn in agent_gw_port['subnets']
                     if sn.get('cidr')]
         mock_set_onlink_routes.assert_called_once_with(
@@ -203,9 +216,10 @@ class TestDvrFipNs(base.BaseTestCase):
     @mock.patch.object(ip_lib.IpNetnsCommand, 'exists')
     def _test_create(self, old_kernel, exists, execute, IPTables):
         exists.return_value = True
-        # There are up to six sysctl calls - two to enable forwarding,
-        # two for arp_ignore and arp_announce, and two for ip_nonlocal_bind
-        execute.side_effect = [None, None, None, None,
+        # There are up to 3 sysctl calls - one to enable forwarding,
+        # arp_ignore and arp_announce, one for ip_nonlocal_bind, and
+        # one for nf_conntrack_tcp_be_liberal.
+        execute.side_effect = [None,
                                RuntimeError if old_kernel else None, None]
 
         self.fip_ns._iptables_manager = IPTables()
@@ -217,15 +231,16 @@ class TestDvrFipNs(base.BaseTestCase):
         bind_cmd = ['sysctl', '-w', 'net.ipv4.ip_nonlocal_bind=1']
         expected = [mock.call(netns_cmd + bind_cmd, check_exit_code=True,
                               extra_ok_codes=None, log_fail_as_error=False,
-                              run_as_root=True)]
+                              run_as_root=True, privsep_exec=True)]
 
         if old_kernel:
             expected.append(mock.call(bind_cmd, check_exit_code=True,
                                       extra_ok_codes=None,
                                       log_fail_as_error=True,
-                                      run_as_root=True))
+                                      run_as_root=True,
+                                      privsep_exec=True))
 
-        execute.assert_has_calls(expected)
+        execute.assert_has_calls(expected, any_order=True)
 
     def test_create_old_kernel(self):
         self._test_create(True)
@@ -275,8 +290,6 @@ class TestDvrFipNs(base.BaseTestCase):
         ri.ns_name = mock.sentinel.router_ns
         ri.get_ex_gw_port.return_value = {'mtu': 2000}
 
-        rtr_2_fip_name = self.fip_ns.get_rtr_ext_device_name(ri.router_id)
-        fip_2_rtr_name = self.fip_ns.get_int_device_name(ri.router_id)
         fip_ns_name = self.fip_ns.get_name()
 
         self.fip_ns.local_subnets = allocator = mock.Mock()
@@ -293,8 +306,8 @@ class TestDvrFipNs(base.BaseTestCase):
         self.fip_ns.create_rtr_2_fip_link(ri)
 
         if not dev_exists:
-            ip_wrapper.add_veth.assert_called_with(rtr_2_fip_name,
-                                                   fip_2_rtr_name,
+            ip_wrapper.add_veth.assert_called_with(device.name,
+                                                   device.name,
                                                    fip_ns_name)
 
             self.assertEqual(2, device.link.set_up.call_count)
@@ -313,8 +326,10 @@ class TestDvrFipNs(base.BaseTestCase):
         device.neigh.add.assert_has_calls(expected)
         self.assertEqual(2, device.neigh.add.call_count)
 
-        device.route.add_gateway.assert_called_once_with(
-            '169.254.31.29', table=16)
+        expected_calls = [mock.call('169.254.31.29', table=16),
+                          mock.call(self.lladdr)]
+        self.assertEqual(expected_calls,
+                         device.route.add_gateway.mock_calls)
         self.assertTrue(
             self.fip_ns._add_rtr_ext_route_rule_to_route_table.called)
 

@@ -24,7 +24,6 @@ import oslo_messaging
 from oslo_service import periodic_task
 from oslo_utils import excutils
 from osprofiler import profiler
-import six
 
 from neutron._i18n import _
 from neutron.common import utils
@@ -36,12 +35,12 @@ LOG = logging.getLogger(__name__)
 CORE_PLUGINS_NAMESPACE = 'neutron.core_plugins'
 
 
-class ManagerMeta(profiler.TracedMeta, type(periodic_task.PeriodicTasks)):
+class ManagerMeta(profiler.TracedMeta,
+                  type(periodic_task.PeriodicTasks)):  # type:ignore[misc]
     pass
 
 
-@six.add_metaclass(ManagerMeta)
-class Manager(periodic_task.PeriodicTasks):
+class Manager(periodic_task.PeriodicTasks, metaclass=ManagerMeta):
     __trace_args__ = {"name": "rpc"}
 
     # Set RPC API version to 1.0 by default.
@@ -52,7 +51,7 @@ class Manager(periodic_task.PeriodicTasks):
             host = cfg.CONF.host
         self.host = host
         conf = getattr(self, "conf", cfg.CONF)
-        super(Manager, self).__init__(conf)
+        super().__init__(conf)
 
     def periodic_tasks(self, context, raise_on_error=False):
         self.run_periodic_tasks(context, raise_on_error=raise_on_error)
@@ -91,8 +90,7 @@ def validate_pre_plugin_load():
         return msg
 
 
-@six.add_metaclass(profiler.TracedMeta)
-class NeutronManager(object):
+class NeutronManager(metaclass=profiler.TracedMeta):
     """Neutron's Manager class.
 
     Neutron's Manager class is responsible for parsing a config file and
@@ -183,8 +181,7 @@ class NeutronManager(object):
         core_plugin = directory.get_plugin()
         if core_plugin.has_native_datastore():
             return constants.DEFAULT_SERVICE_PLUGINS.keys()
-        else:
-            return []
+        return []
 
     def _load_service_plugins(self):
         """Loads service plugins.
@@ -276,16 +273,6 @@ class NeutronManager(object):
         return res_ctrl_mappings.get(
             resource,
             res_ctrl_mappings.get(resource.replace('-', '_')))
-
-    # TODO(blogan): This isn't used by anything else other than tests and
-    # probably should be removed
-    @classmethod
-    def get_service_plugin_by_path_prefix(cls, path_prefix):
-        service_plugins = directory.get_unique_plugins()
-        for service_plugin in service_plugins:
-            plugin_path_prefix = getattr(service_plugin, 'path_prefix', None)
-            if plugin_path_prefix and plugin_path_prefix == path_prefix:
-                return service_plugin
 
     @classmethod
     def add_resource_for_path_prefix(cls, resource, path_prefix):

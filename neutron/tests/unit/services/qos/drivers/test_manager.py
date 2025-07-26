@@ -10,9 +10,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import itertools
 from unittest import mock
 
 from neutron_lib.api.definitions import portbindings
+from neutron_lib.callbacks import registry
 from neutron_lib import constants as lib_consts
 from neutron_lib import context
 from neutron_lib import exceptions
@@ -20,21 +22,30 @@ from neutron_lib.services.qos import base as qos_driver_base
 from neutron_lib.services.qos import constants as qos_consts
 from oslo_utils import uuidutils
 
+from neutron.api.rpc.callbacks.producer import registry as rpc_registry
 from neutron.objects import ports as ports_object
 from neutron.objects.qos import rule as rule_object
 from neutron.services.qos.drivers import manager as driver_mgr
+from neutron.services.qos.drivers.openvswitch import driver as ovs_driver
+from neutron.services.qos.drivers.ovn import driver as ovn_driver
+from neutron.services.qos.drivers.sriov import driver as sriov_driver
 from neutron.tests.unit.services.qos import base
 
 
 class TestQosDriversManagerBase(base.BaseQosTestCase):
 
     def setUp(self):
-        super(TestQosDriversManagerBase, self).setUp()
+        super().setUp()
         self.config_parse()
         self.setup_coreplugin(load_plugins=False)
+        self._loaded_qos_drivers = []
 
-    @staticmethod
-    def _create_manager_with_drivers(drivers_details):
+    def _delete_loaded_qos_drivers(self):
+        registry._get_callback_manager().clear()
+        for idx, _ in enumerate(self._loaded_qos_drivers):
+            del self._loaded_qos_drivers[idx]
+
+    def _create_manager_with_drivers(self, drivers_details):
         for name, driver_details in drivers_details.items():
 
             class QoSDriver(qos_driver_base.DriverBase):
@@ -43,10 +54,11 @@ class TestQosDriversManagerBase(base.BaseQosTestCase):
                     return driver_details['is_loaded']
 
             # the new ad-hoc driver will register on the QOS_PLUGIN registry
-            QoSDriver(name,
-                      driver_details.get('vif_types', []),
-                      driver_details.get('vnic_types', []),
-                      driver_details.get('rules', []))
+            self._loaded_qos_drivers.append(
+                QoSDriver(name,
+                          driver_details.get('vif_types', []),
+                          driver_details.get('vnic_types', []),
+                          driver_details.get('rules', [])))
 
         return driver_mgr.QosServiceDriverManager()
 
@@ -78,7 +90,7 @@ class TestQoSDriversRulesValidations(TestQosDriversManagerBase):
     """Test validation of rules for port"""
 
     def setUp(self):
-        super(TestQoSDriversRulesValidations, self).setUp()
+        super().setUp()
         self.ctxt = context.Context('fake_user', 'fake_tenant')
 
     def _get_port(self, vif_type, vnic_type):
@@ -119,6 +131,29 @@ class TestQoSDriversRulesValidations(TestQosDriversManagerBase):
         else:
             is_rule_supported_mock.assert_not_called()
 
+    def test_validate_rule_for_network(self):
+        driver_manager = self._create_manager_with_drivers({
+            'driver-A': {
+                'is_loaded': True,
+                'rules': {
+                    qos_consts.RULE_TYPE_MINIMUM_BANDWIDTH: {
+                        "min_kbps": {'type:values': None},
+                        'direction': {
+                            'type:values': lib_consts.VALID_DIRECTIONS}
+                    }
+                }
+            }
+        })
+        rule = rule_object.QosMinimumBandwidthRule(
+            self.ctxt, id=uuidutils.generate_uuid())
+
+        is_rule_supported_mock = mock.Mock()
+        is_rule_supported_mock.return_value = True
+        driver_manager._drivers[0].is_rule_supported = is_rule_supported_mock
+        self.assertTrue(driver_manager.validate_rule_for_network(
+                         mock.Mock(), rule, mock.Mock()))
+        is_rule_supported_mock.assert_called_once_with(rule)
+
     def test_validate_rule_for_port_rule_vif_type_supported(self):
         port = self._get_port(
             portbindings.VIF_TYPE_OVS, portbindings.VNIC_NORMAL)
@@ -146,67 +181,29 @@ class TestQoSDriversRulesValidations(TestQosDriversManagerBase):
 
 class TestQosDriversManagerRules(TestQosDriversManagerBase):
     """Test supported rules"""
-    def test_available_rules_one_in_common(self):
-        driver_manager = self._create_manager_with_drivers({
-            'driver-A': {
-                'is_loaded': True,
-                'rules': {
-                    qos_consts.RULE_TYPE_BANDWIDTH_LIMIT: {
-                        "max_kbps": {'type:values': None},
-                        "max_burst_kbps": {'type:values': None}
-                    },
-                    qos_consts.RULE_TYPE_MINIMUM_BANDWIDTH: {
-                        "min_kbps": {'type:values': None},
-                        'direction': {
-                            'type:values': lib_consts.VALID_DIRECTIONS}
-                    }
-                }
-            },
-            'driver-B': {
-                'is_loaded': True,
-                'rules': {
-                    qos_consts.RULE_TYPE_MINIMUM_BANDWIDTH: {
-                        "min_kbps": {'type:values': None},
-                        'direction': {
-                            'type:values': lib_consts.VALID_DIRECTIONS}
-                    },
-                    qos_consts.RULE_TYPE_DSCP_MARKING: {
-                        "dscp_mark": {
-                            'type:values': lib_consts.VALID_DSCP_MARKS}
-                    }
-                }
-            }
-        })
-        self.assertEqual(driver_manager.supported_rule_types,
-                         set([qos_consts.RULE_TYPE_MINIMUM_BANDWIDTH]))
 
-    def test_available_rules_no_rule_in_common(self):
-        driver_manager = self._create_manager_with_drivers({
-            'driver-A': {
-                'is_loaded': True,
-                'rules': {
-                    qos_consts.RULE_TYPE_BANDWIDTH_LIMIT: {
-                        "max_kbps": {'type:values': None},
-                        "max_burst_kbps": {'type:values': None}
-                    }
-                }
-            },
-            'driver-B': {
-                'is_loaded': True,
-                'rules': {
-                    qos_consts.RULE_TYPE_MINIMUM_BANDWIDTH: {
-                        "min_kbps": {'type:values': None},
-                        'direction': {
-                            'type:values': lib_consts.VALID_DIRECTIONS}
-                    },
-                    qos_consts.RULE_TYPE_DSCP_MARKING: {
-                        "dscp_mark": {
-                            'type:values': lib_consts.VALID_DSCP_MARKS}
-                    }
-                }
-            }
-        })
-        self.assertEqual(driver_manager.supported_rule_types, set([]))
+    @mock.patch.object(rpc_registry, 'provide')
+    def test_available_rules(self, *args):
+        available_drivers = {'ovs': ovs_driver.SUPPORTED_RULES,
+                             'ovn': ovn_driver.SUPPORTED_RULES,
+                             'sriov': sriov_driver.SUPPORTED_RULES}
+        for drivers in itertools.combinations(available_drivers, 2):
+            rules_0 = set(available_drivers[drivers[0]])
+            rules_1 = set(available_drivers[drivers[1]])
+            driver_manager = self._create_manager_with_drivers(
+                {drivers[0]: {'is_loaded': True, 'rules': rules_0},
+                 drivers[1]: {'is_loaded': True, 'rules': rules_1}})
+            self.assertEqual(
+                driver_manager.supported_rule_types(),
+                rules_0 & rules_1)
+            self.assertEqual(
+                driver_manager.supported_rule_types(all_supported=True),
+                rules_0 | rules_1)
+            self.assertEqual(
+                driver_manager.supported_rule_types(all_rules=True),
+                set(qos_consts.VALID_RULE_TYPES))
+
+            self._delete_loaded_qos_drivers()
 
     def test__parse_parameter_values(self):
         range_parameter = {'type:range': [0, 10]}
@@ -296,7 +293,7 @@ class TestQosDriversCalls(TestQosDriversManagerBase):
     """Test QoS driver calls"""
 
     def setUp(self):
-        super(TestQosDriversCalls, self).setUp()
+        super().setUp()
         self.driver_manager = self._create_manager_with_drivers(
             {'driver-A': {'is_loaded': True}})
 

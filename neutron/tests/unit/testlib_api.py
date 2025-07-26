@@ -13,7 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
 import testresources
 import testscenarios
 import testtools
@@ -24,11 +23,11 @@ from oslo_config import cfg
 from oslo_db import exception as oslodb_exception
 from oslo_db.sqlalchemy import provision
 
+from neutron.api import wsgi
 from neutron.db.migration import cli as migration
 # Import all data models
 from neutron.db.migration.models import head  # noqa
 from neutron.tests import base
-from neutron import wsgi
 
 
 class ExpectedException(testtools.ExpectedException):
@@ -36,9 +35,9 @@ class ExpectedException(testtools.ExpectedException):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if super(ExpectedException, self).__exit__(exc_type,
-                                                   exc_value,
-                                                   traceback):
+        if super().__exit__(exc_type,
+                            exc_value,
+                            traceback):
             self.exception = exc_value
             return True
         return False
@@ -48,7 +47,7 @@ def create_request(path, body, content_type, method='GET',
                    query_string=None, context=None, headers=None):
     headers = headers or {}
     if query_string:
-        url = "%s?%s" % (path, query_string)
+        url = f"{path}?{query_string}"
     else:
         url = path
     req = wsgi.Request.blank(url)
@@ -56,7 +55,7 @@ def create_request(path, body, content_type, method='GET',
     req.headers = {}
     req.headers['Accept'] = content_type
     req.headers.update(headers)
-    if isinstance(body, six.text_type):
+    if isinstance(body, str):
         req.body = body.encode()
     else:
         req.body = body
@@ -77,14 +76,13 @@ class StaticSqlFixtureNoSchema(lib_fixtures.SqlFixture):
     def _init_resources(cls):
         if cls._GLOBAL_RESOURCES:
             return
-        else:
-            cls._GLOBAL_RESOURCES = True
-            cls.database_resource = provision.DatabaseResource(
-                "sqlite", db_api.get_context_manager())
-            dependency_resources = {}
-            for name, resource in cls.database_resource.resources:
-                dependency_resources[name] = resource.getResource()
-            cls.engine = dependency_resources['backend'].engine
+        cls._GLOBAL_RESOURCES = True
+        cls.database_resource = provision.DatabaseResource(
+            "sqlite", db_api.get_context_manager())
+        dependency_resources = {}
+        for name, resource in cls.database_resource.resources:
+            dependency_resources[name] = resource.getResource()
+        cls.engine = dependency_resources['backend'].engine
 
     def _delete_from_schema(self, engine):
         pass
@@ -101,7 +99,7 @@ class OpportunisticSqlFixture(lib_fixtures.SqlFixture):
     DRIVER = 'sqlite'
 
     def __init__(self, test):
-        super(OpportunisticSqlFixture, self).__init__()
+        super().__init__()
         self.test = test
 
     @classmethod
@@ -118,21 +116,26 @@ class OpportunisticSqlFixture(lib_fixtures.SqlFixture):
 
     def _delete_from_schema(self, engine):
         if self.test.BUILD_SCHEMA:
-            super(OpportunisticSqlFixture, self)._delete_from_schema(engine)
+            super()._delete_from_schema(engine)
 
     def _init_resources(self):
         testresources.setUpResources(
             self.test, self.test.resources, testresources._get_result())
-        self.addCleanup(
-            testresources.tearDownResources,
-            self.test, self.test.resources, testresources._get_result()
-        )
+        self.addCleanup(self._cleanup_resources)
 
         # unfortunately, fixtures won't let us call a skip() from
         # here.  So the test has to check this also.
         # see https://github.com/testing-cabal/fixtures/issues/31
         if hasattr(self.test, 'db'):
             self.engine = self.test.engine = self.test.db.engine
+
+    def _cleanup_resources(self):
+        testresources.tearDownResources(
+            self.test, self.test.resources, testresources._get_result())
+
+        if self.test.CLEAN_DB_AFTER_TEST:
+            self.test._database_resources.pop(self.test.DRIVER)
+            self.test._schema_resources.pop((self.test.DRIVER, None))
 
     @classmethod
     def resources_collection(cls, test):
@@ -169,17 +172,14 @@ class OpportunisticSqlFixture(lib_fixtures.SqlFixture):
                 ('schema', schema_resource),
                 ('db', database_resource)
             ]
-        else:
-            return [
-                ('db', database_resource)
-            ]
+        return [('db', database_resource)]
 
 
-class BaseSqlTestCase(object):
+class BaseSqlTestCase:
     BUILD_SCHEMA = True
 
     def setUp(self):
-        super(BaseSqlTestCase, self).setUp()
+        super().setUp()
 
         self._setup_database_fixtures()
 
@@ -200,7 +200,7 @@ class SqlTestCase(BaseSqlTestCase, base.BaseTestCase):
     """regular sql test"""
 
 
-class OpportunisticDBTestMixin(object):
+class OpportunisticDBTestMixin:
     """Mixin that converts a BaseSqlTestCase to use the
     OpportunisticSqlFixture.
     """
@@ -210,6 +210,7 @@ class OpportunisticDBTestMixin(object):
     FIXTURE = OpportunisticSqlFixture
 
     BUILD_WITH_MIGRATIONS = False
+    CLEAN_DB_AFTER_TEST = False
 
     def _setup_database_fixtures(self):
         self.useFixture(self.FIXTURE(self))
@@ -218,8 +219,7 @@ class OpportunisticDBTestMixin(object):
             msg = "backend '%s' unavailable" % self.DRIVER
             if self.SKIP_ON_UNAVAILABLE_DB:
                 self.skipTest(msg)
-            else:
-                self.fail(msg)
+            self.fail(msg)
 
     _schema_resources = {}
     _database_resources = {}
@@ -255,15 +255,6 @@ class MySQLTestCaseMixin(OpportunisticDBTestMixin):
     DRIVER = "mysql"
 
 
-class PostgreSQLTestCaseMixin(OpportunisticDBTestMixin):
-    """Mixin that turns any BaseSqlTestCase into a PostgresSQL test suite.
-
-    If the PostgreSQL db is unavailable then this test is skipped, unless
-    OS_FAIL_ON_MISSING_DEPS is enabled.
-    """
-    DRIVER = "postgresql"
-
-
 def module_load_tests(loader, found_tests, pattern):
     """Apply OptimisingTestSuite on a per-module basis.
 
@@ -285,7 +276,7 @@ class WebTestCase(SqlTestCase):
     fmt = 'json'
 
     def setUp(self):
-        super(WebTestCase, self).setUp()
+        super().setUp()
         json_deserializer = wsgi.JSONDeserializer()
         self._deserializers = {
             'application/json': json_deserializer,
@@ -302,7 +293,7 @@ class WebTestCase(SqlTestCase):
         return result
 
 
-class SubDictMatch(object):
+class SubDictMatch:
 
     def __init__(self, sub_dict):
         self.sub_dict = sub_dict

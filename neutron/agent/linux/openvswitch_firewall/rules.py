@@ -16,13 +16,13 @@
 import collections
 
 import netaddr
+from neutron_lib.agent.common import constants as agent_consts
 from neutron_lib import constants as n_consts
+from neutron_lib.plugins.ml2 import ovs_constants as ovs_consts
 
 from neutron._i18n import _
 from neutron.agent.linux.openvswitch_firewall import constants as ovsfw_consts
 from neutron.common import utils
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants \
-        as ovs_consts
 
 CT_STATES = [
     ovsfw_consts.OF_STATE_ESTABLISHED_NOT_REPLY,
@@ -158,10 +158,13 @@ def merge_port_ranges(rule_conj_list):
 def flow_priority_offset(rule, conjunction=False):
     """Calculate flow priority offset from rule.
     Whether the rule belongs to conjunction flows or not is decided
-    upon existence of rule['remote_group_id'] but can be overridden
+    upon existence of rule['remote_group_id'] or
+    rule['remote_address_group_id'] but can be overridden
     to be True using the optional conjunction arg.
     """
-    conj_offset = 0 if 'remote_group_id' in rule or conjunction else 4
+    conj_offset = 0 if 'remote_group_id' in rule or \
+                       'remote_address_group_id' in rule or \
+                       conjunction else 4
     protocol = rule.get('protocol')
     if protocol is None:
         return conj_offset
@@ -169,7 +172,7 @@ def flow_priority_offset(rule, conjunction=False):
     if protocol in [n_consts.PROTO_NUM_ICMP, n_consts.PROTO_NUM_IPV6_ICMP]:
         if 'port_range_min' not in rule:
             return conj_offset + 1
-        elif 'port_range_max' not in rule:
+        if 'port_range_max' not in rule:
             return conj_offset + 2
     return conj_offset + 3
 
@@ -186,18 +189,18 @@ def create_flows_from_rule_and_port(rule, port, conjunction=False):
     flow_template = {
         'priority': 70 + flow_priority_offset(rule, conjunction),
         'dl_type': ovsfw_consts.ethertype_to_dl_type_map[ethertype],
-        'reg_port': port.ofport,
+        agent_consts.PORT_REG_NAME: port.ofport,
     }
 
     if is_valid_prefix(dst_ip_prefix):
         flow_template[FLOW_FIELD_FOR_IPVER_AND_DIRECTION[(
             utils.get_ip_version(dst_ip_prefix), n_consts.EGRESS_DIRECTION)]
-        ] = dst_ip_prefix
+                     ] = dst_ip_prefix
 
     if is_valid_prefix(src_ip_prefix):
         flow_template[FLOW_FIELD_FOR_IPVER_AND_DIRECTION[(
             utils.get_ip_version(src_ip_prefix), n_consts.INGRESS_DIRECTION)]
-        ] = src_ip_prefix
+                     ] = src_ip_prefix
 
     flows = create_protocol_flows(direction, flow_template, port, rule)
 
@@ -208,7 +211,7 @@ def populate_flow_common(direction, flow_template, port):
     """Initialize common flow fields."""
     if direction == n_consts.INGRESS_DIRECTION:
         flow_template['table'] = ovs_consts.RULES_INGRESS_TABLE
-        flow_template['actions'] = "output:{:d}".format(port.ofport)
+        flow_template['actions'] = f"output:{port.ofport:d}"
     elif direction == n_consts.EGRESS_DIRECTION:
         flow_template['table'] = ovs_consts.RULES_EGRESS_TABLE
         # Traffic can be both ingress and egress, check that no ingress rules
@@ -239,10 +242,10 @@ def create_port_range_flows(flow_template, rule):
     if protocol is None:
         return []
     flows = []
-    src_port_match = '{:s}_src'.format(protocol)
+    src_port_match = f'{protocol:s}_src'
     src_port_min = rule.get('source_port_range_min')
     src_port_max = rule.get('source_port_range_max')
-    dst_port_match = '{:s}_dst'.format(protocol)
+    dst_port_match = f'{protocol:s}_dst'
     dst_port_min = rule.get('port_range_min')
     dst_port_max = rule.get('port_range_max')
 
@@ -286,18 +289,17 @@ def create_icmp_flows(flow_template, rule):
 
 
 def _flow_priority_offset_from_conj_id(conj_id):
-    "Return a flow priority offset encoded in a conj_id."
+    """Return a flow priority offset encoded in a conj_id."""
     # A base conj_id, which is returned by ConjIdMap.get_conj_id, is a
     # multiple of 8, and we use 2 conj_ids per offset.
     return conj_id % 8 // 2
 
 
-def create_flows_for_ip_address(ip_address, direction, ethertype,
-                                vlan_tag, conj_ids):
-    """Create flows from a rule and an ip_address derived from
-    remote_group_id
+def create_flows_for_ip_address_and_mac(ip_address, mac_address, direction,
+                                        ethertype, vlan_tag, conj_ids):
+    """Create flows from a rule, ip, and mac addresses derived from
+    remote_group_id or remote_address_group_id.
     """
-    ip_address, mac_address = ip_address
     net = netaddr.IPNetwork(str(ip_address))
     any_src_ip = net.prefixlen == 0
 
@@ -311,7 +313,7 @@ def create_flows_for_ip_address(ip_address, direction, ethertype,
 
     flow_template = {
         'dl_type': ovsfw_consts.ethertype_to_dl_type_map[ethertype],
-        'reg_net': vlan_tag,  # needed for project separation
+        agent_consts.NET_REG_NAME: vlan_tag,  # needed for project separation
     }
 
     ip_ver = utils.get_ip_version(ip_prefix)
@@ -324,7 +326,9 @@ def create_flows_for_ip_address(ip_address, direction, ethertype,
     flow_template[FLOW_FIELD_FOR_IPVER_AND_DIRECTION[(
         ip_ver, direction)]] = ip_prefix
 
-    if any_src_ip:
+    if any_src_ip and mac_address:
+        # A remote address group can contain an any_src_ip without
+        # mac_address and in that case we don't set the dl_src.
         flow_template['dl_src'] = mac_address
 
     result = []
@@ -345,7 +349,7 @@ def create_accept_flows(flow):
         flow['actions'] = (
             'ct(commit,zone=NXM_NX_REG{:d}[0..15]),{:s},'
             'resubmit(,{:d})'.format(
-                ovsfw_consts.REG_NET, flow['actions'],
+                agent_consts.REG_NET, flow['actions'],
                 ovs_consts.ACCEPTED_INGRESS_TRAFFIC_TABLE)
         )
     result.append(flow)
@@ -376,7 +380,7 @@ def create_conj_flows(port, conj_id, direction, ethertype):
         # The matching is redundant as it has been done by
         # conjunction(...,2/2) flows and flows can be summarized
         # without this.
-        'reg_port': port.ofport,
+        agent_consts.PORT_REG_NAME: port.ofport,
     }
     flow_template = populate_flow_common(direction, flow_template, port)
     flows = create_accept_flows(flow_template)

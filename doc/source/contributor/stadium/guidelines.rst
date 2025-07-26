@@ -152,7 +152,7 @@ To release a sub-project, follow the following steps:
   other Neutron projects. You can skip this step if you don't have a version in
   setup.cfg.
 * A sub-project owner `proposes
-  <https://opendev.org/openstack/releases/tree/README.rst>`_ a patch
+  <https://opendev.org/openstack/releases/src/README.rst>`_ a patch
   to openstack/releases repository with the intended git hash. `The Neutron
   release liaison <https://wiki.openstack.org/wiki/CrossProjectLiaisons#Release_management>`_
   should be added in Gerrit to the list of reviewers for the patch.
@@ -174,7 +174,7 @@ To release a sub-project, follow the following steps:
 * The Neutron release liaison votes with +1 for the openstack/releases patch.
 * The releases will now be on PyPI. A sub-project owner should verify this by
   going to an URL similar to
-  `this <https://pypi.org/simple/networking-odl>`_.
+  `this <https://pypi.org/simple/networking-sfc>`_.
 * A sub-project owner should next go to Launchpad and release this version
   using the "Release Now" button for the release itself.
 * If a sub-project uses the "delay-release" option, a sub-project owner should
@@ -210,7 +210,7 @@ To make a branch end of life, follow the following steps:
 * A sub-project owner should request the infrastructure team to delete
   the branch by sending an email to the infrastructure mailing list, not by
   bothering the infrastructure team on IRC.
-* A sub-project owner should tweak jenkins jobs in project-config if any.
+* A sub-project owner should tweak zuul jobs in project-config if any.
 
 References
 ~~~~~~~~~~

@@ -14,6 +14,8 @@
 
 from unittest import mock
 
+import copy
+
 import netaddr
 from neutron_lib.api.definitions import dns as dns_apidef
 from neutron_lib.utils import net as n_net
@@ -22,21 +24,36 @@ from ovsdbapp.backend.ovs_idl import idlutils
 
 from neutron.common.ovn import constants as ovn_const
 from neutron.common.ovn import utils
+from neutron.common import utils as n_utils
 from neutron.conf.plugins.ml2.drivers.ovn import ovn_conf as ovn_config
+from neutron.db import ovn_revision_numbers_db as rev_db
 from neutron.tests.functional import base
 
 
 class TestNBDbResources(base.TestOVNFunctionalBase):
     _extension_drivers = ['dns']
 
+    def _is_nb_global_ready(self):
+        try:
+            next(iter(self.nb_api.tables['NB_Global'].rows))
+        except StopIteration:
+            return False
+        return True
+
     def setUp(self):
-        super(TestNBDbResources, self).setUp()
+        super().setUp()
         self.orig_get_random_mac = n_net.get_random_mac
         cfg.CONF.set_override('quota_subnet', -1, group='QUOTAS')
         ovn_config.cfg.CONF.set_override('ovn_metadata_enabled',
                                          False,
                                          group='ovn')
         ovn_config.cfg.CONF.set_override('dns_domain', 'ovn.test')
+
+        # Wait for NB_Global table, for details see: LP #1956965
+        n_utils.wait_until_true(
+            self._is_nb_global_ready,
+            timeout=15, sleep=1
+        )
 
     # FIXME(lucasagomes): Map the revision numbers properly instead
     # of stripping them out. Currently, tests like test_dhcp_options()
@@ -56,7 +73,7 @@ class TestNBDbResources(base.TestOVNFunctionalBase):
                 'cidr': row.cidr, 'external_ids': ext_ids,
                 'options': row.options})
 
-        self.assertItemsEqual(expected_dhcp_options_rows,
+        self.assertCountEqual(expected_dhcp_options_rows,
                               observed_dhcp_options_rows)
 
     def _verify_dhcp_option_row_for_port(self, port_id,
@@ -96,7 +113,7 @@ class TestNBDbResources(base.TestOVNFunctionalBase):
 
     def _get_subnet_dhcp_mac(self, subnet):
         mac_key = 'server_id' if subnet['ip_version'] == 6 else 'server_mac'
-        dhcp_options = self.mech_driver._nb_ovn.get_subnet_dhcp_options(
+        dhcp_options = self.mech_driver.nb_ovn.get_subnet_dhcp_options(
             subnet['id'])['subnet']
         return dhcp_options.get('options', {}).get(
             mac_key) if dhcp_options else None
@@ -360,7 +377,7 @@ class TestNBDbResources(base.TestOVNFunctionalBase):
                         'mtu': str(n1['network']['mtu']),
                         'router': subnet['gateway_ip'],
                         'ip_forward_enable': '1',
-                        'tftp_server': '10.0.0.100',
+                        'tftp_server': '"10.0.0.100"',
                         'domain_name': '"%s"' % cfg.CONF.dns_domain,
                         'dns_server': '20.20.20.20'}}
         expected_dhcp_v4_options_rows['v4-' + p2['port']['id']] = \
@@ -424,7 +441,7 @@ class TestNBDbResources(base.TestOVNFunctionalBase):
                         'dns_server': '{10.10.10.10}',
                         'mtu': str(n1['network']['mtu']),
                         'router': subnet['gateway_ip'],
-                        'tftp_server': '100.0.0.100'}}
+                        'tftp_server': '"100.0.0.100"'}}
         expected_dhcp_v4_options_rows['v4-' + p4['port']['id']] = \
             expected_dhcp_options_rows['v4-' + p4['port']['id']]
         expected_dhcp_v6_options_rows['v6-' + p4['port']['id']] = \
@@ -692,7 +709,7 @@ class TestNBDbResources(base.TestOVNFunctionalBase):
                         'dns_server': '{10.10.10.10}',
                         'mtu': '1200',
                         'router': subnet['gateway_ip'],
-                        'tftp_server': '8.8.8.8'}}
+                        'tftp_server': '"8.8.8.8"'}}
         self._verify_dhcp_option_rows(expected_dhcp_options_rows)
         self._verify_dhcp_option_row_for_port(
             p1['id'], expected_dhcp_options_rows['v4-' + p1['id']],
@@ -758,13 +775,14 @@ class TestNBDbResources(base.TestOVNFunctionalBase):
         # is not configured as domain_name.
         # Parameter taken from configuration
         # should be set instead.
+        mtu = str(1480 - cfg.CONF.ml2_type_geneve.max_header_size)
         expected_dhcp_options_rows = {
             'cidr': '10.0.0.0/24',
             'external_ids': {'subnet_id': subnet['id']},
             'options': {'dns_server': '{10.10.10.10}',
                         'domain_name': '"%s"' % cfg.CONF.dns_domain,
                         'lease_time': '43200',
-                        'mtu': '1450',
+                        'mtu': mtu,
                         'router': '10.0.0.1',
                         'server_id': '10.0.0.1',
                         'server_mac': dhcp_mac}}
@@ -779,13 +797,14 @@ class TestNBDbResources(base.TestOVNFunctionalBase):
         p = self._make_port(self.fmt, n1['network']['id'],
                             fixed_ips=[{'subnet_id': subnet['id']}])
         dhcp_mac = self._get_subnet_dhcp_mac(subnet)
+        mtu = str(1480 - cfg.CONF.ml2_type_geneve.max_header_size)
         # Make sure that domain_name is not included.
         expected_dhcp_options_rows = {
             'cidr': '10.0.0.0/24',
             'external_ids': {'subnet_id': subnet['id']},
             'options': {'dns_server': '{10.10.10.10}',
                         'lease_time': '43200',
-                        'mtu': '1450',
+                        'mtu': mtu,
                         'router': '10.0.0.1',
                         'server_id': '10.0.0.1',
                         'server_mac': dhcp_mac}}
@@ -821,104 +840,10 @@ class TestPortSecurity(base.TestOVNFunctionalBase):
         return port_acls
 
     def _verify_port_acls(self, port_id, expected_acls):
-        if self.nb_api.is_port_groups_supported():
-            port_acls = self._get_port_related_acls(port_id)
-        else:
-            port_acls = self._get_port_related_acls_port_group_not_supported(
-                port_id)
-        self.assertItemsEqual(expected_acls, port_acls)
-
-    @mock.patch('neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb.'
-                'impl_idl_ovn.OvsdbNbOvnIdl.is_port_groups_supported',
-                lambda *args: False)
-    def test_port_security_port_group_not_supported(self):
-        n1 = self._make_network(self.fmt, 'n1', True)
-        res = self._create_subnet(self.fmt, n1['network']['id'], '10.0.0.0/24')
-        subnet = self.deserialize(self.fmt, res)['subnet']
-        p = self._make_port(self.fmt, n1['network']['id'],
-                            fixed_ips=[{'subnet_id': subnet['id']}])
-        port_id = p['port']['id']
-        sg_id = p['port']['security_groups'][0].replace('-', '_')
-        expected_acls_with_sg_ps_enabled = [
-            {'match': 'inport == "' + str(port_id) + '" && ip',
-             'action': 'drop',
-             'priority': 1001,
-             'direction': 'from-lport'},
-            {'match': 'outport == "' + str(port_id) + '" && ip',
-             'action': 'drop',
-             'priority': 1001,
-             'direction': 'to-lport'},
-            {'match': 'inport == "' + str(port_id) + '" && ip4 && ip4.dst == '
-                      '{255.255.255.255, 10.0.0.0/24} && udp && udp.src == 68 '
-                      '&& udp.dst == 67',
-             'action': 'allow',
-             'priority': 1002,
-             'direction': 'from-lport'},
-            {'match': 'inport == "' + str(port_id) + '" && ip6',
-             'action': 'allow-related',
-             'priority': 1002,
-             'direction': 'from-lport'},
-            {'match': 'inport == "' + str(port_id) + '" && ip4',
-             'action': 'allow-related',
-             'priority': 1002,
-             'direction': 'from-lport'},
-            {'match': 'outport == "' + str(port_id) + '" && ip4 && '
-                      'ip4.src == $as_ip4_' + str(sg_id),
-             'action': 'allow-related',
-             'priority': 1002,
-             'direction': 'to-lport'},
-            {'match': 'outport == "' + str(port_id) + '" && ip6 && '
-                      'ip6.src == $as_ip6_' + str(sg_id),
-             'action': 'allow-related',
-             'priority': 1002,
-             'direction': 'to-lport'},
-        ]
-        self._verify_port_acls(port_id, expected_acls_with_sg_ps_enabled)
-
-        # clear the security groups.
-        data = {'port': {'security_groups': []}}
-        port_req = self.new_update_request('ports', data, p['port']['id'])
-        port_req.get_response(self.api)
-
-        # No security groups and port security enabled - > ACLs should be
-        # added to drop the packets.
-        expected_acls_with_no_sg_ps_enabled = [
-            {'match': 'inport == "' + str(port_id) + '" && ip',
-             'action': 'drop',
-             'priority': 1001,
-             'direction': 'from-lport'},
-            {'match': 'outport == "' + str(port_id) + '" && ip',
-             'action': 'drop',
-             'priority': 1001,
-             'direction': 'to-lport'},
-        ]
-        self._verify_port_acls(port_id, expected_acls_with_no_sg_ps_enabled)
-
-        # Disable port security
-        data = {'port': {'port_security_enabled': False}}
-        port_req = self.new_update_request('ports', data, p['port']['id'])
-        port_req.get_response(self.api)
-        # No security groups and port security disabled - > No ACLs should be
-        # added (allowing all the traffic).
-        self._verify_port_acls(port_id, [])
-
-        # Enable port security again with no security groups - > ACLs should
-        # be added back to drop the packets.
-        data = {'port': {'port_security_enabled': True}}
-        port_req = self.new_update_request('ports', data, p['port']['id'])
-        port_req.get_response(self.api)
-        self._verify_port_acls(port_id, expected_acls_with_no_sg_ps_enabled)
-
-        # Set security groups back
-        data = {'port': {'security_groups': p['port']['security_groups']}}
-        port_req = self.new_update_request('ports', data, p['port']['id'])
-        port_req.get_response(self.api)
-        self._verify_port_acls(port_id, expected_acls_with_sg_ps_enabled)
+        port_acls = self._get_port_related_acls(port_id)
+        self.assertCountEqual(expected_acls, port_acls)
 
     def test_port_security_port_group(self):
-        if not self.nb_api.is_port_groups_supported():
-            self.skipTest('Port groups is not supported')
-
         n1 = self._make_network(self.fmt, 'n1', True)
         res = self._create_subnet(self.fmt, n1['network']['id'], '10.0.0.0/24')
         subnet = self.deserialize(self.fmt, res)['subnet']
@@ -998,6 +923,31 @@ class TestPortSecurity(base.TestOVNFunctionalBase):
         self._verify_port_acls(port_id, expected_acls_with_sg_ps_enabled)
 
 
+class TestSecurityGroups(base.TestOVNFunctionalBase):
+
+    def test_security_group_creation_and_deletion(self):
+        sg = self._make_security_group(self.fmt)['security_group']
+        rev_num = rev_db.get_revision_row(self.context, sg['id'])
+        self.assertEqual(1, rev_num.revision_number)
+        for sg_rule in sg['security_group_rules']:
+            rev_num = rev_db.get_revision_row(self.context, sg_rule['id'])
+            self.assertEqual(0, rev_num.revision_number)
+
+        # Retrieve the ACL UUIDs before deleting the Port_Group; this operation
+        # will also delete the associated ACLs.
+        pg_name = utils.ovn_port_group_name(sg['id'])
+        pg = self.nb_api.pg_get(pg_name).execute(check_errors=True)
+        acl_uuids = [acl.uuid for acl in pg.acls]
+        self._delete('security-groups', sg['id'])
+        self.assertIsNone(rev_db.get_revision_row(self.context, sg['id']))
+        for sg_rule in sg['security_group_rules']:
+            self.assertIsNone(rev_db.get_revision_row(self.context,
+                                                      sg_rule['id']))
+        for acl_uuid in acl_uuids:
+            self.assertIsNone(
+                self.nb_api.lookup('ACL', acl_uuid, default=None))
+
+
 class TestDNSRecords(base.TestOVNFunctionalBase):
     _extension_drivers = ['port_security', 'dns']
 
@@ -1007,7 +957,7 @@ class TestDNSRecords(base.TestOVNFunctionalBase):
             observed_dns_records.append(
                 {'external_ids': dns_row.external_ids,
                  'records': dns_row.records})
-        self.assertItemsEqual(expected_dns_records, observed_dns_records)
+        self.assertCountEqual(expected_dns_records, observed_dns_records)
 
     def _validate_ls_dns_records(self, lswitch_name, expected_dns_records):
         ls = idlutils.row_by_value(self.nb_api.idl,
@@ -1017,11 +967,11 @@ class TestDNSRecords(base.TestOVNFunctionalBase):
             observed_dns_records.append(
                 {'external_ids': dns_row.external_ids,
                  'records': dns_row.records})
-        self.assertItemsEqual(expected_dns_records, observed_dns_records)
+        self.assertCountEqual(expected_dns_records, observed_dns_records)
 
     def setUp(self):
         ovn_config.cfg.CONF.set_override('dns_domain', 'ovn.test')
-        super(TestDNSRecords, self).setUp()
+        super().setUp()
 
     def test_dns_records(self):
         expected_dns_records = []
@@ -1056,6 +1006,9 @@ class TestDNSRecords(base.TestOVNFunctionalBase):
              'records': {'n1p1': port_ips, 'n1p1.ovn.test': port_ips,
                          'n1p1.net-n1': port_ips}}
         ]
+        for ip in port_ips.split(" "):
+            p_record = netaddr.IPAddress(ip).reverse_dns.rstrip(".")
+            expected_dns_records[0]['records'][p_record] = 'n1p1.ovn.test'
 
         self._validate_dns_records(expected_dns_records)
         self._validate_ls_dns_records(n1_lswitch_name,
@@ -1081,6 +1034,9 @@ class TestDNSRecords(base.TestOVNFunctionalBase):
         expected_dns_records.append(
             {'external_ids': {'ls_name': n2_lswitch_name},
              'records': {'n2p1': port_ips, 'n2p1.ovn.test': port_ips}})
+        for ip in port_ips.split(" "):
+            p_record = netaddr.IPAddress(ip).reverse_dns.rstrip(".")
+            expected_dns_records[1]['records'][p_record] = 'n2p1.ovn.test'
         self._validate_dns_records(expected_dns_records)
         self._validate_ls_dns_records(n1_lswitch_name,
                                       [expected_dns_records[0]])
@@ -1098,6 +1054,9 @@ class TestDNSRecords(base.TestOVNFunctionalBase):
         expected_dns_records[0]['records']['n1p2'] = port_ips
         expected_dns_records[0]['records']['n1p2.ovn.test'] = port_ips
         expected_dns_records[0]['records']['n1p2.net-n1'] = port_ips
+        for ip in port_ips.split(" "):
+            p_record = netaddr.IPAddress(ip).reverse_dns.rstrip(".")
+            expected_dns_records[0]['records'][p_record] = 'n1p2.ovn.test'
         self._validate_dns_records(expected_dns_records)
         self._validate_ls_dns_records(n1_lswitch_name,
                                       [expected_dns_records[0]])
@@ -1111,6 +1070,11 @@ class TestDNSRecords(base.TestOVNFunctionalBase):
         res = req.get_response(self.api)
         self.assertEqual(200, res.status_int)
         expected_dns_records[0]['records'].pop('n1p1')
+        port_ips = " ".join([f['ip_address']
+                             for f in n1p1['port']['fixed_ips']])
+        for ip in port_ips.split(" "):
+            p_record = netaddr.IPAddress(ip).reverse_dns.rstrip(".")
+            expected_dns_records[0]['records'].pop(p_record)
         expected_dns_records[0]['records'].pop('n1p1.ovn.test')
         expected_dns_records[0]['records'].pop('n1p1.net-n1')
         self._validate_dns_records(expected_dns_records)
@@ -1140,6 +1104,69 @@ class TestDNSRecords(base.TestOVNFunctionalBase):
         self._delete('ports', n1p2['port']['id'])
         self._delete('networks', nets[0]['network']['id'])
         self._validate_dns_records([])
+
+
+class TestPortExternalIds(base.TestOVNFunctionalBase):
+
+    def _get_lsp_external_id(self, port_id):
+        ovn_port = self.nb_api.lookup('Logical_Switch_Port', port_id)
+        return copy.deepcopy(ovn_port.external_ids)
+
+    def _set_lsp_external_id(self, port_id, **pairs):
+        external_ids = self._get_lsp_external_id(port_id)
+        for key, val in pairs.items():
+            external_ids[key] = val
+        self.nb_api.set_lswitch_port(lport_name=port_id,
+                                     external_ids=external_ids).execute()
+
+    def _create_lsp(self):
+        n1 = self._make_network(self.fmt, 'n1', True)
+        res = self._create_subnet(self.fmt, n1['network']['id'], '10.0.0.0/24')
+        subnet = self.deserialize(self.fmt, res)['subnet']
+        p = self._make_port(self.fmt, n1['network']['id'],
+                            fixed_ips=[{'subnet_id': subnet['id']}])
+        port_id = p['port']['id']
+        return port_id, self._get_lsp_external_id(port_id)
+
+    def test_port_update_has_ext_ids(self):
+        port_id, ext_ids = self._create_lsp()
+        self.assertIsNotNone(ext_ids)
+
+    def test_port_update_add_ext_id(self):
+        port_id, ext_ids = self._create_lsp()
+        ext_ids['another'] = 'value'
+        self._set_lsp_external_id(port_id, another='value')
+        self.assertEqual(ext_ids, self._get_lsp_external_id(port_id))
+
+    def test_port_update_change_ext_id_value(self):
+        port_id, ext_ids = self._create_lsp()
+        ext_ids['another'] = 'value'
+        self._set_lsp_external_id(port_id, another='value')
+        self.assertEqual(ext_ids, self._get_lsp_external_id(port_id))
+        ext_ids['another'] = 'value2'
+        self._set_lsp_external_id(port_id, another='value2')
+        self.assertEqual(ext_ids, self._get_lsp_external_id(port_id))
+
+    def test_port_update_with_foreign_ext_ids(self):
+        port_id, ext_ids = self._create_lsp()
+        new_ext_ids = {ovn_const.OVN_PORT_FIP_EXT_ID_KEY: '1.11.11.1',
+                       'foreign_key2': 'value1234'}
+        self._set_lsp_external_id(port_id, **new_ext_ids)
+        ext_ids.update(new_ext_ids)
+        self.assertEqual(ext_ids, self._get_lsp_external_id(port_id))
+        # invoke port update and make sure the the values we added to the
+        # external_ids remain undisturbed.
+        data = {'port': {'extra_dhcp_opts': [{'ip_version': 4,
+                                              'opt_name': 'ip-forward-enable',
+                                              'opt_value': '0'}]}}
+        port_req = self.new_update_request('ports', data, port_id)
+        port_req.get_response(self.api)
+        actual_ext_ids = self._get_lsp_external_id(port_id)
+        # update port should have not removed keys it does not use from the
+        # external ids of the lsp.
+        self.assertEqual('1.11.11.1',
+                         actual_ext_ids.get(ovn_const.OVN_PORT_FIP_EXT_ID_KEY))
+        self.assertEqual('value1234', actual_ext_ids.get('foreign_key2'))
 
 
 class TestNBDbResourcesOverTcp(TestNBDbResources):

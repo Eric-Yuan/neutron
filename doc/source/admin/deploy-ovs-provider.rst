@@ -184,7 +184,6 @@ Compute nodes
    .. code-block:: ini
 
       [DEFAULT]
-      interface_driver = openvswitch
       enable_isolated_metadata = True
       force_metadata = True
 
@@ -261,7 +260,7 @@ Create initial networks
 Verify network operation
 ------------------------
 
-.. include:: shared/deploy-provider-verifynetworkoperation.txt
+.. include:: deploy-provider-verifynetworkoperation.txt
 
 Network traffic flow
 ~~~~~~~~~~~~~~~~~~~~

@@ -19,14 +19,12 @@ import itertools
 from neutron_lib import constants as n_const
 from oslo_config import cfg
 from oslo_log import helpers as log_helpers
-import six
 
 from neutron.plugins.ml2.drivers.l2pop import rpc as l2pop_rpc
 from neutron.plugins.ml2.drivers.openvswitch.agent import vlanmanager
 
 
-@six.add_metaclass(abc.ABCMeta)
-class L2populationRpcCallBackMixin(object):
+class L2populationRpcCallBackMixin(metaclass=abc.ABCMeta):
     '''General mixin class of L2-population RPC call back.
 
     The following methods are called through RPC.
@@ -86,10 +84,10 @@ class L2populationRpcCallBackMixin(object):
                                    for pi in agent[when]]
         for value in unmarshalled.values():
             if 'ports' in value:
-                value['ports'] = dict(
-                    (address, [l2pop_rpc.PortInfo(*pi) for pi in port_infos])
+                value['ports'] = {
+                    address: [l2pop_rpc.PortInfo(*pi) for pi in port_infos]
                     for address, port_infos in value['ports'].items()
-                )
+                }
         return unmarshalled
 
     @abc.abstractmethod
@@ -105,8 +103,8 @@ class L2populationRpcCallBackMixin(object):
         pass
 
 
-@six.add_metaclass(abc.ABCMeta)
-class L2populationRpcCallBackTunnelMixin(L2populationRpcCallBackMixin):
+class L2populationRpcCallBackTunnelMixin(L2populationRpcCallBackMixin,
+                                         metaclass=abc.ABCMeta):
     '''Mixin class of L2-population call back for Tunnel.
 
     The following methods are all used in agents as internal methods.
@@ -234,7 +232,8 @@ class L2populationRpcCallBackTunnelMixin(L2populationRpcCallBackMixin):
         vlan_manager = vlanmanager.LocalVlanManager()
         for network_id, values in fdb_entries.items():
             try:
-                lvm = vlan_manager.get(network_id)
+                lvm = vlan_manager.get(
+                    network_id, values.get('segment_id'))
             except vlanmanager.MappingNotFound:
                 continue
             agent_ports = values.get('ports')
@@ -309,22 +308,23 @@ class L2populationRpcCallBackTunnelMixin(L2populationRpcCallBackMixin):
         vlan_manager = vlanmanager.LocalVlanManager()
         for network_id, agent_ports in fdb_entries.items():
             try:
-                lvm = vlan_manager.get(network_id)
+                lvms = vlan_manager.get_segments(network_id)
             except vlanmanager.MappingNotFound:
                 continue
 
-            for agent_ip, state in agent_ports.items():
-                if agent_ip == local_ip:
-                    continue
+            for lvm in lvms.values():
+                for agent_ip, state in agent_ports.items():
+                    if agent_ip == local_ip:
+                        continue
 
-                after = state.get('after', [])
-                for mac_ip in after:
-                    self.setup_entry_for_arp_reply(br, 'add', lvm.vlan,
-                                                   mac_ip.mac_address,
-                                                   mac_ip.ip_address)
+                    after = state.get('after', [])
+                    for mac_ip in after:
+                        self.setup_entry_for_arp_reply(br, 'add', lvm.vlan,
+                                                       mac_ip.mac_address,
+                                                       mac_ip.ip_address)
 
-                before = state.get('before', [])
-                for mac_ip in before:
-                    self.setup_entry_for_arp_reply(br, 'remove', lvm.vlan,
-                                                   mac_ip.mac_address,
-                                                   mac_ip.ip_address)
+                    before = state.get('before', [])
+                    for mac_ip in before:
+                        self.setup_entry_for_arp_reply(br, 'remove', lvm.vlan,
+                                                       mac_ip.mac_address,
+                                                       mac_ip.ip_address)

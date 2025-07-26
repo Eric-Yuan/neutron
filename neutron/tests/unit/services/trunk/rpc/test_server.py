@@ -35,7 +35,7 @@ from neutron.tests.unit.plugins.ml2 import test_plugin
 
 class TrunkSkeletonTest(test_plugin.Ml2PluginV2TestCase):
     def setUp(self):
-        super(TrunkSkeletonTest, self).setUp()
+        super().setUp()
         self.mock_registry_provide = mock.patch(
             'neutron.api.rpc.callbacks.producer.registry.provide').start()
         self.drivers_patch = mock.patch.object(drivers, 'register').start()
@@ -50,7 +50,7 @@ class TrunkSkeletonTest(test_plugin.Ml2PluginV2TestCase):
     def _create_test_trunk(self, port, subports=None):
         subports = subports if subports else []
         trunk = {'port_id': port['port']['id'],
-                 'tenant_id': 'test_tenant',
+                 'project_id': 'test_tenant',
                  'sub_ports': subports
                  }
         response = (
@@ -67,7 +67,7 @@ class TrunkSkeletonTest(test_plugin.Ml2PluginV2TestCase):
             self.mock_registry_provide.assert_called_with(
                 server.trunk_by_port_provider,
                 resources.TRUNK)
-            self.assertItemsEqual(('trunk', [test_obj],),
+            self.assertCountEqual(('trunk', [test_obj],),
                                   mock_conn.mock_calls[1][1])
 
     def test_update_subport_bindings(self):
@@ -104,13 +104,51 @@ class TrunkSkeletonTest(test_plugin.Ml2PluginV2TestCase):
         for port in updated_subports[trunk['id']]:
             self.assertEqual('trunk_host_id', port[portbindings.HOST_ID])
 
+    def test_update_subport_bindings_during_migration(self):
+        with self.port() as _parent_port:
+            parent_port = _parent_port
+        trunk = self._create_test_trunk(parent_port)
+        subports = []
+        for vid in range(0, 3):
+            with self.port() as new_port:
+                obj = trunk_obj.SubPort(
+                    context=self.context,
+                    trunk_id=trunk['id'],
+                    port_id=new_port['port']['id'],
+                    segmentation_type='vlan',
+                    segmentation_id=vid)
+                subports.append(obj)
+
+        expected_calls = [
+            mock.call(
+                mock.ANY, subport['port_id'],
+                {'port': {portbindings.HOST_ID: 'new_trunk_host_id',
+                          'device_owner': constants.TRUNK_SUBPORT_OWNER}})
+            for subport in subports]
+
+        test_obj = server.TrunkSkeleton()
+        test_obj._trunk_plugin = self.trunk_plugin
+        test_obj._core_plugin = self.core_plugin
+        port_data = {
+            portbindings.HOST_ID: 'trunk_host_id',
+            portbindings.PROFILE: {'migrating_to': 'new_trunk_host_id'}}
+        with mock.patch.object(
+                self.core_plugin, "get_port",
+                return_value=port_data), \
+            mock.patch.object(
+                test_obj, "_safe_update_trunk"):
+            test_obj.update_subport_bindings(self.context, subports=subports)
+        for expected_call in expected_calls:
+            self.assertIn(expected_call, self.mock_update_port.mock_calls)
+
     def test__handle_port_binding_binding_error(self):
         with self.port() as _trunk_port:
             trunk = self._create_test_trunk(_trunk_port)
             trunk_host = 'test-host'
             test_obj = server.TrunkSkeleton()
-            self.mock_update_port.return_value = {portbindings.VIF_TYPE:
-                                         portbindings.VIF_TYPE_BINDING_FAILED}
+            self.mock_update_port.return_value = (
+                {portbindings.VIF_TYPE:
+                 portbindings.VIF_TYPE_BINDING_FAILED})
             self.assertRaises(trunk_exc.SubPortBindingError,
                               test_obj._handle_port_binding,
                               self.context,
@@ -141,8 +179,9 @@ class TrunkSkeletonTest(test_plugin.Ml2PluginV2TestCase):
         test_obj = server.TrunkSkeleton()
         test_obj._trunk_plugin = self.trunk_plugin
         test_obj._core_plugin = self.core_plugin
-        self.mock_update_port.return_value = {portbindings.VIF_TYPE:
-                                         portbindings.VIF_TYPE_BINDING_FAILED}
+        self.mock_update_port.return_value = (
+            {portbindings.VIF_TYPE:
+             portbindings.VIF_TYPE_BINDING_FAILED})
         updated_subports = test_obj.update_subport_bindings(self.context,
                                                             subports=subports)
         trunk = trunk_obj.Trunk.get_object(self.context, id=trunk['id'])
@@ -172,8 +211,9 @@ class TrunkSkeletonTest(test_plugin.Ml2PluginV2TestCase):
         test_obj = server.TrunkSkeleton()
         test_obj._trunk_plugin = self.trunk_plugin
         test_obj._core_plugin = self.core_plugin
-        self.mock_update_port.return_value = {portbindings.VIF_TYPE:
-                                         portbindings.VIF_TYPE_BINDING_FAILED}
+        self.mock_update_port.return_value = (
+            {portbindings.VIF_TYPE:
+             portbindings.VIF_TYPE_BINDING_FAILED})
         mock_trunk_obj = mock.Mock(port_id=parent_port['port']['id'])
         mock_trunk_obj.update.side_effect = exc.StaleDataError
 
@@ -212,8 +252,9 @@ class TrunkSkeletonTest(test_plugin.Ml2PluginV2TestCase):
         test_obj = server.TrunkSkeleton()
         test_obj._trunk_plugin = self.trunk_plugin
         test_obj._core_plugin = self.core_plugin
-        self.mock_update_port.return_value = {portbindings.VIF_TYPE:
-                                         portbindings.VIF_TYPE_BINDING_FAILED}
+        self.mock_update_port.return_value = (
+            {portbindings.VIF_TYPE:
+             portbindings.VIF_TYPE_BINDING_FAILED})
         mock_trunk_obj = mock.Mock(port_id=parent_port['port']['id'])
         mock_trunk_obj.update.side_effect = KeyError
 
@@ -262,7 +303,7 @@ class TrunkSkeletonTest(test_plugin.Ml2PluginV2TestCase):
 
 class TrunkStubTest(base.BaseTestCase):
     def setUp(self):
-        super(TrunkStubTest, self).setUp()
+        super().setUp()
         self.test_obj = server.TrunkStub()
 
     def test___init__(self):

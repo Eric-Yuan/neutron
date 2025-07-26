@@ -13,7 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import distutils
+import enum
 import re
 import shutil
 import tempfile
@@ -21,6 +21,8 @@ import tempfile
 import netaddr
 from neutron_lib import constants as n_consts
 from neutron_lib import exceptions
+from neutron_lib.plugins.ml2 import ovs_constants as ovs_const
+from neutron_lib.utils import helpers
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import uuidutils
@@ -31,43 +33,107 @@ from neutron.agent.l3 import ha_router
 from neutron.agent.l3 import namespaces
 from neutron.agent.linux import external_process
 from neutron.agent.linux import ip_lib
-from neutron.agent.linux import ip_link_support
 from neutron.agent.linux import keepalived
 from neutron.agent.linux import utils as agent_utils
 from neutron.cmd import runtime_checks
 from neutron.common import utils as common_utils
-from neutron.plugins.ml2.drivers.openvswitch.agent.common \
-    import constants as ovs_const
+from neutron.conf.agent.l3 import config as l3_config
+from neutron.privileged.agent.linux import dhcp as priv_dhcp
 
 LOG = logging.getLogger(__name__)
 
 
+# PLEASE DO NOT ADD NEW VERSION CHECK TESTS. The entire point of the sanity
+# check system is to avoid doing version number checking since different
+# distros may backport fixes/features to different versioned releases and they
+# are not a reliable way to test for features/bugs. Please write sanity checks
+# that actually test for the usage of the feature in combination with it being
+# configured to use on the running system (e.g. via a config option).
+
+# TODO(twilson) Remove/rework tests that check version numbers into more
+# generic tests of features.
 MINIMUM_DNSMASQ_VERSION = '2.67'
 DNSMASQ_VERSION_DHCP_RELEASE6 = '2.76'
 DNSMASQ_VERSION_HOST_ADDR6_LIST = '2.81'
+DNSMASQ_VERSION_SEGFAULT_ISSUE = '2.86'
 DIRECT_PORT_QOS_MIN_OVS_VERSION = '2.11'
-MINIMUM_DIBBLER_VERSION = '1.0.1'
 CONNTRACK_GRE_MODULE = 'nf_conntrack_proto_gre'
+OVN_NB_DB_SCHEMA_GATEWAY_CHASSIS = '5.7.0'
+OVN_NB_DB_SCHEMA_PORT_GROUP = '5.11.0'
+OVN_NB_DB_SCHEMA_STATELESS_NAT = '5.17.0'
+OVN_SB_DB_SCHEMA_VIRTUAL_PORT = '2.5.0'
+OVN_LOCALNET_LEARN_FDB = '22.09.0'
+OVN_SB_DB_SCHEMA_CHASSIS_PRIVATE = '2.9.0'
+
+
+class OVNCheckType(enum.Enum):
+    nb_version = 0
+    nb_db_schema = 1
+    sb_version = 2
+    sb_db_schema = 3
+
+
+def _get_ovn_version(check_type):
+    """Retrieves the OVN nbctl, sbctl, NS schema or SB schema version
+
+    :param check_type: ``OVNCheckType`` enum element. This method can return
+                       the nbctl version, the sbctl version, the NB schema
+                       version or the SB schema version.
+    :return: (tuple) 3 element tuple: (major, minor, revision). (0, 0, 0) by
+             default.
+    """
+    if check_type in (OVNCheckType.nb_version, OVNCheckType.nb_db_schema):
+        cmd = ['ovn-nbctl', '--version']
+    elif check_type in (OVNCheckType.nb_version, OVNCheckType.nb_db_schema):
+        cmd = ['ovn-sbctl', '--version']
+    else:
+        raise RuntimeError
+
+    out = agent_utils.execute(cmd)
+    if check_type == OVNCheckType.nb_version:
+        matched_line = re.search(r"ovn-nbctl.*", out)
+    elif check_type == OVNCheckType.sb_version:
+        matched_line = re.search(r"ovn-sbctl.*", out)
+    else:
+        matched_line = re.search(r"DB Schema.*", out)
+
+    matched_version = re.search(r"(\d+\.\d+\.\d+)", matched_line.group(0))
+    return versionutils.convert_version_to_tuple(matched_version.group(1) if
+                                                 matched_version else '0.0.0')
 
 
 def ovs_vxlan_supported(from_ip='192.0.2.1', to_ip='192.0.2.2'):
-    name = common_utils.get_rand_device_name(prefix='vxlantest-')
-    with ovs_lib.OVSBridge(name) as br:
-        port = br.add_tunnel_port(from_ip, to_ip, n_consts.TYPE_VXLAN)
+    br_name = common_utils.get_rand_device_name(prefix='vxlantest-')
+    port_name = common_utils.get_rand_device_name(prefix='vxlantest-')
+    with ovs_lib.OVSBridge(br_name,
+                           datapath_type=cfg.CONF.OVS.datapath_type) as br:
+        port = br.add_tunnel_port(
+            port_name=port_name,
+            remote_ip=from_ip,
+            local_ip=to_ip,
+            tunnel_type=n_consts.TYPE_VXLAN)
         return port != ovs_lib.INVALID_OFPORT
 
 
 def ovs_geneve_supported(from_ip='192.0.2.3', to_ip='192.0.2.4'):
-    name = common_utils.get_rand_device_name(prefix='genevetest-')
-    with ovs_lib.OVSBridge(name) as br:
-        port = br.add_tunnel_port(from_ip, to_ip, n_consts.TYPE_GENEVE)
+    br_name = common_utils.get_rand_device_name(prefix='genevetest-')
+    port_name = common_utils.get_rand_device_name(prefix='genevetest-')
+    with ovs_lib.OVSBridge(br_name,
+                           datapath_type=cfg.CONF.OVS.datapath_type) as br:
+        port = br.add_tunnel_port(
+            port_name=port_name,
+            remote_ip=from_ip,
+            local_ip=to_ip,
+            tunnel_type=n_consts.TYPE_GENEVE)
         return port != ovs_lib.INVALID_OFPORT
 
 
 def iproute2_vxlan_supported():
     ip = ip_lib.IPWrapper()
+    name_dummy = common_utils.get_rand_device_name(prefix='vxlantest-')
+    ip.add_dummy(name_dummy)
     name = common_utils.get_rand_device_name(prefix='vxlantest-')
-    port = ip.add_vxlan(name, 3000)
+    port = ip.add_vxlan(name, 3000, name_dummy)
     ip.del_veth(name)
     return name == port.name
 
@@ -75,33 +141,29 @@ def iproute2_vxlan_supported():
 def patch_supported():
     name, peer_name, patch_name = common_utils.get_related_rand_device_names(
         ['patchtest-', 'peertest0-', 'peertest1-'])
-    with ovs_lib.OVSBridge(name) as br:
+    with ovs_lib.OVSBridge(name,
+                           datapath_type=cfg.CONF.OVS.datapath_type) as br:
         port = br.add_patch_port(patch_name, peer_name)
         return port != ovs_lib.INVALID_OFPORT
-
-
-def nova_notify_supported():
-    try:
-        import neutron.notifiers.nova  # noqa since unused
-        return True
-    except ImportError:
-        return False
 
 
 def ofctl_arg_supported(cmd, **kwargs):
     """Verify if ovs-ofctl binary supports cmd with **kwargs.
 
     :param cmd: ovs-ofctl command to use for test.
-    :param **kwargs: arguments to test with the command.
+    :param kwargs: arguments to test with the command.
     :returns: a boolean if the supplied arguments are supported.
     """
     br_name = common_utils.get_rand_device_name(prefix='br-test-')
-    with ovs_lib.OVSBridge(br_name) as test_br:
+    with ovs_lib.OVSBridge(
+            br_name,
+            datapath_type=cfg.CONF.OVS.datapath_type) as test_br:
         full_args = ["ovs-ofctl", cmd, test_br.br_name,
                      ovs_lib._build_flow_expr_str(kwargs, cmd.split('-')[0],
                                                   False)]
         try:
-            agent_utils.execute(full_args, run_as_root=True)
+            agent_utils.execute(full_args, run_as_root=True,
+                                privsep_exec=True)
         except RuntimeError as e:
             LOG.debug("Exception while checking supported feature via "
                       "command %s. Exception: %s", full_args, e)
@@ -110,8 +172,7 @@ def ofctl_arg_supported(cmd, **kwargs):
             LOG.exception("Unexpected exception while checking supported"
                           " feature via command: %s", full_args)
             return False
-        else:
-            return True
+        return True
 
 
 def arp_responder_supported():
@@ -147,41 +208,6 @@ def icmpv6_header_match_supported():
                                icmp_type=n_consts.ICMPV6_TYPE_NA,
                                nd_target='fdf8:f53b:82e4::10',
                                actions="NORMAL")
-
-
-def _vf_management_support(required_caps):
-    is_supported = True
-    try:
-        vf_section = ip_link_support.IpLinkSupport.get_vf_mgmt_section()
-        for cap in required_caps:
-            if not ip_link_support.IpLinkSupport.vf_mgmt_capability_supported(
-                   vf_section, cap):
-                is_supported = False
-                LOG.debug("ip link command does not support "
-                          "vf capability '%(cap)s'", {'cap': cap})
-    except ip_link_support.UnsupportedIpLinkCommand:
-        LOG.exception("Unexpected exception while checking supported "
-                      "ip link command")
-        return False
-    return is_supported
-
-
-def vf_management_supported():
-    required_caps = (
-        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_STATE,
-        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_SPOOFCHK,
-        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_RATE)
-    return _vf_management_support(required_caps)
-
-
-def vf_extended_management_supported():
-    required_caps = (
-        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_STATE,
-        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_SPOOFCHK,
-        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_RATE,
-        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_MIN_TX_RATE,
-    )
-    return _vf_management_support(required_caps)
 
 
 def netns_read_requires_helper():
@@ -221,7 +247,7 @@ def dnsmasq_local_service_supported():
         LOG.debug("Exception while checking dnsmasq version. "
                   "dnsmasq: No such file or directory")
         return False
-    elif returncode == 1:
+    if returncode == 1:
         return False
     return True
 
@@ -232,11 +258,18 @@ def dnsmasq_version_supported():
         env = {'LC_ALL': 'C'}
         out = agent_utils.execute(cmd, addl_env=env)
         m = re.search(r"version (\d+\.\d+)", out)
-        ver = distutils.version.StrictVersion(m.group(1) if m else '0.0')
-        if ver < distutils.version.StrictVersion(MINIMUM_DNSMASQ_VERSION):
+        ver = versionutils.convert_version_to_tuple(m.group(1) if m else '0.0')
+        if ver < versionutils.convert_version_to_tuple(
+                MINIMUM_DNSMASQ_VERSION):
             return False
+        if ver == versionutils.convert_version_to_tuple(
+                DNSMASQ_VERSION_SEGFAULT_ISSUE):
+            LOG.warning('Found dnsmasq version %(current)s installed, this '
+                        'version has a known issue, more details in: '
+                        'https://bugs.launchpad.net/bugs/2026757.',
+                        {'current': ver})
         if (cfg.CONF.dnsmasq_enable_addr6_list is True and
-                ver < distutils.version.StrictVersion(
+                ver < versionutils.convert_version_to_tuple(
                     DNSMASQ_VERSION_HOST_ADDR6_LIST)):
             LOG.warning('Support for multiple IPv6 addresses in host '
                         'entries was introduced in dnsmasq version '
@@ -263,7 +296,7 @@ def ovs_qos_direct_port_supported():
         ver = versionutils.convert_version_to_tuple(matched_version.group(1) if
                                                     matched_version else '0.0')
         minver = versionutils.convert_version_to_tuple(
-                 DIRECT_PORT_QOS_MIN_OVS_VERSION)
+            DIRECT_PORT_QOS_MIN_OVS_VERSION)
         if ver < minver:
             return False
     except (OSError, RuntimeError, ValueError) as e:
@@ -275,7 +308,7 @@ def ovs_qos_direct_port_supported():
 
 
 def dhcp_release6_supported():
-    return runtime_checks.dhcp_release6_supported()
+    return priv_dhcp.dhcp_release6_supported()
 
 
 def bridge_firewalling_enabled():
@@ -293,8 +326,9 @@ def bridge_firewalling_enabled():
     return True
 
 
-class KeepalivedIPv6Test(object):
+class KeepalivedIPv6Test:
     def __init__(self, ha_port, gw_port, gw_vip, default_gw):
+        l3_config.register_l3_agent_config_opts(l3_config.OPTS, cfg.CONF)
         self.ha_port = ha_port
         self.gw_port = gw_port
         self.gw_vip = gw_vip
@@ -384,7 +418,8 @@ def keepalived_ipv6_supported():
     gw_vip = 'fdf8:f53b:82e4::10/64'
     expected_default_gw = 'fe80:f816::1'
 
-    with ovs_lib.OVSBridge(br_name) as br:
+    with ovs_lib.OVSBridge(br_name,
+                           datapath_type=cfg.CONF.OVS.datapath_type) as br:
         with KeepalivedIPv6Test(ha_port, gw_port, gw_vip,
                                 expected_default_gw) as ka:
             br.add_port(ha_port, ('type', 'internal'))
@@ -413,6 +448,14 @@ def keepalived_ipv6_supported():
     return expected_default_gw == default_gw
 
 
+def keepalived_garp_on_sighup_supported():
+    keepalived_garp_on_sighup = (1, 2, 20)
+    keepalived_version = runtime_checks.get_keepalived_version()
+    if keepalived_version:
+        return keepalived_version >= keepalived_garp_on_sighup
+    return False
+
+
 def ovsdb_native_supported():
     # Running the test should ensure we are configured for OVSDB native
     try:
@@ -432,7 +475,8 @@ def ovsdb_native_supported():
 def ovs_conntrack_supported():
     br_name = common_utils.get_rand_device_name(prefix="ovs-test-")
 
-    with ovs_lib.OVSBridge(br_name) as br:
+    with ovs_lib.OVSBridge(br_name,
+                           datapath_type=cfg.CONF.OVS.datapath_type) as br:
         try:
             br.add_protocols(*["OpenFlow%d" % i for i in range(10, 15)])
         except RuntimeError as e:
@@ -485,22 +529,6 @@ def conntrack_supported():
         return False
 
 
-def get_minimal_dibbler_version_supported():
-    return MINIMUM_DIBBLER_VERSION
-
-
-def dibbler_version_supported():
-    try:
-        cmd = ['dibbler-client',
-               'help']
-        out = agent_utils.execute(cmd)
-        return '-w' in out
-    except (OSError, RuntimeError, IndexError, ValueError) as e:
-        LOG.debug("Exception while checking minimal dibbler version. "
-                  "Exception: %s", e)
-        return False
-
-
 def _fix_ip_nonlocal_bind_root_value(original_value):
     current_value = ip_lib.get_ip_nonlocal_bind(namespace=None)
     if current_value != original_value:
@@ -539,3 +567,119 @@ def gre_conntrack_supported():
         return agent_utils.execute(cmd, log_fail_as_error=False)
     except exceptions.ProcessExecutionError:
         return False
+
+
+def min_tx_rate_support():
+    device_mappings = helpers.parse_mappings(
+        cfg.CONF.SRIOV_NIC.physical_device_mappings, unique_keys=False)
+    devices_to_test = set()
+    for devices_in_physnet in device_mappings.values():
+        for device in devices_in_physnet:
+            devices_to_test.add(device)
+
+    # NOTE(ralonsoh): the VF used by default is 0. Each SR-IOV configured
+    # NIC should have configured at least 1 VF.
+    VF_NUM = 0
+    devices_without_support = set()
+    for device in devices_to_test:
+        try:
+            ip_link = ip_lib.IpLinkCommand(device)
+            # NOTE(ralonsoh): to set min_tx_rate, first is needed to set
+            # max_tx_rate and max_tx_rate >= min_tx_rate.
+            vf_config = {'vf': VF_NUM, 'rate': {'min_tx_rate': 400,
+                                                'max_tx_rate': 500}}
+            ip_link.set_vf_feature(vf_config)
+            vf_config = {'vf': VF_NUM, 'rate': {'min_tx_rate': 0,
+                                                'max_tx_rate': 0}}
+            ip_link.set_vf_feature(vf_config)
+        except ip_lib.InvalidArgument:
+            devices_without_support.add(device)
+
+    if devices_without_support:
+        LOG.debug('The following NICs do not support "min_tx_rate": %s',
+                  devices_without_support)
+        return False
+    return True
+
+
+def ovn_nb_db_schema_port_group_supported():
+    try:
+        ver = _get_ovn_version(OVNCheckType.nb_db_schema)
+        minver = versionutils.convert_version_to_tuple(
+            OVN_NB_DB_SCHEMA_PORT_GROUP)
+        if ver < minver:
+            return False
+    except (OSError, RuntimeError, ValueError) as e:
+        LOG.debug('Exception while checking OVN DB schema version. '
+                  'Exception: %s', e)
+        return False
+    return True
+
+
+def ovn_nb_db_schema_stateless_nat_supported():
+    try:
+        ver = _get_ovn_version(OVNCheckType.nb_db_schema)
+        minver = versionutils.convert_version_to_tuple(
+            OVN_NB_DB_SCHEMA_STATELESS_NAT)
+        if ver < minver:
+            return False
+    except (OSError, RuntimeError, ValueError) as e:
+        LOG.debug('Exception while checking OVN DB schema version. '
+                  'Exception: %s', e)
+        return False
+    return True
+
+
+def ovn_sb_db_schema_virtual_port_supported():
+    try:
+        ver = _get_ovn_version(OVNCheckType.sb_db_schema)
+        minver = versionutils.convert_version_to_tuple(
+            OVN_SB_DB_SCHEMA_VIRTUAL_PORT)
+        if ver < minver:
+            return False
+    except (OSError, RuntimeError, ValueError) as e:
+        LOG.debug('Exception while checking OVN DB schema version. '
+                  'Exception: %s', e)
+        return False
+    return True
+
+
+def ovn_nb_db_schema_gateway_chassis_supported():
+    try:
+        ver = _get_ovn_version(OVNCheckType.nb_db_schema)
+        minver = versionutils.convert_version_to_tuple(
+            OVN_NB_DB_SCHEMA_GATEWAY_CHASSIS)
+        if ver < minver:
+            return False
+    except (OSError, RuntimeError, ValueError) as e:
+        LOG.debug('Exception while checking OVN DB schema version. '
+                  'Exception: %s', e)
+        return False
+    return True
+
+
+def ovn_localnet_learn_fdb_support():
+    try:
+        ver = _get_ovn_version(OVNCheckType.nb_version)
+        minver = versionutils.convert_version_to_tuple(OVN_LOCALNET_LEARN_FDB)
+        if ver < minver:
+            return False
+    except (OSError, RuntimeError, ValueError) as e:
+        LOG.debug('Exception while checking OVN version. '
+                  'Exception: %s', e)
+        return False
+    return True
+
+
+def ovn_sb_db_schema_chassis_private_supported():
+    try:
+        ver = _get_ovn_version(OVNCheckType.sb_db_schema)
+        minver = versionutils.convert_version_to_tuple(
+            OVN_SB_DB_SCHEMA_CHASSIS_PRIVATE)
+        if ver < minver:
+            return False
+    except (OSError, RuntimeError, ValueError) as e:
+        LOG.debug('Exception while checking OVN DB schema version. '
+                  'Exception: %s', e)
+        return False
+    return True

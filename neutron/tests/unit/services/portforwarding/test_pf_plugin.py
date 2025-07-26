@@ -49,7 +49,7 @@ DB_PLUGIN_KLASS = 'neutron.db.db_base_plugin_v2.NeutronDbPluginV2'
 class TestPortForwardingPlugin(testlib_api.SqlTestCase):
 
     def setUp(self):
-        super(TestPortForwardingPlugin, self).setUp()
+        super().setUp()
 
         with mock.patch.object(
                 resource_manager.ResourceCallbacksManager, '_singleton',
@@ -108,14 +108,14 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
         get_objects_mock.assert_called_once_with(
             self.ctxt, _pager=mock.ANY, floatingip_id=None)
 
-    @mock.patch.object(registry, 'notify')
+    @mock.patch.object(registry, 'publish')
     @mock.patch.object(resources_rpc.ResourcesPushRpcApi, 'push')
     @mock.patch.object(port_forwarding.PortForwarding, 'get_object')
     @mock.patch.object(port_forwarding.PortForwarding, 'get_objects')
     @mock.patch.object(router.FloatingIP, 'get_object')
     def test_delete_floatingip_port_forwarding(
             self, fip_get_object_mock, pf_get_objects_mock,
-            pf_get_object_mock, push_api_mock, registry_notify_mock):
+            pf_get_object_mock, push_api_mock, mock_registry_publish):
 
         # After delete, not empty resource list
         pf_get_objects_mock.return_value = [mock.Mock(id='pf_id'),
@@ -129,7 +129,7 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
         pf_obj.delete.assert_called()
         push_api_mock.assert_called_once_with(
             self.ctxt, mock.ANY, rpc_events.DELETED)
-        registry_notify_mock.assert_called_once_with(
+        mock_registry_publish.assert_called_once_with(
             pf_consts.PORT_FORWARDING,
             events.AFTER_DELETE, self.pf_plugin, payload=mock.ANY)
 
@@ -137,7 +137,7 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
         pf_get_objects_mock.reset_mock()
         pf_get_object_mock.reset_mock()
         push_api_mock.reset_mock()
-        registry_notify_mock.reset_mock()
+        mock_registry_publish.reset_mock()
         pf_obj = mock.Mock(id='need_to_delete_pf_id', floatingip_id='fip_id')
         fip_obj = mock.Mock(id='fip_id')
         fip_get_object_mock.return_value = fip_obj
@@ -155,7 +155,7 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
         fip_obj.update.assert_called()
         push_api_mock.assert_called_once_with(
             self.ctxt, mock.ANY, rpc_events.DELETED)
-        registry_notify_mock.assert_called_once_with(
+        mock_registry_publish.assert_called_once_with(
             pf_consts.PORT_FORWARDING,
             events.AFTER_DELETE, self.pf_plugin, payload=mock.ANY)
 
@@ -168,11 +168,14 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
             self.pf_plugin.delete_floatingip_port_forwarding,
             self.ctxt, 'pf_id', floatingip_id='fip_id')
 
-    @mock.patch.object(registry, 'notify')
+    @mock.patch.object(port_forwarding.PortForwarding, 'get_objects')
+    @mock.patch.object(db_base_plugin_v2.NeutronDbPluginV2, 'get_port')
+    @mock.patch.object(registry, 'publish')
     @mock.patch.object(resources_rpc.ResourcesPushRpcApi, 'push')
     @mock.patch.object(port_forwarding.PortForwarding, 'get_object')
     def test_update_floatingip_port_forwarding(
-            self, mock_pf_get_object, mock_rpc_push, mock_registry_notify):
+            self, mock_pf_get_object, mock_rpc_push, mock_registry_publish,
+            mock_get_port, mock_pf_get_objects):
         pf_input = {
             'port_forwarding':
                 {'port_forwarding': {
@@ -180,7 +183,14 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
                     'floatingip_id': 'fip_id'}},
             'floatingip_id': 'fip_id'}
         pf_obj = mock.Mock()
+        pf_obj.internal_ip_address = "10.0.0.1"
+        pf_obj.internal_port = 22
+        pf_obj.external_port = 222
         mock_pf_get_object.return_value = pf_obj
+        port_dict = {'id': 'ID', 'fixed_ips': [{"subnet_id": "test-subnet-id",
+                                                "ip_address": "10.0.0.1"}]}
+        mock_get_port.return_value = port_dict
+        mock_pf_get_objects.return_value = []
         self.pf_plugin.update_floatingip_port_forwarding(
             self.ctxt, 'pf_id', **pf_input)
         mock_pf_get_object.assert_called_once_with(self.ctxt, id='pf_id')
@@ -188,9 +198,85 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
         self.assertTrue(pf_obj.update)
         mock_rpc_push.assert_called_once_with(
             self.ctxt, mock.ANY, rpc_events.UPDATED)
-        mock_registry_notify.assert_called_once_with(
+        mock_registry_publish.assert_called_once_with(
             pf_consts.PORT_FORWARDING,
             events.AFTER_UPDATE, self.pf_plugin, payload=mock.ANY)
+
+    @mock.patch.object(port_forwarding.PortForwarding, 'get_objects')
+    @mock.patch.object(db_base_plugin_v2.NeutronDbPluginV2, 'get_port')
+    def test_check_port_forwarding_update(self, mock_get_port,
+                                          mock_pf_get_objects):
+        port_dict = {'fixed_ips': [{"ip_address": "10.0.0.1"}]}
+        mock_get_port.return_value = port_dict
+        other_pf_obj = mock.Mock(id='cmp_obj_id')
+        pf_obj = mock.Mock(id='pf_obj_id', internal_port_id='int_port_id',
+                           internal_ip_address='10.0.0.1')
+        mock_pf_get_objects.return_value = [pf_obj, other_pf_obj]
+        self.pf_plugin._check_port_forwarding_update(self.ctxt, pf_obj)
+        mock_get_port.assert_called_once_with(self.ctxt, 'int_port_id')
+        mock_pf_get_objects.assert_called_once_with(
+            self.ctxt,
+            floatingip_id=pf_obj.floatingip_id, protocol=pf_obj.protocol)
+
+    @mock.patch.object(port_forwarding.PortForwarding, 'get_objects')
+    @mock.patch.object(db_base_plugin_v2.NeutronDbPluginV2, 'get_port')
+    def test_check_port_forwarding_update_invalid_address(
+            self, mock_get_port, mock_pf_get_objects):
+        port_dict = {'fixed_ips': [{"ip_address": "10.0.0.1"}]}
+        mock_get_port.return_value = port_dict
+        pf_obj = mock.Mock(id='pf_obj_id', internal_port_id='int_port_id',
+                           internal_ip_address="99.99.99.99")
+        self.assertRaisesRegex(
+            lib_exc.BadRequest,
+            "not correspond to an address on the internal port",
+            self.pf_plugin._check_port_forwarding_update,
+            self.ctxt, pf_obj)
+        mock_get_port.assert_called_once_with(self.ctxt, 'int_port_id')
+        mock_pf_get_objects.assert_not_called()
+
+    @mock.patch.object(port_forwarding.PortForwarding, 'get_objects')
+    @mock.patch.object(db_base_plugin_v2.NeutronDbPluginV2, 'get_port')
+    def test_check_port_forwarding_update_invalid_external(
+            self, mock_get_port, mock_pf_get_objects):
+        port_dict = {'fixed_ips': [{"ip_address": "10.0.0.1"}]}
+        mock_get_port.return_value = port_dict
+        pf_obj_dict = {'id': 'pf_obj_one',
+                       'floating_ip_address': 'same_fip_addr',
+                       'external_port': 'same_ext_port'}
+        other_pf_obj = mock.Mock(**pf_obj_dict)
+        pf_obj_dict.update(id='pf_obj_two', internal_ip_address='10.0.0.1')
+        pf_obj = mock.Mock(**pf_obj_dict)
+        mock_pf_get_objects.return_value = [pf_obj, other_pf_obj]
+        self.assertRaisesRegex(
+            lib_exc.BadRequest,
+            "already exist.*same_fip_addr",
+            self.pf_plugin._check_port_forwarding_update,
+            self.ctxt, pf_obj)
+        mock_get_port.assert_called_once_with(self.ctxt, mock.ANY)
+        mock_pf_get_objects.assert_called_once()
+
+    @mock.patch.object(port_forwarding.PortForwarding, 'get_objects')
+    @mock.patch.object(db_base_plugin_v2.NeutronDbPluginV2, 'get_port')
+    def test_check_port_forwarding_update_invalid_internal(
+            self, mock_get_port, mock_pf_get_objects):
+        same_internal_ip = "10.0.0.10"
+        port_dict = {'fixed_ips': [{"ip_address": same_internal_ip}]}
+        mock_get_port.return_value = port_dict
+        pf_obj_dict = {'id': 'pf_obj_one',
+                       'internal_port_id': 'same_int_port_id',
+                       'internal_ip_address': same_internal_ip,
+                       'internal_port': 'same_int_port'}
+        other_pf_obj = mock.Mock(**pf_obj_dict)
+        pf_obj_dict.update(id='pf_obj_two')
+        pf_obj = mock.Mock(**pf_obj_dict)
+        mock_pf_get_objects.return_value = [pf_obj, other_pf_obj]
+        self.assertRaisesRegex(
+            lib_exc.BadRequest,
+            f"already exist.*{same_internal_ip}",
+            self.pf_plugin._check_port_forwarding_update,
+            self.ctxt, pf_obj)
+        mock_get_port.assert_called_once_with(self.ctxt, 'same_int_port_id')
+        mock_pf_get_objects.assert_called_once()
 
     @mock.patch.object(port_forwarding.PortForwarding, 'get_object')
     def test_negative_update_floatingip_port_forwarding(
@@ -210,7 +296,7 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
     @mock.patch.object(pf_plugin.PortForwardingPlugin,
                        '_check_port_has_binding_floating_ip')
     @mock.patch.object(obj_base.NeutronDbObject, 'update_objects')
-    @mock.patch.object(registry, 'notify')
+    @mock.patch.object(registry, 'publish')
     @mock.patch.object(resources_rpc.ResourcesPushRpcApi, 'push')
     @mock.patch.object(pf_plugin.PortForwardingPlugin, '_check_router_match')
     @mock.patch.object(pf_plugin.PortForwardingPlugin,
@@ -220,7 +306,7 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
     @mock.patch('neutron.objects.port_forwarding.PortForwarding')
     def test_create_floatingip_port_forwarding(
             self, mock_port_forwarding, mock_fip_get_object, mock_find_router,
-            mock_check_router_match, mock_push_api, mock_registry_notify,
+            mock_check_router_match, mock_push_api, mock_registry_publish,
             mock_update_objects, mock_check_bind_fip):
         # Update fip
         pf_input = {
@@ -243,7 +329,7 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
         self.assertTrue(pf_obj.create.called)
         mock_push_api.assert_called_once_with(
             self.ctxt, mock.ANY, rpc_events.CREATED)
-        mock_registry_notify.assert_called_once_with(
+        mock_registry_publish.assert_called_once_with(
             pf_consts.PORT_FORWARDING,
             events.AFTER_CREATE, self.pf_plugin, payload=mock.ANY)
 
@@ -253,7 +339,7 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
         mock_port_forwarding.reset_mock()
         mock_update_objects.reset_mock()
         mock_push_api.reset_mock()
-        mock_registry_notify.reset_mock()
+        mock_registry_publish.reset_mock()
         mock_port_forwarding.return_value = pf_obj
         fip_obj.router_id = 'router_id'
         fip_obj.fixed_port_id = ''
@@ -265,7 +351,7 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
         self.assertFalse(mock_update_objects.called)
         mock_push_api.assert_called_once_with(
             self.ctxt, mock.ANY, rpc_events.CREATED)
-        mock_registry_notify.assert_called_once_with(
+        mock_registry_publish.assert_called_once_with(
             pf_consts.PORT_FORWARDING,
             events.AFTER_CREATE, self.pf_plugin, payload=mock.ANY)
 
@@ -395,37 +481,56 @@ class TestPortForwardingPlugin(testlib_api.SqlTestCase):
                           self.ctxt, 'fake-pf-id', 'fip_id_2', **pf_input)
 
     def test_service_plugins_values(self):
-        exp_default = ['router']
-        supported_plugins = ['router', 'ovn-router']
+        exp_default_plugins = ['router']
+        ovn_rtr_full = 'neutron.services.ovn_l3.plugin.OVNL3RouterPlugin'
+        supported_plugins = ['router', 'ovn-router', ovn_rtr_full]
         same_as_input = 'same_as_input'
-        TC = namedtuple('TC', 'input expected description')
+        TC = namedtuple('TC', 'input exp_plugins exp_uses_rpc description')
         test_cases = [
-            TC([], exp_default, "default from empty cfg"),
-            TC(['foo'], exp_default, "default from unexpected cfg"),
-            TC(['foo', 123], exp_default, "default from unexpected cfg"),
-            TC(['foo', 'router'], exp_default, "default from valid cfg"),
-            TC(['router'], same_as_input, "valid cfg 1"),
-            TC(['router'], same_as_input, "valid cfg 1"),
-            TC(['ovn-router'], same_as_input, "valid cfg 2"),
-            TC(['ovn-router', 'router'], supported_plugins, "valid cfg 3"),
-            TC(['router', 'ovn-router'], supported_plugins, "valid cfg 4"),
-            TC(['bar', 'router', 'foo'], ['router'], "valid cfg 5"),
-            TC(['bar', 'ovn-router', 'foo'], ['ovn-router'], "valid cfg 6"),
-            TC(['bar', 'router', 123, 'ovn-router', 'foo', 'kitchen', 'sink'],
-               supported_plugins, "valid cfg 7"),
+            TC([], exp_default_plugins, True, "default from empty cfg"),
+            TC(['foo'], exp_default_plugins, True,
+               "default from unexpected cfg"),
+            TC(['foo', 123], exp_default_plugins, True,
+               "default from unexpected cfg"),
+            TC(['foo', 'router'], exp_default_plugins, True,
+               "default from valid cfg"),
+            TC(['router'], same_as_input, True, "valid cfg 1"),
+            TC(['ovn-router'], same_as_input, False, "valid cfg 2"),
+            TC([ovn_rtr_full], same_as_input, False, "valid cfg 3"),
+            TC(['ovn-router', ovn_rtr_full, 'router'], supported_plugins, True,
+               "valid cfg 4"),
+            TC(['router', 'ovn-router'], same_as_input, True,
+               "valid cfg 5"),
+            TC(['router', ovn_rtr_full], same_as_input, True,
+               "valid cfg 6"),
+            TC([ovn_rtr_full, 'ovn-router'], ['ovn-router', ovn_rtr_full],
+               False, "valid cfg 7"),
+            TC(['bar', 'router', 'foo'], ['router'], True, "valid cfg 8"),
+            TC(['bar', 'ovn-router', 'foo'], ['ovn-router'], False,
+               "valid cfg 9"),
+            TC(['bar', ovn_rtr_full, 'foo'], [ovn_rtr_full], False,
+               "valid cfg 10"),
+            TC(['bar', 'router', 123, 'ovn-router', 'foo', 'kitchen', 'sink',
+                ovn_rtr_full], supported_plugins, True, "valid cfg 11"),
         ]
         for tc in test_cases:
             cfg.CONF.set_override("service_plugins", tc.input)
-            result = pf_plugin._required_service_plugins()
-            if tc.expected == same_as_input:
-                self.assertEqual(tc.input, result, tc.description)
+            plugins, rpc_required = pf_plugin._required_service_plugins()
+            if tc.exp_plugins == same_as_input:
+                self.assertEqual(
+                    (tc.input, tc.exp_uses_rpc), (plugins, rpc_required),
+                    tc.description)
             else:
-                self.assertEqual(tc.expected, result, tc.description)
+                self.assertEqual(
+                    (tc.exp_plugins, tc.exp_uses_rpc), (plugins, rpc_required),
+                    tc.description)
 
     @mock.patch.object(cfg.ConfigOpts, '__getattr__')
     def test_service_plugins_no_such_opt(self, mock_config_opts_get):
         description = "test cfg.NoSuchOptError exception"
         mock_config_opts_get.side_effect = cfg.NoSuchOptError('test_svc_plug')
-        result = pf_plugin._required_service_plugins()
+        plugins, rpc_required = pf_plugin._required_service_plugins()
         mock_config_opts_get.assert_called_once()
-        self.assertEqual(['router'], result, description)
+        expected = (['router'], True)
+        self.assertEqual(
+            expected, (plugins, rpc_required), description)

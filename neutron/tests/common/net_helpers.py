@@ -24,6 +24,7 @@ import shlex
 import signal
 import subprocess
 import time
+from unittest import mock
 
 import fixtures
 import netaddr
@@ -32,7 +33,6 @@ from neutron_lib import exceptions as n_exc
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import uuidutils
-import six
 
 from neutron.agent.common import ovs_lib
 from neutron.agent.linux import bridge_lib
@@ -43,9 +43,9 @@ from neutron.agent.linux import utils
 from neutron.common import utils as common_utils
 from neutron.conf.agent import common as config
 from neutron.db import db_base_plugin_common as db_base
-from neutron.plugins.ml2.drivers.linuxbridge.agent import \
-    linuxbridge_neutron_agent as linuxbridge_agent
+from neutron.services.trunk.drivers.openvswitch.agent import trunk_manager
 from neutron.tests.common import base as common_base
+from neutron.tests.common import helpers
 from neutron.tests import tools
 
 LOG = logging.getLogger(__name__)
@@ -59,13 +59,6 @@ VETH0_PREFIX = 'test-veth0'
 VETH1_PREFIX = 'test-veth1'
 PATCH_PREFIX = 'patch'
 MACVTAP_PREFIX = 'macvtap'
-
-# port name should be shorter than DEVICE_NAME_MAX_LEN because if this
-# port is used to provide vlan connection between two linuxbridge
-# agents then place for vlan ID is also required, Vlan ID can take max 4 digits
-# and there is also additional "." in device name so it will in overall gives
-# DEVICE_NAME_MAX_LEN = 15 chars
-LB_DEVICE_NAME_MAX_LEN = 10
 
 SS_SOURCE_PORT_PATTERN = re.compile(
     r'^.*\s+\d+\s+.*:(?P<port>\d+)\s+[^\s]+:.*')
@@ -107,12 +100,23 @@ def set_namespace_gateway(port_dev, gateway_ip):
     port_dev.route.add_gateway(gateway_ip)
 
 
-def assert_ping(src_namespace, dst_ip, timeout=1, count=3):
+def assert_ping(src_namespace, dst_ip, timeout=1, count=3, retry_count=1,
+                device=None):
     ipversion = netaddr.IPAddress(dst_ip).version
     ping_command = 'ping' if ipversion == 4 else 'ping6'
     ns_ip_wrapper = ip_lib.IPWrapper(src_namespace)
-    ns_ip_wrapper.netns.execute([ping_command, '-W', timeout, '-c', count,
-                                 dst_ip])
+    cmd = [ping_command, '-W', timeout, '-c', count]
+    if device:
+        cmd += ['-I', device]
+    cmd.append(dst_ip)
+    while retry_count:
+        retry_count -= 1
+        try:
+            ns_ip_wrapper.netns.execute(cmd, privsep_exec=True)
+            return
+        except n_exc.ProcessExecutionError as exc:
+            if not retry_count:
+                raise exc
 
 
 def assert_async_ping(src_namespace, dst_ip, timeout=1, count=1, interval=1):
@@ -124,8 +128,9 @@ def assert_async_ping(src_namespace, dst_ip, timeout=1, count=1, interval=1):
     # cannot be used and it needs to be done using the following workaround.
     for _index in range(count):
         start_time = time.time()
-        ns_ip_wrapper.netns.execute([ping_command, '-W', timeout, '-c', '1',
-                                     dst_ip])
+        ns_ip_wrapper.netns.execute(
+            [ping_command, '-W', timeout, '-c', '1', dst_ip],
+            privsep_exec=True)
         end_time = time.time()
         diff = end_time - start_time
         if 0 < diff < interval:
@@ -145,9 +150,9 @@ def async_ping(namespace, ips, timeout=1, count=10):
             f.result()
 
 
-def assert_no_ping(src_namespace, dst_ip, timeout=1, count=1):
+def assert_no_ping(src_namespace, dst_ip, timeout=1, count=1, device=None):
     try:
-        assert_ping(src_namespace, dst_ip, timeout, count)
+        assert_ping(src_namespace, dst_ip, timeout, count, device=device)
     except RuntimeError:
         pass
     else:
@@ -167,7 +172,7 @@ def assert_arping(src_namespace, dst_ip, source=None, timeout=1, count=1):
     if source:
         arping_cmd.extend(['-s', source])
     arping_cmd.append(dst_ip)
-    ns_ip_wrapper.netns.execute(arping_cmd)
+    ns_ip_wrapper.netns.execute(arping_cmd, privsep_exec=True)
 
 
 def assert_no_arping(src_namespace, dst_ip, source=None, timeout=1, count=1):
@@ -193,7 +198,8 @@ def _get_source_ports_from_ss_output(output):
 def get_unused_port(used, start=1024, end=None):
     if end is None:
         port_range = utils.execute(
-            ['sysctl', '-n', 'net.ipv4.ip_local_port_range'], run_as_root=True)
+            ['sysctl', '-n', 'net.ipv4.ip_local_port_range'], run_as_root=True,
+            privsep_exec=True)
         end = int(port_range.split()[0]) - 1
 
     candidates = set(range(start, end + 1))
@@ -223,7 +229,8 @@ def get_free_namespace_port(protocol, namespace=None, start=1024, end=None):
         raise ValueError("Unsupported protocol %s" % protocol)
 
     ip_wrapper = ip_lib.IPWrapper(namespace=namespace)
-    output = ip_wrapper.netns.execute(['ss', param], run_as_root=True)
+    output = ip_wrapper.netns.execute(['ss', param], run_as_root=True,
+                                      privsep_exec=True)
     used_ports = _get_source_ports_from_ss_output(output)
 
     return get_unused_port(used_ports, start, end)
@@ -232,11 +239,12 @@ def get_free_namespace_port(protocol, namespace=None, start=1024, end=None):
 def set_local_port_range(start, end):
     utils.execute(
         ['sysctl', '-w', 'net.ipv4.ip_local_port_range=%d %d' % (start, end)],
-        run_as_root=True)
-    utils.execute(['sysctl', '-p'], run_as_root=True)
+        run_as_root=True, privsep_exec=True)
+    utils.execute(['sysctl', '-p'], run_as_root=True, privsep_exec=True)
     # verify
     port_range = utils.execute(
-        ['sysctl', '-n', 'net.ipv4.ip_local_port_range'], run_as_root=True)
+        ['sysctl', '-n', 'net.ipv4.ip_local_port_range'], run_as_root=True,
+        privsep_exec=True)
     assert int(port_range.split()[0]) == start
     assert int(port_range.split()[1]) == end
 
@@ -253,13 +261,15 @@ def create_patch_ports(source, destination):
     :param destination: Instance of OVSBridge
     """
     common = common_utils.get_rand_name(max_length=4, prefix='')
-    prefix = '%s-%s-' % (PATCH_PREFIX, common)
+    prefix = f'{PATCH_PREFIX}-{common}-'
 
     source_name = common_utils.get_rand_device_name(prefix=prefix)
     destination_name = common_utils.get_rand_device_name(prefix=prefix)
 
     source.add_patch_port(source_name, destination_name)
     destination.add_patch_port(destination_name, source_name)
+
+    return source_name, destination_name
 
 
 def create_vlan_interface(
@@ -297,12 +307,30 @@ class RootHelperProcess(subprocess.Popen):
         cmd = shlex.split(root_helper) + cmd
         self.child_pid = None
         LOG.debug("Spawning process %s", cmd)
-        super(RootHelperProcess, self).__init__(cmd, *args, **kwargs)
+        super().__init__(cmd, *args, **kwargs)
         self._wait_for_child_process()
 
-    def kill(self, sig=signal.SIGKILL):
+    def kill(self, sig=signal.SIGKILL, skip_errors=None):
+        skip_errors = (
+            ["No such process"] if skip_errors is None else skip_errors)
         pid = self.child_pid or str(self.pid)
-        utils.execute(['kill', '-%d' % sig, pid], run_as_root=True)
+        try:
+            utils.execute(['kill', '-%d' % sig, pid], run_as_root=True)
+        except n_exc.ProcessExecutionError as e:
+            # NOTE(slaweq): kill command returns 1 for many
+            # different issues, e.g. when there is no such process to kill
+            # (which we want to handle here) but also in cases like e.g. when
+            # user don't have privileges to kill process (which we don't want
+            # to silently hide). Sometimes we don't want really to fail if e.g.
+            # we are trying to kill process which already don't exists, so we
+            # can check if that was the error and not fail than.
+            for skip_error in skip_errors:
+                if skip_error in str(e):
+                    LOG.debug('Kill process %(pid)s failed due to error: '
+                              '%(err)s. This error can be ignored.',
+                              {'pid': pid, 'err': e})
+                    return
+            raise e
 
     def read_stdout(self, timeout=None):
         return self._read_stream(self.stdout, timeout)
@@ -340,7 +368,7 @@ class RootHelperProcess(subprocess.Popen):
                 pass
             msg = ("Process %(cmd)s hasn't been spawned in %(seconds)d "
                    "seconds. Return code: %(ret_code)s, stdout: %(stdout)s, "
-                   "sdterr: %(stderr)s" %
+                   "stderr: %(stderr)s" %
                    {'cmd': self.cmd, 'seconds': timeout,
                     'ret_code': self.returncode, 'stdout': stdout,
                     'stderr': stderr})
@@ -354,7 +382,7 @@ class RootHelperProcess(subprocess.Popen):
         return self.poll() is None
 
 
-class Pinger(object):
+class Pinger:
     """Class for sending ICMP packets asynchronously
 
     The aim is to keep sending ICMP packets on background while executing other
@@ -374,7 +402,7 @@ class Pinger(object):
     """
 
     stats_pattern = re.compile(
-        r'^(?P<trans>\d+) packets transmitted,.*(?P<recv>\d+) received.*$')
+        r'^(?P<trans>\d+) packets transmitted, +(?P<recv>\d+) received.*$')
     unreachable_pattern = re.compile(
         r'.* Destination .* Unreachable')
     TIMEOUT = 15
@@ -392,13 +420,16 @@ class Pinger(object):
         self.interval = interval
 
     def _wait_for_death(self):
-        is_dead = lambda: self.proc.poll() is not None
+        def is_dead():
+            return self.proc.poll() is not None
         common_utils.wait_until_true(
             is_dead, timeout=self.TIMEOUT, exception=RuntimeError(
                 "Ping command hasn't ended after %d seconds." % self.TIMEOUT))
 
     def _parse_stats(self):
+        output = ''
         for line in self.proc.stdout:
+            output += line
             if (not self.destination_unreachable and
                     self.unreachable_pattern.match(line)):
                 self.destination_unreachable = True
@@ -409,7 +440,9 @@ class Pinger(object):
                 self.received = int(result.group('recv'))
                 break
         else:
+            LOG.error(f"Didn't find ping statistics:\n{output}")
             raise RuntimeError("Didn't find ping statistics.")
+        LOG.debug(f"ping command output:\n{output}")
 
     def start(self):
         if self.proc and self.proc.is_running:
@@ -431,15 +464,14 @@ class Pinger(object):
             self._parse_stats()
 
     def wait(self):
-        if self.count:
-            self._wait_for_death()
-            self._parse_stats()
-        else:
+        if not self.count:
             raise RuntimeError("Pinger is running infinitely, use stop() "
                                "first")
+        self._wait_for_death()
+        self._parse_stats()
 
 
-class NetcatTester(object):
+class NetcatTester:
     TCP = n_const.PROTO_NAME_TCP
     UDP = n_const.PROTO_NAME_UDP
     SCTP = n_const.PROTO_NAME_SCTP
@@ -545,7 +577,7 @@ class NetcatTester(object):
             self.server_process.writeline(message)
             message = self.client_process.read_stdout(READ_TIMEOUT).strip()
         except ConnectionError as e:
-            LOG.debug("Error: %s occured during connectivity test.", e)
+            LOG.debug("Error: %s occurred during connectivity test.", e)
             message = ""
 
         return message == testing_string
@@ -575,14 +607,12 @@ class NetcatTester(object):
         return proc
 
     def stop_processes(self, skip_errors=None):
-        skip_errors = (['No such process'] if skip_errors is None
-                       else skip_errors)
         for proc_attr in ('_client_process', '_server_process'):
             proc = getattr(self, proc_attr)
             if proc:
                 try:
                     if proc.poll() is None:
-                        proc.kill()
+                        proc.kill(skip_errors=skip_errors)
                         proc.wait()
                 except n_exc.ProcessExecutionError as exc:
                     for skip_error in skip_errors:
@@ -603,7 +633,7 @@ class NamespaceFixture(fixtures.Fixture):
     """
 
     def __init__(self, prefix=NS_PREFIX):
-        super(NamespaceFixture, self).__init__()
+        super().__init__()
         self.prefix = prefix
 
     def _setUp(self):
@@ -613,10 +643,18 @@ class NamespaceFixture(fixtures.Fixture):
         self.addCleanup(self.destroy)
 
     def destroy(self):
-        if self.ip_wrapper.netns.exists(self.name):
-            for pid in ip_lib.list_namespace_pids(self.name):
-                utils.kill_process(pid, signal.SIGKILL, run_as_root=True)
-            self.ip_wrapper.netns.delete(self.name)
+        # TODO(ralonsoh): once the issue in LP#1838793 is properly fixed, we
+        # can remove this workaround (TestTimer context).
+        with helpers.TestTimer(5):
+            try:
+                if self.ip_wrapper.netns.exists(self.name):
+                    for pid in ip_lib.list_namespace_pids(self.name):
+                        utils.kill_process(pid, signal.SIGKILL,
+                                           run_as_root=True)
+                    self.ip_wrapper.netns.delete(self.name)
+            except helpers.TestTimerTimeout:
+                LOG.warning('Namespace %s was not deleted due to a timeout.',
+                            self.name)
 
 
 class VethFixture(fixtures.Fixture):
@@ -638,8 +676,8 @@ class VethFixture(fixtures.Fixture):
     def destroy(self):
         for port in self.ports:
             ip_wrapper = ip_lib.IPWrapper(port.namespace)
-            if (ip_wrapper.netns.exists(port.namespace) or
-                    port.namespace is None):
+            if (port.namespace is None or
+                    ip_wrapper.netns.exists(port.namespace)):
                 try:
                     ip_wrapper.del_veth(port.name)
                     break
@@ -652,10 +690,9 @@ class VethFixture(fixtures.Fixture):
     def get_peer_name(name):
         if name.startswith(VETH0_PREFIX):
             return name.replace(VETH0_PREFIX, VETH1_PREFIX)
-        elif name.startswith(VETH1_PREFIX):
+        if name.startswith(VETH1_PREFIX):
             return name.replace(VETH1_PREFIX, VETH0_PREFIX)
-        else:
-            tools.fail('%s is not a valid VethFixture veth endpoint' % name)
+        tools.fail('%s is not a valid VethFixture veth endpoint' % name)
 
 
 class NamedVethFixture(VethFixture):
@@ -666,7 +703,7 @@ class NamedVethFixture(VethFixture):
     """
 
     def __init__(self, veth0_prefix=VETH0_PREFIX, veth1_prefix=VETH1_PREFIX):
-        super(NamedVethFixture, self).__init__()
+        super().__init__()
         self.veth0_name = self.get_veth_name(veth0_prefix)
         self.veth1_name = self.get_veth_name(veth1_prefix)
 
@@ -695,7 +732,7 @@ class MacvtapFixture(fixtures.Fixture):
     :type ip_dev: IPDevice
     """
     def __init__(self, src_dev=None, mode=None, prefix=MACVTAP_PREFIX):
-        super(MacvtapFixture, self).__init__()
+        super().__init__()
         self.src_dev = src_dev
         self.mode = mode
         self.prefix = prefix
@@ -717,8 +754,7 @@ class MacvtapFixture(fixtures.Fixture):
                 pass
 
 
-@six.add_metaclass(abc.ABCMeta)
-class PortFixture(fixtures.Fixture):
+class PortFixture(fixtures.Fixture, metaclass=abc.ABCMeta):
     """Create a port.
 
     :ivar port: created port
@@ -727,7 +763,7 @@ class PortFixture(fixtures.Fixture):
     """
 
     def __init__(self, bridge=None, namespace=None, mac=None, port_id=None):
-        super(PortFixture, self).__init__()
+        super().__init__()
         self.bridge = bridge
         self.namespace = namespace
         self.mac = (mac or
@@ -740,7 +776,7 @@ class PortFixture(fixtures.Fixture):
 
     @abc.abstractmethod
     def _setUp(self):
-        super(PortFixture, self)._setUp()
+        super()._setUp()
         if not self.bridge:
             self.bridge = self.useFixture(self._create_bridge_fixture()).bridge
 
@@ -756,6 +792,19 @@ class PortFixture(fixtures.Fixture):
             return VethPortFixture(bridge, namespace)
         tools.fail('Unexpected bridge type: %s' % type(bridge))
 
+    def set_port_mac_address(self):
+
+        def set_mac_address():
+            self.port.link.set_address(self.mac)
+            return self.port.link.address.lower() == self.mac.lower()
+
+        try:
+            common_utils.wait_until_true(set_mac_address, timeout=10)
+        except common_utils.WaitTimeout:
+            LOG.error("MAC address of the port %s not set properly. "
+                      "Requested MAC: %s; Actual MAC: %s",
+                      self.port, self.mac, self.port.link.address)
+
 
 class OVSBridgeFixture(fixtures.Fixture):
     """Create an OVS bridge.
@@ -767,12 +816,28 @@ class OVSBridgeFixture(fixtures.Fixture):
     """
 
     def __init__(self, prefix=BR_PREFIX):
-        super(OVSBridgeFixture, self).__init__()
+        super().__init__()
         self.prefix = prefix
 
     def _setUp(self):
         ovs = ovs_lib.BaseOVS()
         self.bridge = common_base.create_resource(self.prefix, ovs.add_bridge)
+        self.addCleanup(self.bridge.destroy)
+
+
+class OVSMetaBridgeFixture(fixtures.Fixture):
+    """Create an OVS bridge.
+
+    :ivar bridge: created bridge
+    :type bridge: OVSBridge
+    """
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+
+    def _setUp(self):
+        ovs = ovs_lib.BaseOVS()
+        self.bridge = ovs.add_bridge(self.name)
         self.addCleanup(self.bridge.destroy)
 
 
@@ -784,12 +849,24 @@ class OVSTrunkBridgeFixture(OVSBridgeFixture):
         self.addCleanup(self.bridge.destroy)
 
 
+class OVSTrunkBridgeFixtureTrunkBridge(fixtures.Fixture):
+
+    def __init__(self, trunk_id):
+        super().__init__()
+        self.trunk_id = trunk_id
+
+    def _setUp(self):
+        self.bridge = trunk_manager.TrunkBridge(self.trunk_id)
+        self.bridge.create()
+        self.addCleanup(self.bridge.destroy)
+
+
 class OVSPortFixture(PortFixture):
     NIC_NAME_LEN = 14
 
     def __init__(self, bridge=None, namespace=None, mac=None, port_id=None,
                  hybrid_plug=False):
-        super(OVSPortFixture, self).__init__(bridge, namespace, mac, port_id)
+        super().__init__(bridge, namespace, mac, port_id)
         self.hybrid_plug = hybrid_plug
         self.vlan_tag = None
 
@@ -797,15 +874,9 @@ class OVSPortFixture(PortFixture):
         return OVSBridgeFixture()
 
     def _setUp(self):
-        super(OVSPortFixture, self)._setUp()
+        super()._setUp()
 
-        # because in some tests this port can be used to providing connection
-        # between linuxbridge agents and vlan_id can be also added to this
-        # device name it has to be max LB_DEVICE_NAME_MAX_LEN long
-        port_name = common_utils.get_rand_name(
-            LB_DEVICE_NAME_MAX_LEN,
-            PORT_PREFIX
-        )
+        port_name = common_utils.get_rand_name(prefix=PORT_PREFIX)
 
         if self.hybrid_plug:
             self.hybrid_plug_port(port_name)
@@ -819,17 +890,19 @@ class OVSPortFixture(PortFixture):
         interface_config = cfg.ConfigOpts()
         config.register_interface_opts(interface_config)
         ovs_interface = interface.OVSInterfaceDriver(interface_config)
-        ovs_interface.plug_new(
-            None,
-            self.port_id,
-            port_name,
-            self.mac,
-            bridge=self.bridge.br_name,
-            namespace=self.namespace)
-        # NOTE(mangelajo): for OVS implementations remove the DEAD VLAN tag
-        # on ports that we intend to use as fake vm interfaces, they
-        # need to be flat. This is related to lp#1767422
-        self.bridge.clear_db_attribute("Port", port_name, "tag")
+        # NOTE(slaweq): for OVS implementation normally there would be DEAD
+        # VLAN tag set for port and we would need to remove it here as it is
+        # needed during the tests. But to avoid setting and removing tag, we
+        # can simply mock _set_port_dead method so port will not be tagged with
+        # DEAD_VLAN tag initially
+        with mock.patch.object(ovs_lib.OVSBridge, '_set_port_dead'):
+            ovs_interface.plug_new(
+                None,
+                self.port_id,
+                port_name,
+                self.mac,
+                bridge=self.bridge.br_name,
+                namespace=self.namespace)
         self.addCleanup(self.bridge.delete_port, port_name)
         self.port = ip_lib.IPDevice(port_name, self.namespace)
 
@@ -866,9 +939,9 @@ class OVSPortFixture(PortFixture):
         self.addCleanup(self.port.link.delete)
         ip_wrapper.add_device_to_namespace(self.port)
         bridge_port.link.set_up()
-        self.qbr.addif(bridge_port)
+        self.qbr.addif(bridge_port.name)
 
-        self.port.link.set_address(self.mac)
+        self.set_port_mac_address()
         self.port.link.set_up()
 
     # NOTE(jlibosva): Methods below are taken from nova.virt.libvirt.vif
@@ -890,7 +963,7 @@ class LinuxBridgeFixture(fixtures.Fixture):
     """
     def __init__(self, prefix=BR_PREFIX, namespace=UNDEFINED,
                  prefix_is_full_name=False):
-        super(LinuxBridgeFixture, self).__init__()
+        super().__init__()
         self.prefix = prefix
         self.prefix_is_full_name = prefix_is_full_name
         self.namespace = namespace
@@ -917,15 +990,11 @@ class LinuxBridgeFixture(fixtures.Fixture):
 
     def _create_bridge(self):
         if self.prefix_is_full_name:
-            return bridge_lib.BridgeDevice.addbr(
-                name=self.prefix,
-                namespace=self.namespace
-            )
-        else:
-            return common_base.create_resource(
-                self.prefix,
-                bridge_lib.BridgeDevice.addbr,
-                namespace=self.namespace)
+            return bridge_lib.BridgeDevice.addbr(name=self.prefix,
+                                                 namespace=self.namespace)
+        return common_base.create_resource(self.prefix,
+                                           bridge_lib.BridgeDevice.addbr,
+                                           namespace=self.namespace)
 
 
 class LinuxBridgePortFixture(PortFixture):
@@ -938,7 +1007,7 @@ class LinuxBridgePortFixture(PortFixture):
     """
 
     def __init__(self, bridge, namespace=None, mac=None, port_id=None):
-        super(LinuxBridgePortFixture, self).__init__(
+        super().__init__(
             bridge, namespace, mac, port_id)
         # we need to override port_id value here because in Port() class it is
         # always generated as random. In LinuxBridgePortFixture we need to have
@@ -950,8 +1019,8 @@ class LinuxBridgePortFixture(PortFixture):
         return LinuxBridgeFixture()
 
     def _setUp(self):
-        super(LinuxBridgePortFixture, self)._setUp()
-        br_port_name = self._get_port_name()
+        super()._setUp()
+        br_port_name = self.port_id
         if br_port_name:
             self.veth_fixture = self.useFixture(
                 NamedVethFixture(veth0_prefix=br_port_name))
@@ -959,13 +1028,12 @@ class LinuxBridgePortFixture(PortFixture):
             self.veth_fixture = self.useFixture(VethFixture())
         self.br_port, self.port = self.veth_fixture.ports
 
-        if self.mac:
-            self.port.link.set_address(self.mac)
+        self.set_port_mac_address()
 
         # bridge side
         br_ip_wrapper = ip_lib.IPWrapper(self.bridge.namespace)
         br_ip_wrapper.add_device_to_namespace(self.br_port)
-        self.bridge.addif(self.br_port)
+        self.bridge.addif(self.br_port.name)
         self.br_port.link.set_up()
 
         # port side
@@ -973,14 +1041,8 @@ class LinuxBridgePortFixture(PortFixture):
         ns_ip_wrapper.add_device_to_namespace(self.port)
         self.port.link.set_up()
 
-    def _get_port_name(self):
-        if self.port_id:
-            return linuxbridge_agent.LinuxBridgeManager.get_tap_device_name(
-                self.port_id)
-        return None
 
-
-class VethBridge(object):
+class VethBridge:
 
     def __init__(self, ports):
         self.ports = ports
@@ -1017,7 +1079,7 @@ class VethPortFixture(PortFixture):
         return VethBridgeFixture()
 
     def _setUp(self):
-        super(VethPortFixture, self)._setUp()
+        super()._setUp()
         self.port = self.bridge.allocate_port()
 
         ns_ip_wrapper = ip_lib.IPWrapper(self.namespace)

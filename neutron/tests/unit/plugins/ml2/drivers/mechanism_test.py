@@ -30,8 +30,9 @@ class TestMechanismDriver(api.MechanismDriver):
     """Test mechanism driver for testing mechanism driver api."""
 
     def __init__(self, *args, **kwargs):
-        super(TestMechanismDriver, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self._supported_vnic_types = ('test_mechanism_driver_vnic_type', )
+        self._supported_extensions = set()
 
     def initialize(self):
         self.bound_ports = set()
@@ -99,7 +100,8 @@ class TestMechanismDriver(api.MechanismDriver):
         assert(isinstance(context, api.PortContext))
 
         self._check_port_info(context.current, context.host,
-                              context.vif_type, context.vif_details)
+                              context.vif_type, context.vif_details,
+                              context.binding_levels)
 
         if context.vif_type in (portbindings.VIF_TYPE_UNBOUND,
                                 portbindings.VIF_TYPE_BINDING_FAILED):
@@ -124,7 +126,8 @@ class TestMechanismDriver(api.MechanismDriver):
         if original_expected:
             self._check_port_info(context.original, context.original_host,
                                   context.original_vif_type,
-                                  context.original_vif_details)
+                                  context.original_vif_details,
+                                  context.binding_levels)
 
             assert(context.current['id'] == context.original['id'])
 
@@ -152,7 +155,8 @@ class TestMechanismDriver(api.MechanismDriver):
         assert(isinstance(network_context, api.NetworkContext))
         self._check_network_context(network_context, False)
 
-    def _check_port_info(self, port, host, vif_type, vif_details):
+    def _check_port_info(self, port, host, vif_type, vif_details,
+                         binding_levels):
         assert(isinstance(port, dict))
         assert(port['id'] is not None)
         assert(vif_type in (portbindings.VIF_TYPE_UNBOUND,
@@ -160,6 +164,8 @@ class TestMechanismDriver(api.MechanismDriver):
                             portbindings.VIF_TYPE_DISTRIBUTED,
                             portbindings.VIF_TYPE_OVS,
                             portbindings.VIF_TYPE_BRIDGE))
+        bound_drivers = port[portbindings.VIF_DETAILS].pop(
+            portbindings.VIF_DETAILS_BOUND_DRIVERS, None)
         if port['device_owner'] == const.DEVICE_OWNER_DVR_INTERFACE:
             assert(port[portbindings.HOST_ID] == '')
             assert(port[portbindings.VIF_TYPE] ==
@@ -171,7 +177,12 @@ class TestMechanismDriver(api.MechanismDriver):
                    portbindings.VIF_TYPE_DISTRIBUTED)
             assert(port[portbindings.VIF_TYPE] == vif_type)
             assert(isinstance(vif_details, dict))
+
             assert(port[portbindings.VIF_DETAILS] == vif_details)
+        if bound_drivers and binding_levels:
+            bd_reference = {str(idx): bl['bound_driver'] for
+                            idx, bl in enumerate(binding_levels)}
+            assert(bd_reference == bound_drivers)
 
     def _check_unbound(self, levels, top_segment, bottom_segment):
         assert(levels is None)
@@ -267,13 +278,19 @@ class TestMechanismDriver(api.MechanismDriver):
     def get_standard_device_mappings(self, agent):
         return {}
 
+    def supported_extensions(self, extensions):
+        if self._supported_extensions:
+            return extensions & self._supported_extensions
+        return extensions
+
 
 class TestMechanismDriverWithAgent(mech_agent.AgentMechanismDriverBase,
                                    TestMechanismDriver):
     """Test mechanism driver with agent for testing mechanism driver api."""
 
     def __init__(self):
-        super(TestMechanismDriverWithAgent, self).__init__('test_agent_type')
+        super().__init__(
+            'test_agent_type', [portbindings.VNIC_NORMAL])
         self.bound_ports = set()
         self._agent_type = 'test_mechanism_driver_agent'
 

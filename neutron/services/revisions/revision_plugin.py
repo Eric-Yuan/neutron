@@ -14,6 +14,7 @@
 from neutron_lib.api.definitions import revisionifmatch
 from neutron_lib.db import api as db_api
 from neutron_lib.db import resource_extend
+from neutron_lib.db import standard_attr
 from neutron_lib.services import base as service_base
 from oslo_log import log as logging
 import sqlalchemy
@@ -22,7 +23,6 @@ from sqlalchemy.orm import session as se
 import webob.exc
 
 from neutron._i18n import _
-from neutron.db import standard_attr
 
 LOG = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class RevisionPlugin(service_base.ServicePluginBase):
     __filter_validation_support = True
 
     def __init__(self):
-        super(RevisionPlugin, self).__init__()
+        super().__init__()
         # background on these event hooks:
         # https://docs.sqlalchemy.org/en/latest/orm/session_events.html
         db_api.sqla_listen(se.Session, 'before_flush', self.bump_revisions)
@@ -49,20 +49,43 @@ class RevisionPlugin(service_base.ServicePluginBase):
         db_api.sqla_listen(se.Session, 'after_rollback',
                            self._clear_rev_bumped_flags)
 
+    def _get_objects_to_bump_revision(self, dirty_objects):
+        all_std_attr_objects = []
+        objects_to_bump_revision = []
+        for dirty_object in dirty_objects:
+            if isinstance(dirty_object, standard_attr.HasStandardAttributes):
+                objects_to_bump_revision.append(dirty_object)
+            elif isinstance(dirty_object, standard_attr.StandardAttribute):
+                all_std_attr_objects.append(dirty_object)
+
+        # Now as we have all objects divided into 2 groups, we need to ensure
+        # that we don't have revision number for the same one in both groups.
+        # It may happen e.g. for the Subnet object, as during update of Subnet,
+        # both Subnet and StandardAttribute objects of that subnet are dirty.
+        # But for example for Network, when only description is changed, only
+        # StandardAttribute object is in the dirty objects set.
+        std_attr_ids = [o.standard_attr_id for o in objects_to_bump_revision]
+
+        # NOTE(slaweq): StandardAttribute objects which have "description"
+        # field modified, should have revision bumped too
+        objects_to_bump_revision += [
+            o for o in all_std_attr_objects
+            if ('description' not in o._sa_instance_state.unmodified and
+                o.id not in std_attr_ids)]
+
+        return objects_to_bump_revision
+
     def bump_revisions(self, session, context, instances):
         self._enforce_if_match_constraints(session)
-        # bump revision number for any updated objects in the session
+        # bump revision number for updated objects in the session
+        modified_objs = {o for o in session.dirty if session.is_modified(o)}
         self._bump_obj_revisions(
-            session,
-            [
-                obj for obj in session.dirty
-                if isinstance(obj, standard_attr.HasStandardAttributes)]
-        )
+            session, self._get_objects_to_bump_revision(modified_objs))
 
         # see if any created/updated/deleted objects bump the revision
         # of another object
         objects_with_related_revisions = [
-            o for o in session.deleted | session.dirty | session.new
+            o for o in modified_objs | set(session.deleted) | set(session.new)
             if getattr(o, 'revises_on_change', ())
         ]
         collected = session.info.setdefault('_related_bumped', set())
@@ -186,7 +209,7 @@ class RevisionPlugin(service_base.ServicePluginBase):
                 # well.
                 standard_attr.StandardAttribute.revision_number:
                 standard_attr.StandardAttribute.revision_number + 1},
-                synchronize_session=False)
+                     synchronize_session=False)
 
             # run a SELECT to get back the new values we just generated.
             # if MySQL supported RETURNING, we could get these numbers
@@ -259,7 +282,12 @@ class RevisionPlugin(service_base.ServicePluginBase):
         to match.
         """
         context = session.info.get('using_context')
-        criteria = context.get_transaction_constraint() if context else None
+        if context:
+            # NOTE(ralonsoh): use "pop_transaction_constraint" once implemented
+            criteria = context.get_transaction_constraint()
+            context.clear_transaction_constraint()
+        else:
+            criteria = None
         if not criteria:
             return None, None
         match = criteria.if_revision_match
@@ -300,4 +328,4 @@ class RevisionNumberConstraintFailed(webob.exc.HTTPPreconditionFailed):
     def __init__(self, expected, current):
         detail = (_("Constrained to %(exp)s, but current revision is %(cur)s")
                   % {'exp': expected, 'cur': current})
-        super(RevisionNumberConstraintFailed, self).__init__(detail=detail)
+        super().__init__(detail=detail)

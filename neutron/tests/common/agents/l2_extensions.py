@@ -16,13 +16,18 @@
 import re
 import signal
 
+from neutron_lib import constants
+from neutron_lib.plugins.ml2 import ovs_constants
 from oslo_log import log as logging
 
 from neutron.agent.common import async_process
-from neutron.agent.linux import iptables_manager
 from neutron.common import utils as common_utils
+from neutron.plugins.ml2.common import constants as comm_consts
 
 LOG = logging.getLogger(__name__)
+
+PACKET_RATE_LIMIT = ovs_constants.PACKET_RATE_LIMIT
+BANDWIDTH_RATE_LIMIT = ovs_constants.BANDWIDTH_RATE_LIMIT
 
 
 class TcpdumpException(Exception):
@@ -39,15 +44,6 @@ def extract_mod_nw_tos_action(flows):
                 after_mod = actions.partition('mod_nw_tos:')[2]
                 tos_mark = int(after_mod.partition(',')[0])
     return tos_mark
-
-
-def extract_dscp_value_from_iptables_rules(rules):
-    pattern = (r"^-A neutron-linuxbri-qos-.* -j DSCP "
-               "--set-dscp (?P<dscp_value>0x[A-Fa-f0-9]+)$")
-    for rule in rules:
-        m = re.match(pattern, rule)
-        if m:
-            return int(m.group("dscp_value"), 16)
 
 
 def wait_until_bandwidth_limit_rule_applied(check_function, port_vif, rule):
@@ -86,18 +82,31 @@ def wait_until_dscp_marking_rule_applied_ovs(bridge, port_vif, rule):
     common_utils.wait_until_true(_dscp_marking_rule_applied)
 
 
-def wait_until_dscp_marking_rule_applied_linuxbridge(namespace, port_vif,
-                                                     expected_rule):
+def wait_until_pkt_meter_rule_applied_ovs(bridge, port_vif, port_id,
+                                          direction, mac=None,
+                                          type_=comm_consts.METER_FLAG_PPS):
+    def _pkt_rate_limit_rule_applied():
+        port_num = bridge.get_port_ofport(port_vif)
+        port_vlan = bridge.get_port_tag_by_name(port_vif)
+        key = f"{type_}_{port_id}_{direction}"
+        meter_id = bridge.get_value_from_other_config(
+            port_vif, key, value_type=int)
 
-    iptables = iptables_manager.IptablesManager(
-        namespace=namespace)
+        table = (str(PACKET_RATE_LIMIT) if
+                 type_ == comm_consts.METER_FLAG_PPS else
+                 str(BANDWIDTH_RATE_LIMIT))
 
-    def _dscp_marking_rule_applied():
-        mangle_rules = iptables.get_rules_for_table("mangle")
-        dscp_mark = extract_dscp_value_from_iptables_rules(mangle_rules)
-        return dscp_mark == expected_rule
+        if direction == constants.EGRESS_DIRECTION:
+            flows = bridge.dump_flows_for(table=table, in_port=str(port_num),
+                                          dl_src=str(mac))
+        else:
+            flows = bridge.dump_flows_for(table=table, dl_vlan=str(port_vlan),
+                                          dl_dst=str(mac))
+        if mac:
+            return bool(flows) and meter_id
+        return not bool(flows) and not meter_id
 
-    common_utils.wait_until_true(_dscp_marking_rule_applied)
+    common_utils.wait_until_true(_pkt_rate_limit_rule_applied)
 
 
 def wait_for_dscp_marked_packet(sender_vm, receiver_vm, dscp_mark):
@@ -126,7 +135,7 @@ def wait_for_dscp_marked_packet(sender_vm, receiver_vm, dscp_mark):
             return
         tcpdump_stderr_lines.append(line)
 
-    tcpdump_stdout_lines = [line for line in tcpdump_async.iter_stdout()]
+    tcpdump_stdout_lines = list(tcpdump_async.iter_stdout())
     LOG.debug("Captured output lines from tcpdump. Stdout: %s; Stderr: %s",
               tcpdump_stdout_lines, tcpdump_stderr_lines)
 
@@ -135,3 +144,22 @@ def wait_for_dscp_marked_packet(sender_vm, receiver_vm, dscp_mark):
         "to %(dst)s" % {'dscp_mark': dscp_mark,
                         'src': sender_vm.ip,
                         'dst': receiver_vm.ip})
+
+
+def extract_vlan_id(flows):
+    if flows:
+        flow_list = flows.splitlines()
+        for flow in flow_list:
+            if 'mod_vlan_vid' in flow:
+                actions = flow.partition('actions=')[2]
+                after_mod = actions.partition('mod_vlan_vid:')[2]
+                return int(after_mod.partition(',')[0])
+
+
+def wait_for_mod_vlan_id_applied(bridge, expected_vlan_id):
+    def _vlan_id_rule_applied():
+        flows = bridge.dump_flows_for(table='0')
+        vlan_id = extract_vlan_id(flows)
+        return vlan_id == expected_vlan_id
+
+    common_utils.wait_until_true(_vlan_id_rule_applied)

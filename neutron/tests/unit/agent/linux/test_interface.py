@@ -13,10 +13,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import time
 from unittest import mock
 
 from neutron_lib import constants
+from neutron_lib.plugins.ml2 import ovs_constants as ovs_const
 from oslo_utils import excutils
+from oslo_utils import uuidutils
 from pyroute2.netlink import exceptions as pyroute2_exc
 
 from neutron.agent.common import ovs_lib
@@ -25,6 +28,7 @@ from neutron.agent.linux import ip_lib
 from neutron.common import utils
 from neutron.conf.agent import common as config
 from neutron.conf.plugins.ml2.drivers import ovs_conf
+from neutron.privileged.agent.linux import ethtool
 from neutron.tests import base
 
 
@@ -36,21 +40,21 @@ class BaseChild(interface.LinuxInterfaceDriver):
         pass
 
 
-class FakeNetwork(object):
+class FakeNetwork:
     id = '12345678-1234-5678-90ab-ba0987654321'
 
 
-class FakeSubnet(object):
+class FakeSubnet:
     cidr = '192.168.1.1/24'
 
 
-class FakeAllocation(object):
+class FakeAllocation:
     subnet = FakeSubnet()
     ip_address = '192.168.1.2'
     ip_version = constants.IP_VERSION_4
 
 
-class FakePort(object):
+class FakePort:
     id = 'abcdef01-1234-5678-90ab-ba0987654321'
     fixed_ips = [FakeAllocation]
     device_id = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
@@ -60,14 +64,18 @@ class FakePort(object):
 
 class TestBase(base.BaseTestCase):
     def setUp(self):
-        super(TestBase, self).setUp()
+        super().setUp()
         self.conf = config.setup_conf()
         ovs_conf.register_ovs_opts(self.conf)
         config.register_interface_opts(self.conf)
+        self.eth_offload_p = mock.patch.object(ethtool, 'offload')
+        self.eth_offload = self.eth_offload_p.start()
         self.ip_dev_p = mock.patch.object(ip_lib, 'IPDevice')
         self.ip_dev = self.ip_dev_p.start()
         self.ip_p = mock.patch.object(ip_lib, 'IPWrapper')
         self.ip = self.ip_p.start()
+        link = self.ip.return_value.device.return_value.link
+        link.address = 'aa:bb:cc:dd:ee:ff'
         self.device_exists_p = mock.patch.object(ip_lib, 'device_exists')
         self.device_exists = self.device_exists_p.start()
         self.get_devices_with_ip_p = mock.patch.object(ip_lib,
@@ -77,7 +85,7 @@ class TestBase(base.BaseTestCase):
 
 class TestABCDriver(TestBase):
     def setUp(self):
-        super(TestABCDriver, self).setUp()
+        super().setUp()
         mock_link_addr = mock.PropertyMock(return_value='aa:bb:cc:dd:ee:ff')
         type(self.ip_dev().link).address = mock_link_addr
 
@@ -196,7 +204,7 @@ class TestABCDriver(TestBase):
         ns = '12345678-1234-5678-90ab-ba0987654321'
         new_cidrs = ['192.168.1.2/24', '2001:db8:a::124/64']
         bc.init_router_port('tap0', new_cidrs, namespace=ns,
-            extra_subnets=[{'cidr': '172.20.0.0/24'}])
+                            extra_subnets=[{'cidr': '172.20.0.0/24'}])
         self.ip_dev.assert_has_calls(
             [mock.call('tap0', namespace=ns),
              mock.call().addr.list(),
@@ -381,6 +389,10 @@ class TestABCDriver(TestBase):
 
 class TestOVSInterfaceDriver(TestBase):
 
+    def setUp(self):
+        super().setUp()
+        self.mock_sleep = mock.patch.object(time, 'sleep').start()
+
     def test_get_device_name(self):
         br = interface.OVSInterfaceDriver(self.conf)
         device_name = br.get_device_name(FakePort())
@@ -434,6 +446,11 @@ class TestOVSInterfaceDriver(TestBase):
                 self.device_exists.side_effect = device_exists
                 link = self.ip.return_value.device.return_value.link
                 link.set_address.side_effect = (RuntimeError, None)
+                namespace_obj = (
+                    self.ip.return_value.ensure_namespace.return_value)
+                self.ip.ensure_namespace.return_value = namespace_obj
+                namespace_obj.add_device_to_namespace.side_effect = (
+                    ip_lib.NetworkInterfaceNotFound, utils.WaitTimeout, None)
                 ovs.plug('01234567-1234-1234-99',
                          'port-1234',
                          'tap0',
@@ -452,11 +469,16 @@ class TestOVSInterfaceDriver(TestBase):
             expected = [
                 mock.call(),
                 mock.call().device('tap0'),
+                mock.ANY,
                 mock.call().device().link.set_address('aa:bb:cc:dd:ee:ff'),
                 mock.call().device().link.set_address('aa:bb:cc:dd:ee:ff')]
             if namespace:
                 expected.extend(
                     [mock.call().ensure_namespace(namespace),
+                     mock.call().ensure_namespace().add_device_to_namespace(
+                         mock.ANY),
+                     mock.call().ensure_namespace().add_device_to_namespace(
+                         mock.ANY),
                      mock.call().ensure_namespace().add_device_to_namespace(
                          mock.ANY)])
             expected.extend([
@@ -479,11 +501,11 @@ class TestOVSInterfaceDriver(TestBase):
                     reraise = mock.patch.object(
                         excutils, 'save_and_reraise_exception')
                     reraise.start()
-                    ip_wrapper = mock.Mock()
                     for exception in (OSError(),
-                                      pyroute2_exc.NetlinkError(22)):
-                        ip_wrapper.ensure_namespace.side_effect = exception
-                        self.ip.return_value = ip_wrapper
+                                      pyroute2_exc.NetlinkError(22),
+                                      RuntimeError()):
+                        ip = self.ip.return_value
+                        ip.ensure_namespace.side_effect = exception
                         delete_port.reset_mock()
                         ovs.plug_new(
                             '01234567-1234-1234-99',
@@ -503,12 +525,32 @@ class TestOVSInterfaceDriver(TestBase):
             ovs_br.assert_has_calls([mock.call('br-int'),
                                      mock.call().delete_port('tap0')])
 
+    def test__add_device_to_namespace_retries(self):
+        ovs = interface.OVSInterfaceDriver(self.conf)
+        namespace_obj = self.ip.return_value.ensure_namespace.return_value
+        self.ip.ensure_namespace.return_value = namespace_obj
+        namespace_obj.add_device_to_namespace.side_effect = (
+            ip_lib.NetworkInterfaceNotFound)
+        namespace_name = uuidutils.generate_uuid()
+        device = mock.MagicMock(namespace=namespace_name)
+        self.assertRaises(
+            ip_lib.NetworkInterfaceNotFound,
+            ovs._add_device_to_namespace,
+            self.ip, device, "test-ns")
+        self.assertEqual(10, namespace_obj.add_device_to_namespace.call_count)
+        self.assertEqual(namespace_name, device.namespace)
+
 
 class TestOVSInterfaceDriverWithVeth(TestOVSInterfaceDriver):
 
     def setUp(self):
-        super(TestOVSInterfaceDriverWithVeth, self).setUp()
+        super().setUp()
+        ovs_conf.register_ovs_agent_opts(self.conf)
         self.conf.set_override('ovs_use_veth', True)
+        self.conf.set_override(
+            'datapath_type',
+            ovs_const.OVS_DATAPATH_NETDEV,
+            group='OVS')
 
     def test_get_device_name(self):
         br = interface.OVSInterfaceDriver(self.conf)
@@ -535,10 +577,12 @@ class TestOVSInterfaceDriverWithVeth(TestOVSInterfaceDriver):
 
             root_dev = mock.Mock()
             ns_dev = mock.Mock()
+            ns_dev.link.address = 'aa:bb:cc:dd:ee:ff'
             self.ip().add_veth = mock.Mock(return_value=(root_dev, ns_dev))
             mock.patch.object(
                 interface, '_get_veth',
                 return_value=(root_dev, ns_dev)).start()
+            ns_dev.name = devname
 
             expected = [mock.call(),
                         mock.call().add_veth('tap0', devname,
@@ -569,6 +613,8 @@ class TestOVSInterfaceDriverWithVeth(TestOVSInterfaceDriver):
             self.ip.assert_has_calls(expected)
             root_dev.assert_has_calls([mock.call.link.set_up()])
             ns_dev.assert_has_calls([mock.call.link.set_up()])
+            self.eth_offload.assert_has_calls(
+                [mock.call(devname, rx=False, tx=False, namespace=namespace)])
 
     def test_plug_new(self):
         # The purpose of test_plug_new in parent class(TestOVSInterfaceDriver)
@@ -584,80 +630,4 @@ class TestOVSInterfaceDriverWithVeth(TestOVSInterfaceDriver):
             ovs_br.assert_has_calls([mock.call(bridge),
                                      mock.call().delete_port('tap0')])
         self.ip_dev.assert_has_calls([mock.call('ns-0', namespace=None),
-                                      mock.call().link.delete()])
-
-
-class TestBridgeInterfaceDriver(TestBase):
-    def test_get_device_name(self):
-        br = interface.BridgeInterfaceDriver(self.conf)
-        device_name = br.get_device_name(FakePort())
-        self.assertEqual('ns-abcdef01-12', device_name)
-
-    def test_plug_no_ns(self):
-        self._test_plug()
-
-    def test_plug_with_ns(self):
-        self._test_plug(namespace='01234567-1234-1234-99')
-
-    def _test_plug(self, namespace=None):
-        def device_exists(device, namespace=None):
-            return device.startswith('brq')
-
-        root_veth = mock.Mock()
-        ns_veth = mock.Mock()
-
-        self.ip().add_veth = mock.Mock(return_value=(root_veth, ns_veth))
-        mock.patch.object(
-            interface, '_get_veth',
-            return_value=(root_veth, ns_veth)).start()
-
-        self.device_exists.side_effect = device_exists
-        br = interface.BridgeInterfaceDriver(self.conf)
-        mac_address = 'aa:bb:cc:dd:ee:ff'
-        br.plug('01234567-1234-1234-99',
-                'port-1234',
-                'ns-0',
-                mac_address,
-                namespace=namespace,
-                mtu=9000)
-
-        ip_calls = [mock.call(),
-                    mock.call().add_veth('tap0', 'ns-0', namespace2=namespace)]
-        ns_veth.assert_has_calls([mock.call.link.set_address(mac_address)])
-        ns_veth.assert_has_calls([mock.call.link.set_mtu(9000)])
-        root_veth.assert_has_calls([mock.call.link.set_mtu(9000)])
-
-        self.ip.assert_has_calls(ip_calls)
-
-        root_veth.assert_has_calls([mock.call.link.set_up()])
-        ns_veth.assert_has_calls([mock.call.link.set_up()])
-
-    def test_plug_dev_exists(self):
-        self.device_exists.return_value = True
-        with mock.patch('neutron.agent.linux.interface.LOG.info') as log:
-            br = interface.BridgeInterfaceDriver(self.conf)
-            br.plug('01234567-1234-1234-99',
-                    'port-1234',
-                    'tap0',
-                    'aa:bb:cc:dd:ee:ff')
-            self.assertFalse(self.ip_dev.called)
-            self.assertEqual(log.call_count, 1)
-
-    def test_unplug_no_device(self):
-        self.device_exists.return_value = False
-        self.ip_dev().link.delete.side_effect = RuntimeError
-        with mock.patch('neutron.agent.linux.interface.LOG') as log:
-            br = interface.BridgeInterfaceDriver(self.conf)
-            br.unplug('tap0')
-            [mock.call(), mock.call('tap0'), mock.call().link.delete()]
-            self.assertEqual(log.error.call_count, 1)
-
-    def test_unplug(self):
-        self.device_exists.return_value = True
-        with mock.patch('neutron.agent.linux.interface.LOG.debug') as log:
-            br = interface.BridgeInterfaceDriver(self.conf)
-            br.unplug('tap0')
-            self.assertEqual(log.call_count, 1)
-
-        self.ip_dev.assert_has_calls([mock.call('tap0', namespace=None),
                                       mock.call().link.delete()])

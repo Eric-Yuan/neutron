@@ -17,16 +17,14 @@ import sys
 
 from neutron_lib.agent import l2_extension
 from neutron_lib import constants
+from neutron_lib.plugins.ml2 import ovs_constants
 from neutron_lib.utils import helpers
 from oslo_config import cfg
 from oslo_log import log as logging
+from pyroute2.netlink import exceptions as netlink_exceptions
 
 from neutron.agent.linux import bridge_lib
 from neutron.conf.agent import l2_ext_fdb_population
-from neutron.plugins.ml2.drivers.linuxbridge.agent.common import (
-     constants as linux_bridge_constants)
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import (
-     constants as ovs_constants)
 
 l2_ext_fdb_population.register_fdb_population_opts()
 
@@ -35,15 +33,15 @@ LOG = logging.getLogger(__name__)
 
 class FdbPopulationAgentExtension(
         l2_extension.L2AgentExtension):
-    """The FDB population is an agent extension to OVS or linux bridge
-    who's objective is to update the FDB table for existing instance
+    """The FDB population is an agent extension to OVS
+    whose objective is to update the FDB table for existing instance
     using normal port, thus enabling communication between SR-IOV instances
     and normal instances.
     Additional information describing the problem can be found here:
     http://events.linuxfoundation.org/sites/events/files/slides/LinuxConJapan2014_makita_0.pdf
     """
 
-    # FDB udpates are triggered for ports with a certain device_owner only:
+    # FDB updates are triggered for ports with a certain device_owner only:
     # - device owner "compute": updates the FDB with normal port instances,
     #       required in order to enable communication between
     #       SR-IOV direct port instances and normal port instance.
@@ -60,7 +58,7 @@ class FdbPopulationAgentExtension(
                                constants.DEVICE_OWNER_ROUTER_INTF,
                                constants.DEVICE_OWNER_DHCP}
 
-    class FdbTableTracker(object):
+    class FdbTableTracker:
         """FDB table tracker is a helper class
         intended to keep track of the existing FDB rules.
         """
@@ -70,13 +68,14 @@ class FdbPopulationAgentExtension(
             # update macs already in the physical interface's FDB table
             for device in devices:
                 try:
-                    _stdout = bridge_lib.FdbInterface.show(device)
-                except RuntimeError as e:
+                    rules = bridge_lib.FdbInterface.show(dev=device)
+                except (OSError, netlink_exceptions.NetlinkError) as e:
                     LOG.warning(
                         'Unable to find FDB Interface %(device)s. '
                         'Exception: %(e)s', {'device': device, 'e': e})
                     continue
-                self.device_to_macs[device] = _stdout.split()[::3]
+                self.device_to_macs[device] = [rule['mac'] for rule in
+                                               rules[device]]
 
         def update_port(self, device, port_id, mac):
             # check if device is updated
@@ -90,14 +89,9 @@ class FdbPopulationAgentExtension(
             # check if rule for mac already exists
             if mac in self.device_to_macs[device]:
                 return
-            try:
-                bridge_lib.FdbInterface.add(mac, device)
-            except RuntimeError as e:
-                LOG.warning(
-                    'Unable to add mac %(mac)s '
-                    'to FDB Interface %(device)s. '
-                    'Exception: %(e)s',
-                    {'mac': mac, 'device': device, 'e': e})
+            if not bridge_lib.FdbInterface.add(mac, device):
+                LOG.warning('Unable to add mac %(mac)s to FDB Interface '
+                            '%(device)s.', {'mac': mac, 'device': device})
                 return
             self.device_to_macs[device].append(mac)
 
@@ -110,14 +104,10 @@ class FdbPopulationAgentExtension(
                 return
             for device in devices:
                 if mac in self.device_to_macs[device]:
-                    try:
-                        bridge_lib.FdbInterface.delete(mac, device)
-                    except RuntimeError as e:
-                        LOG.warning(
-                            'Unable to delete mac %(mac)s '
-                            'from FDB Interface %(device)s. '
-                            'Exception: %(e)s',
-                            {'mac': mac, 'device': device, 'e': e})
+                    if not bridge_lib.FdbInterface.delete(mac, device):
+                        LOG.warning('Unable to delete mac %(mac)s from FDB '
+                                    'Interface %(device)s.',
+                                    {'mac': mac, 'device': device})
                         return
                     self.device_to_macs[device].remove(mac)
                     del self.portid_to_mac[port_id]
@@ -125,12 +115,9 @@ class FdbPopulationAgentExtension(
     # class FdbPopulationAgentExtension implementation:
     def initialize(self, connection, driver_type):
         """Perform FDB Agent Extension initialization."""
-        valid_driver_types = (linux_bridge_constants.EXTENSION_DRIVER_TYPE,
-                              ovs_constants.EXTENSION_DRIVER_TYPE)
-        if driver_type not in valid_driver_types:
-            LOG.error('FDB extension is only supported for OVS and '
-                      'linux bridge agent, currently uses '
-                      '%(driver_type)s', {'driver_type': driver_type})
+        if driver_type != ovs_constants.EXTENSION_DRIVER_TYPE:
+            LOG.error('FDB extension is only supported for OVS agent, '
+                      f'currently uses {driver_type}')
             sys.exit(1)
 
         self.device_mappings = helpers.parse_mappings(

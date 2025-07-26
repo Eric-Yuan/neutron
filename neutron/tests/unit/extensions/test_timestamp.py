@@ -19,7 +19,6 @@ from neutron_lib import context
 from neutron_lib.plugins import directory
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
-import six
 
 from neutron.common import utils
 from neutron.db import db_base_plugin_v2
@@ -27,10 +26,10 @@ from neutron.extensions import timestamp
 from neutron import manager
 from neutron.objects import network as net_obj
 from neutron.objects import tag as tag_obj
-from neutron.tests.unit.db import test_db_base_plugin_v2
+from neutron.tests.common import test_db_base_plugin_v2
 
 
-class TimeStampExtensionManager(object):
+class TimeStampExtensionManager:
 
     def get_resources(self):
         return []
@@ -56,12 +55,12 @@ class TimeStampChangedsinceTestCase(test_db_base_plugin_v2.
 
     def setUp(self):
         ext_mgr = TimeStampExtensionManager()
-        super(TimeStampChangedsinceTestCase, self).setUp(plugin=self.plugin,
-                                                         ext_mgr=ext_mgr)
+        super().setUp(plugin=self.plugin,
+                      ext_mgr=ext_mgr)
         self.addCleanup(manager.NeutronManager.clear_instance)
 
     def setup_coreplugin(self, core_plugin=None, load_plugins=True):
-        super(TimeStampChangedsinceTestCase, self).setup_coreplugin(
+        super().setup_coreplugin(
             self.plugin, load_plugins=False)
         self.patched_default_svc_plugins.return_value = ['timestamp']
         manager.init()
@@ -74,7 +73,7 @@ class TimeStampChangedsinceTestCase(test_db_base_plugin_v2.
         return resources
 
     def _return_by_timedelay(self, resource, timedelay):
-        resource_type = six.next(six.iterkeys(resource))
+        resource_type = next(iter(resource))
         time_create = timeutils.parse_isotime(
             resource[resource_type]['updated_at'])
         time_before = datetime.timedelta(seconds=timedelay)
@@ -85,7 +84,7 @@ class TimeStampChangedsinceTestCase(test_db_base_plugin_v2.
                                                  addedtime_string)
 
     def _update_test_resource_by_name(self, resource):
-        resource_type = six.next(six.iterkeys(resource))
+        resource_type = next(iter(resource))
         name = resource[resource_type]['name']
         data = {resource_type: {'name': '%s_new' % name}}
         req = self.new_update_request('%ss' % resource_type,
@@ -104,7 +103,7 @@ class TimeStampChangedsinceTestCase(test_db_base_plugin_v2.
     def _list_resources_with_changed_since(self, resource):
         # assert list results contain the net info when
         # changed_since equal with the net updated time.
-        resource_type = six.next(six.iterkeys(resource))
+        resource_type = next(iter(resource))
         if resource_type in ['network', 'port']:
             self._set_timestamp_by_show(resource, resource_type)
         resources = self._get_resp_with_changed_since(resource_type,
@@ -125,7 +124,7 @@ class TimeStampChangedsinceTestCase(test_db_base_plugin_v2.
         self.assertEqual([], resources[resource_type + 's'])
 
     def _test_list_mutiple_resources_with_changed_since(self, first, second):
-        resource_type = six.next(six.iterkeys(first))
+        resource_type = next(iter(first))
         if resource_type in ['network', 'port']:
             self._set_timestamp_by_show(first, resource_type)
             self._set_timestamp_by_show(second, resource_type)
@@ -242,19 +241,23 @@ class TimeStampChangedsinceTestCase(test_db_base_plugin_v2.
 class TimeStampDBMixinTestCase(TimeStampChangedsinceTestCase):
     """Test timestamp_db.TimeStamp_db_mixin()"""
 
-    def _save_network(self, network_id):
+    def _save_network(self, network_id, timenow):
         ctx = context.get_admin_context()
+        # getting admin context will have called timeutils, reset now
+        timenow.reset_mock()
         obj = net_obj.Network(ctx, id=network_id)
         obj.create()
         return obj
 
     # Use tag as non StandardAttribute object
-    def _save_tag(self, tags, standard_attr_id):
+    def _save_tag(self, tags, standard_attr_id, timenow):
         ctx = context.get_admin_context()
         ret = []
+        # getting admin context will have called timeutils, reset now
+        timenow.reset_mock()
         for tag in tags:
             _tag_obj = tag_obj.Tag(ctx, standard_attr_id=standard_attr_id,
-                                  tag=tag)
+                                   tag=tag)
             _tag_obj.create()
             ret.append(_tag_obj)
         return ret
@@ -266,15 +269,14 @@ class TimeStampDBMixinTestCase(TimeStampChangedsinceTestCase):
         def save_network():
             if self._network:
                 self._network.delete()
-            timenow.reset_mock()
-            self._network = self._save_network(network_id)
+            self._network = self._save_network(network_id, timenow)
             return 1 == timenow.call_count
 
         def save_tag():
             for tag in self._tags:
                 tag.delete()
-            timenow.reset_mock()
-            self._tags = self._save_tag(tags, self._network.standard_attr_id)
+            self._tags = self._save_tag(tags, self._network.standard_attr_id,
+                                        timenow)
             return 0 == timenow.call_count
 
         network_id = uuidutils.generate_uuid()

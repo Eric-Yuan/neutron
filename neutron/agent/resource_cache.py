@@ -28,7 +28,7 @@ LOG = logging.getLogger(__name__)
 objects.register_objects()
 
 
-class RemoteResourceCache(object):
+class RemoteResourceCache:
     """Retrieves and stashes logical resources in their OVO format.
 
     This is currently only compatible with OVO objects that have an ID.
@@ -48,6 +48,9 @@ class RemoteResourceCache(object):
 
     def start_watcher(self):
         self._watcher = RemoteResourceWatcher(self)
+
+    def stop_watcher(self):
+        self._watcher.stop()
 
     def get_resource_by_id(self, rtype, obj_id, agent_restarted=False):
         """Returns None if it doesn't exist."""
@@ -118,7 +121,7 @@ class RemoteResourceCache(object):
         If the attribute on the object is a list, each value is checked if it
         is in the list.
 
-        The values in the dicionary for a single key are matched in an OR
+        The values in the dictionary for a single key are matched in an OR
         fashion.
         """
         self._flood_cache_for_query(rtype, **filters)
@@ -127,7 +130,7 @@ class RemoteResourceCache(object):
             for key, values in filters.items():
                 for value in values:
                     attr = getattr(obj, key)
-                    if isinstance(attr, (list, tuple, set)):
+                    if isinstance(attr, list | tuple | set):
                         # attribute is a list so we check if value is in
                         # list
                         if value in attr:
@@ -191,11 +194,24 @@ class RemoteResourceCache(object):
         else:
             LOG.debug("Received new resource %s: %s", rtype, resource)
         # local notification for agent internals to subscribe to
-        registry.notify(rtype, events.AFTER_UPDATE, self,
-                        context=context, changed_fields=changed_fields,
-                        existing=existing, updated=resource,
-                        resource_id=resource.id,
-                        agent_restarted=agent_restarted)
+        registry.publish(rtype, events.AFTER_UPDATE, self,
+                         payload=events.DBEventPayload(
+                             context,
+                             metadata={'changed_fields': changed_fields,
+                                       'agent_restarted': agent_restarted},
+                             resource_id=resource.id,
+                             states=(existing, resource)))
+
+    def record_resource_remove(self, rtype, resource_id):
+        filters = {'id': (resource_id, )}
+        for i in self._get_query_ids(rtype, filters):
+            try:
+                self._satisfied_server_queries.remove(i)
+            except KeyError:
+                continue
+        LOG.debug("Remove resource cache for resource %s: %s",
+                  rtype, resource_id)
+        self._type_cache(rtype).pop(resource_id, None)
 
     def record_resource_delete(self, context, rtype, resource_id):
         # deletions are final, record them so we never
@@ -209,8 +225,11 @@ class RemoteResourceCache(object):
         self._deleted_ids_by_type[rtype].add(resource_id)
         existing = self._type_cache(rtype).pop(resource_id, None)
         # local notification for agent internals to subscribe to
-        registry.notify(rtype, events.AFTER_DELETE, self, context=context,
-                        existing=existing, resource_id=resource_id)
+        registry.publish(rtype, events.AFTER_DELETE, self,
+                         payload=events.DBEventPayload(
+                             context,
+                             resource_id=resource_id,
+                             states=(existing,)))
 
     def _get_changed_fields(self, old, new):
         """Returns changed fields excluding update time and revision."""
@@ -225,7 +244,7 @@ class RemoteResourceCache(object):
         return changed
 
 
-class RemoteResourceWatcher(object):
+class RemoteResourceWatcher:
     """Converts RPC callback notifications to local registry notifications.
 
     This allows a constructor to listen for RPC callbacks for a given
@@ -258,3 +277,6 @@ class RemoteResourceWatcher(object):
             else:
                 # creates and updates are treated equally
                 self.rcache.record_resource_update(context, rtype, r)
+
+    def stop(self):
+        self._connection.close()

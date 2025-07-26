@@ -35,6 +35,12 @@ FLAT_VLAN = 0
 
 
 mech_sriov_conf.register_sriov_mech_driver_opts()
+SRIOV_SUPPORTED_VNIC_TYPES = [
+    portbindings.VNIC_DIRECT,
+    portbindings.VNIC_MACVTAP,
+    portbindings.VNIC_DIRECT_PHYSICAL,
+    portbindings.VNIC_ACCELERATOR_DIRECT,
+]
 
 
 class SriovNicSwitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
@@ -53,38 +59,37 @@ class SriovNicSwitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
     resource_provider_uuid5_namespace = uuid.UUID(
         '87f1895c-73bb-11e8-9008-c4d987b2a692')
 
-    def __init__(self,
-                 agent_type=constants.AGENT_TYPE_NIC_SWITCH,
-                 vif_details={portbindings.CAP_PORT_FILTER: False,
-                              portbindings.VIF_DETAILS_CONNECTIVITY:
-                                  portbindings.CONNECTIVITY_L2},
-                 supported_vnic_types=[portbindings.VNIC_DIRECT,
-                                       portbindings.VNIC_MACVTAP,
-                                       portbindings.VNIC_DIRECT_PHYSICAL]):
+    def __init__(self):
         """Initialize base class for SriovNicSwitch L2 agent type.
 
         :param agent_type: Constant identifying agent type in agents_db
         :param vif_details: Dictionary with details for VIF driver when bound
         :param supported_vnic_types: The binding:vnic_type values we can bind
         """
-        self.agent_type = agent_type
-
-        # TODO(lajoskatona): move this blacklisting to
-        # SimpleAgentMechanismDriverBase. By that e blacklisting and validation
-        # of the vnic_types would be available for all mechanism drivers.
-        self.supported_vnic_types = self.blacklist_supported_vnic_types(
-            vnic_types=supported_vnic_types,
-            blacklist=cfg.CONF.SRIOV_DRIVER.vnic_type_blacklist
-        )
+        agent_type = constants.AGENT_TYPE_NIC_SWITCH
+        vif_details = {portbindings.CAP_PORT_FILTER: False,
+                       portbindings.VIF_DETAILS_CONNECTIVITY:
+                           self.connectivity}
+        supported_vnic_types = SRIOV_SUPPORTED_VNIC_TYPES
+        prohibit_list = cfg.CONF.SRIOV_DRIVER.vnic_type_prohibit_list
+        super().__init__(agent_type, None, vif_details,
+                         supported_vnic_types=supported_vnic_types,
+                         vnic_type_prohibit_list=prohibit_list)
 
         # NOTE(ndipanov): PF passthrough requires a different vif type
+        def _vif_type(vtype):
+            return (portbindings.VIF_TYPE_HOSTDEV_PHY
+                    if vtype == portbindings.VNIC_DIRECT_PHYSICAL
+                    else portbindings.VIF_TYPE_HW_VEB)
+
         self.vnic_type_for_vif_type = (
-            {vtype: portbindings.VIF_TYPE_HOSTDEV_PHY
-                if vtype == portbindings.VNIC_DIRECT_PHYSICAL
-                else portbindings.VIF_TYPE_HW_VEB
-             for vtype in self.supported_vnic_types})
+            {vtype: _vif_type(vtype) for vtype in self.supported_vnic_types})
         self.vif_details = vif_details
         sriov_qos_driver.register()
+
+    @property
+    def connectivity(self):
+        return portbindings.CONNECTIVITY_L2
 
     def get_allowed_network_types(self, agent):
         return (constants.TYPE_FLAT, constants.TYPE_VLAN)
@@ -105,9 +110,9 @@ class SriovNicSwitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         """
         if 'device_mappings' in agent['configurations']:
             return agent['configurations']['device_mappings']
-        else:
-            raise ValueError(_('Cannot standardize device mappings of agent '
-                               'type: %s'), agent['agent_type'])
+        raise ValueError(
+            _('Cannot standardize device mappings of agent type: %s'),
+            agent['agent_type'])
 
     def bind_port(self, context):
         LOG.debug("Attempting to bind port %(port)s on "
@@ -130,6 +135,22 @@ class SriovNicSwitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
                       vnic_type)
             return
 
+        allowed_binding_segments = []
+
+        subnets = self.get_subnets_from_fixed_ips(context)
+        if subnets:
+            # In case that fixed IPs is provided, filter segments per subnet
+            # that they belong to first.
+            for segment in context.segments_to_bind:
+                for subnet in subnets:
+                    seg_id = subnet.get('segment_id')
+                    # If subnet is not attached to any segment, let's use
+                    # default behavior.
+                    if seg_id is None or seg_id == segment[api.ID]:
+                        allowed_binding_segments.append(segment)
+        else:
+            allowed_binding_segments = context.segments_to_bind
+
         if vnic_type == portbindings.VNIC_DIRECT_PHYSICAL:
             # Physical functions don't support things like QoS properties,
             # spoof checking, etc. so we might as well side-step the agent
@@ -138,7 +159,7 @@ class SriovNicSwitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
             # either. This should be changed in the future so physical
             # functions can use device mapping checks and the plugin can
             # get port status updates.
-            for segment in context.segments_to_bind:
+            for segment in allowed_binding_segments:
                 if self.try_to_bind_segment_for_agent(context, segment,
                                                       agent=None):
                     break
@@ -147,7 +168,7 @@ class SriovNicSwitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         for agent in context.host_agents(self.agent_type):
             LOG.debug("Checking agent: %s", agent)
             if agent['alive']:
-                for segment in context.segments_to_bind:
+                for segment in allowed_binding_segments:
                     if self.try_to_bind_segment_for_agent(context, segment,
                                                           agent):
                         return
@@ -178,6 +199,9 @@ class SriovNicSwitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         :param agent: agents_db entry describing agent to bind or None
         :returns: True if segment can be bound for agent
         """
+        if agent and agent['agent_type'] != self.agent_type:
+            return False
+
         network_type = segment[api.NETWORK_TYPE]
         if network_type in self.get_allowed_network_types(agent):
             if agent:
@@ -191,6 +215,20 @@ class SriovNicSwitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
 
     def check_vlan_transparency(self, context):
         """SR-IOV driver vlan transparency support."""
+
+        # The SR-IOV driver don't really have any way to configure vlans
+        # transparency for the ports but it returns `True` so that having
+        # this driver enabled will not prevent the creation of networks with
+        # enabled vlan QinQ
+        return True
+
+    def check_vlan_qinq(self, context):
+        """SR-IOV driver vlan QinQ support."""
+
+        # The SR-IOV driver don't really have any way to configure QinQ vlans
+        # for the ports but it returns `True` so that having this driver
+        # enabled will not prevent the creation of networks with enabled
+        # vlan QinQ
         return True
 
     def _get_vif_details(self, segment):

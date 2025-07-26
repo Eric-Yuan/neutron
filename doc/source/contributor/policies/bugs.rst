@@ -1,7 +1,7 @@
 .. _neutron_bugs:
 
-Neutron Bugs
-============
+Bugs
+====
 
 Neutron (client, core, FwaaS, VPNaaS) maintains all of its bugs in the following
 Launchpad projects:
@@ -24,7 +24,7 @@ Neutron project and has a desire to assist with bug triage.
 
 If you would like to join this Launchpad group, it's best to reach out to a
 member of the above mentioned neutron-drivers-core team in #openstack-neutron
-on Freenode and let them know why you would like to be a member. The team is
+on OFTC and let them know why you would like to be a member. The team is
 more than happy to add additional bug triage capability, but it helps to know
 who is requesting access, and IRC is a quick way to make the connection.
 
@@ -72,7 +72,7 @@ moving down the resolution pipeline.
 
 During the period a member acts as bug deputy, he/she is expected to watch
 bugs filed against the Neutron projects (as listed above) and do a first
-screening to determine potential severity, tagging, logstash queries, other
+screening to determine potential severity, tagging, opensearch queries, other
 affected projects, affected releases, etc.
 
 From time to time bugs will be filed and auto-assigned by members of the
@@ -294,10 +294,11 @@ If the bug report is sound, move next:
   issue, make sure that there is at least one patch that 'Closes' the bug
   or document/question what it takes to mark the bug as fixed.
 * If the bug indicates test or gate failure, look at the failures for that
-  test over time using `OpenStack Health <http://status.openstack.org/openstack-health/#/>`_
-  or `OpenStack Logstash <http://logstash.openstack.org/#/dashboard/file/logstash.json>`_.
+  test over time using
+  `OpenStack OpenSearch <https://opensearch.logs.openstack.org/_dashboards/app/discover?security_tenant=global>`_.
   This can help to validate whether the bug identifies an issue that is
   occurring all of the time, some of the time, or only for the bug submitter.
+  To use OpenSearch please check `documentation <https://docs.openstack.org/project-team-guide/testing.html#checking-status-of-other-job-results>`_.
 * If the bug is the result of a misuse of the system, mark the bug either
   as 'Won't fix', or 'Opinion' if you are still on the fence and need
   other people's input.
@@ -378,7 +379,7 @@ more will be added over time if needed.
 +-------------------------------+-----------------------------------------+--------------------------+
 | Tag                           | Description                             | Contact                  |
 +===============================+=========================================+==========================+
-| access-control_               | A bug affecting RBAC and policy.json    | Miguel Lavalle           |
+| access-control_               | A bug affecting RBAC and policy.yaml    | Slawek Kaplonski         |
 +-------------------------------+-----------------------------------------+--------------------------+
 | api_                          | A bug affecting the API layer           | Akihiro Motoki           |
 +-------------------------------+-----------------------------------------+--------------------------+
@@ -388,7 +389,7 @@ more will be added over time if needed.
 +-------------------------------+-----------------------------------------+--------------------------+
 | baremetal_                    | A bug affecting Ironic support          | N/A                      |
 +-------------------------------+-----------------------------------------+--------------------------+
-| db_                           | A bug affecting the DB layer            | Nate Johnston            |
+| db_                           | A bug affecting the DB layer            | Rodolfo Alonso Hernandez |
 +-------------------------------+-----------------------------------------+--------------------------+
 | deprecation_                  | To track config/feature deprecations    | Neutron PTL/drivers      |
 +-------------------------------+-----------------------------------------+--------------------------+
@@ -400,15 +401,14 @@ more will be added over time if needed.
 +-------------------------------+-----------------------------------------+--------------------------+
 | functional-tests_             | A bug in the functional tests subtree   | Rodolfo Alonso Hernandez |
 +-------------------------------+-----------------------------------------+--------------------------+
-| fwaas_                        | A bug affecting neutron-fwaas           | Nate Johnston            |
-+-------------------------------+-----------------------------------------+--------------------------+
 | gate-failure_                 | A bug affecting gate stability          | Slawek Kaplonski         |
 +-------------------------------+-----------------------------------------+--------------------------+
 | ipv6_                         | A bug affecting IPv6 support            | Brian Haley              |
 +-------------------------------+-----------------------------------------+--------------------------+
 | l2-pop_                       | A bug in L2 Population mech driver      | Miguel Lavalle           |
 +-------------------------------+-----------------------------------------+--------------------------+
-| l3-bgp_                       | A bug affecting neutron-dynamic-routing | Ryan Tidwell             |
+| l3-bgp_                       | A bug affecting neutron-dynamic-routing | Tobias Urdin/            |
+|                               |                                         | Jens Harbott             |
 +-------------------------------+-----------------------------------------+--------------------------+
 | l3-dvr-backlog_               | A bug affecting distributed routing     | Yulong Liu/              |
 |                               |                                         | Brian Haley              |
@@ -419,11 +419,10 @@ more will be added over time if needed.
 +-------------------------------+-----------------------------------------+--------------------------+
 | lib_                          | An issue affecting neutron-lib          | Neutron PTL              |
 +-------------------------------+-----------------------------------------+--------------------------+
-| linuxbridge_                  | A bug affecting ML2/linuxbridge         | N/A                      |
+| loadimpact_                   | Performance penalty/improvements        | Miguel Lavalle/          |
+|                               |                                         | Oleg Bondarev            |
 +-------------------------------+-----------------------------------------+--------------------------+
-| loadimpact_                   | Performance penalty/improvements        | Miguel Lavalle           |
-+-------------------------------+-----------------------------------------+--------------------------+
-| logging_                      | An issue with logging guidelines        | Matt Riedemann           |
+| logging_                      | An issue with logging guidelines        | N/A                      |
 +-------------------------------+-----------------------------------------+--------------------------+
 | low-hanging-fruit_            | Starter bugs for new contributors       | Miguel Lavalle           |
 +-------------------------------+-----------------------------------------+--------------------------+
@@ -441,8 +440,11 @@ more will be added over time if needed.
 | ovn_                          | A bug affecting ML2/OVN                 | Jakub Libosvar/          |
 |                               |                                         | Lucas Alvares Gomes      |
 +-------------------------------+-----------------------------------------+--------------------------+
-| ovn-octavia-provider_         | A bug affecting OVN Octavia provider    | Maciej Jozefczyk/        |
-|                               | driver                                  | Brian Haley              |
+| ovn-bgp-agent_                | A bug affecting OVN BGP agent           | Luis Tomas Bolivar/      |
+|                               |                                         | Lucas Alvares Gomes      |
++-------------------------------+-----------------------------------------+--------------------------+
+| ovn-octavia-provider_         | A bug affecting OVN Octavia provider    | Fernando Royo            |
+|                               | driver                                  |                          |
 +-------------------------------+-----------------------------------------+--------------------------+
 | ovs_                          | A bug affecting ML2/OVS                 | Miguel Lavalle           |
 +-------------------------------+-----------------------------------------+--------------------------+
@@ -450,7 +452,9 @@ more will be added over time if needed.
 +-------------------------------+-----------------------------------------+--------------------------+
 | ovsdb-lib_                    | A bug affecting OVSDB library           | Terry Wilson             |
 +-------------------------------+-----------------------------------------+--------------------------+
-| qos_                          | A bug affecting ML2/QoS                 | Slawek Kaplonski         |
+| pyroute2_                     | A bug affecting pyroute2 library        | Rodolfo Alonso Hernandez |
++-------------------------------+-----------------------------------------+--------------------------+
+| qos_                          | A bug affecting ML2/QoS                 | Rodolfo Alonso Hernandez |
 +-------------------------------+-----------------------------------------+--------------------------+
 | rfe_                          | Feature enhancements being screened     | Drivers Team             |
 +-------------------------------+-----------------------------------------+--------------------------+
@@ -466,9 +470,11 @@ more will be added over time if needed.
 +-------------------------------+-----------------------------------------+--------------------------+
 | sriov-pci-pt_                 | A bug affecting Sriov/PCI PassThrough   | Moshe Levi               |
 +-------------------------------+-----------------------------------------+--------------------------+
+| stable_                       | A bug affecting only stable branches    | Bernard Cafarelli        |
++-------------------------------+-----------------------------------------+--------------------------+
 | tempest_                      | A bug in tempest subtree tests          | Rodolfo Alonso Hernandez |
 +-------------------------------+-----------------------------------------+--------------------------+
-| troubleshooting_              | An issue affecting ease of debugging    | Nate Johnston            |
+| troubleshooting_              | An issue affecting ease of debugging    | PTL/Drivers Team         |
 +-------------------------------+-----------------------------------------+--------------------------+
 | unittest_                     | A bug affecting the unit test subtree   | Rodolfo Alonso Hernandez |
 +-------------------------------+-----------------------------------------+--------------------------+
@@ -640,14 +646,6 @@ Lib
 
 * `Lib - All bugs <https://bugs.launchpad.net/neutron/+bugs?field.tag=lib>`_
 
-.. _linuxbridge:
-
-LinuxBridge
-+++++++++++
-
-* `LinuxBridge - All bugs <https://bugs.launchpad.net/neutron/+bugs?field.tag=linuxbridge>`_
-* `LinuxBridge - In progress <https://bugs.launchpad.net/neutron/+bugs?field.status%3Alist=INPROGRESS&field.tag=linuxbridge>`_
-
 .. _loadimpact:
 
 Load Impact
@@ -717,6 +715,14 @@ OVN
 * `OVN - All bugs <https://bugs.launchpad.net/neutron/+bugs?field.tag=ovn>`_
 * `OVN - In progress <https://bugs.launchpad.net/neutron/+bugs?field.status%3Alist=INPROGRESS&field.tag=ovn>`_
 
+.. _ovn-bgp-agent:
+
+OVN BGP Agent
++++++++++++++
+
+* `OVN BGP Agent - All bugs <https://bugs.launchpad.net/ovn-bgp-agent/>`_
+* `OVN BGP Agent - In progress <https://bugs.launchpad.net/ovn-bgp-agent/+bugs?field.status%3Alist=INPROGRESS>`_
+
 .. _ovn-octavia-provider:
 
 OVN Octavia Provider driver
@@ -750,6 +756,14 @@ OVSDB Lib
 * `OVSDB Lib - In progress <https://bugs.launchpad.net/neutron/+bugs?field.status%3Alist=INPROGRESS&field.tag=ovsdb-lib>`_
 
 .. _qos:
+
+pyroute2
+++++++++
+
+* `Pyroute2 Lib - All bugs <https://bugs.launchpad.net/neutron/+bugs?field.tag=pyroute2>`_
+* `Pyroute2 Lib - In progress <https://bugs.launchpad.net/neutron/+bugs?field.status%3Alist=INPROGRESS&field.tag=pyroute2>`_
+
+.. _pyroute2:
 
 QoS
 +++
@@ -812,6 +826,14 @@ SG-FW
 * `Security groups - In progress <https://bugs.launchpad.net/neutron/+bugs?field.status%3Alist=INPROGRESS&field.tag=sg-fw>`_
 
 .. _tempest:
+
+Stable
+++++++
+
+* `Stable - All bugs <https://bugs.launchpad.net/neutron/+bugs?field.tag=stable>`_
+* `Stable - In progress bugs <https://bugs.launchpad.net/neutron/+bugs?field.status%3Alist=INPROGRESS&field.tag=stable>`_
+
+.. _stable:
 
 Tempest
 +++++++

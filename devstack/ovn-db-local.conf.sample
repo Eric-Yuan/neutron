@@ -16,16 +16,13 @@ SERVICE_PASSWORD=password
 SERVICE_TOKEN=password
 ADMIN_PASSWORD=password
 
-# The DevStack plugin defaults to using the ovn branch from the official ovs
-# repo.  You can optionally use a different one.  For example, you may want to
-# use the latest patches in blp's ovn branch:
-#OVN_REPO=https://github.com/blp/ovs-reviews.git
-#OVN_BRANCH=ovn
-
 Q_AGENT=ovn
 NEUTRON_AGENT=$Q_AGENT
-
-Q_ML2_PLUGIN_MECHANISM_DRIVERS=ovn,logger
+# NOTE(ralonsoh): during the eventlet removal, the "logger" mech
+# driver has been removed from this list. Re-add it once the removal
+# is finished or the mech driver does not call monkey_patch().
+# Q_ML2_PLUGIN_MECHANISM_DRIVERS=ovn,logger
+Q_ML2_PLUGIN_MECHANISM_DRIVERS=ovn
 Q_ML2_PLUGIN_TYPE_DRIVERS=local,flat,vlan,geneve
 Q_ML2_TENANT_NETWORK_TYPE="geneve"
 #SERVICE_HOST=
@@ -39,6 +36,17 @@ enable_service ovn-northd
 # one will be generated and saved in the file 'ovn-uuid' for re-use in future
 # DevStack runs.
 #OVN_UUID=
+
+# The DevStack plugin defaults to using the ovn branch from the official ovs
+# repo.  You can optionally use a different one.  For example, you may want to
+# use the latest patches in blp's ovn branch (and see OVN_BUILD_FROM_SOURCE):
+#OVN_REPO=https://github.com/blp/ovs-reviews.git
+#OVN_BRANCH=ovn
+
+# NOTE: When specifying the branch, as shown above, you must also enable this!
+# By default, OVN will be installed from packages. In order to build OVN from
+# source, set OVN_BUILD_FROM_SOURCE=True
+#OVN_BUILD_FROM_SOURCE=False
 
 # Whether or not to build custom openvswitch kernel modules from the ovs git
 # tree. This is enabled by default.  This is required unless your distro kernel

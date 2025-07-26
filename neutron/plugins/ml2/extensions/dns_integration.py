@@ -43,6 +43,10 @@ class DNSExtensionDriver(api.ExtensionDriver):
     def extension_alias(self):
         return self._supported_extension_alias
 
+    @staticmethod
+    def _parse_dns_domain(plugin_context, domain):
+        return domain
+
     def process_create_network(self, plugin_context, request_data, db_data):
         dns_domain = request_data.get(dns_apidef.DNSDOMAIN)
         if not validators.is_attr_set(dns_domain):
@@ -101,7 +105,7 @@ class DNSExtensionDriver(api.ExtensionDriver):
         flag = self.external_dns_not_needed(plugin_context, network, subnets)
         current_dns_name, current_dns_domain = (
             self._calculate_current_dns_name_and_domain(
-                dns_name, external_dns_domain, flag))
+                plugin_context, dns_name, external_dns_domain, flag))
 
         dns_data_obj = port_obj.PortDNS(
             plugin_context,
@@ -115,7 +119,7 @@ class DNSExtensionDriver(api.ExtensionDriver):
         dns_data_obj.create()
         return dns_data_obj
 
-    def _calculate_current_dns_name_and_domain(self, dns_name,
+    def _calculate_current_dns_name_and_domain(self, plugin_context, dns_name,
                                                external_dns_domain,
                                                no_external_dns_service):
         # When creating a new PortDNS object, the current_dns_name and
@@ -131,7 +135,8 @@ class DNSExtensionDriver(api.ExtensionDriver):
         are_both_dns_attributes_set = dns_name and external_dns_domain
         if no_external_dns_service or not are_both_dns_attributes_set:
             return '', ''
-        return dns_name, external_dns_domain
+        return dns_name, self._parse_dns_domain(
+            plugin_context, external_dns_domain)
 
     def _update_dns_db(self, plugin_context, request_data, db_data, network,
                        subnets):
@@ -153,7 +158,8 @@ class DNSExtensionDriver(api.ExtensionDriver):
                 dns_data_db = self._populate_previous_external_dns_data(
                     dns_data_db)
                 dns_data_db = self._populate_current_external_dns_data(
-                    request_data, network, dns_data_db, dns_name, dns_domain,
+                    plugin_context, request_data,
+                    network, dns_data_db, dns_name, dns_domain,
                     is_dns_name_changed, is_dns_domain_changed)
             elif not dns_data_db['current_dns_name']:
                 # If port was removed from external DNS service in previous
@@ -176,15 +182,17 @@ class DNSExtensionDriver(api.ExtensionDriver):
             dns_data_db['current_dns_domain'])
         return dns_data_db
 
-    def _populate_current_external_dns_data(self, request_data, network,
-                                            dns_data_db, dns_name, dns_domain,
-                                            is_dns_name_changed,
+    def _populate_current_external_dns_data(self, plugin_context, request_data,
+                                            network, dns_data_db, dns_name,
+                                            dns_domain, is_dns_name_changed,
                                             is_dns_domain_changed):
         if is_dns_name_changed or is_dns_domain_changed:
             if is_dns_name_changed:
                 dns_data_db[dns_apidef.DNSNAME] = dns_name
             external_dns_domain = (dns_data_db[dns_apidef.DNSDOMAIN] or
                                    network.get(dns_apidef.DNSDOMAIN))
+            external_dns_domain = self._parse_dns_domain(
+                plugin_context, external_dns_domain)
             if is_dns_domain_changed:
                 dns_data_db[dns_apidef.DNSDOMAIN] = dns_domain
                 external_dns_domain = request_data[dns_apidef.DNSDOMAIN]
@@ -288,6 +296,8 @@ class DNSExtensionDriver(api.ExtensionDriver):
         if dns_domain and dns_domain != lib_const.DNS_DOMAIN_DEFAULT:
             if dns_data_db:
                 dns_name = dns_data_db.dns_name
+                if dns_data_db.current_dns_domain:
+                    dns_domain = dns_data_db.current_dns_domain
         return dns_name, dns_domain
 
     def _get_dns_names_for_port(self, ips, dns_data_db):
@@ -299,13 +309,13 @@ class DNSExtensionDriver(api.ExtensionDriver):
                 hostname = dns_name
                 fqdn = dns_name
                 if not dns_name.endswith('.'):
-                    fqdn = '%s.%s' % (dns_name, dns_domain)
+                    fqdn = f'{dns_name}.{dns_domain}'
             else:
                 hostname = 'host-%s' % ip['ip_address'].replace(
                     '.', '-').replace(':', '-')
                 fqdn = hostname
                 if dns_domain:
-                    fqdn = '%s.%s' % (hostname, dns_domain)
+                    fqdn = f'{hostname}.{dns_domain}'
             dns_assignment.append({'ip_address': ip['ip_address'],
                                    'hostname': hostname,
                                    'fqdn': fqdn})
@@ -343,9 +353,9 @@ class DNSExtensionDriverML2(DNSExtensionDriver):
         LOG.info("DNSExtensionDriverML2 initialization complete")
 
     def _is_tunnel_tenant_network(self, provider_net):
-        if provider_net['network_type'] == 'geneve':
+        if provider_net['network_type'] == lib_const.TYPE_GENEVE:
             tunnel_ranges = cfg.CONF.ml2_type_geneve.vni_ranges
-        elif provider_net['network_type'] == 'vxlan':
+        elif provider_net['network_type'] == lib_const.TYPE_VXLAN:
             tunnel_ranges = cfg.CONF.ml2_type_vxlan.vni_ranges
         else:
             tunnel_ranges = cfg.CONF.ml2_type_gre.tunnel_id_ranges
@@ -382,13 +392,15 @@ class DNSExtensionDriverML2(DNSExtensionDriver):
         if len(segments) > 1:
             return False
         provider_net = segments[0]
-        if provider_net['network_type'] == 'local':
+        if provider_net['network_type'] == lib_const.TYPE_LOCAL:
             return True
-        if provider_net['network_type'] == 'flat':
+        if provider_net['network_type'] == lib_const.TYPE_FLAT:
             return False
-        if provider_net['network_type'] == 'vlan':
+        if provider_net['network_type'] == lib_const.TYPE_VLAN:
             return self._is_vlan_tenant_network(provider_net)
-        if provider_net['network_type'] in ['gre', 'vxlan', 'geneve']:
+        if provider_net['network_type'] in [
+                lib_const.TYPE_GRE, lib_const.TYPE_VXLAN,
+                lib_const.TYPE_GENEVE]:
             return self._is_tunnel_tenant_network(provider_net)
         return True
 
@@ -405,7 +417,7 @@ class DNSDomainPortsExtensionDriver(DNSExtensionDriverML2):
 
     def extend_port_dict(self, session, db_data, response_data):
         response_data = (
-            super(DNSDomainPortsExtensionDriver, self).extend_port_dict(
+            super().extend_port_dict(
                 session, db_data, response_data))
         dns_data_db = db_data.dns
         response_data[dns_apidef.DNSDOMAIN] = ''
@@ -449,16 +461,16 @@ def _filter_by_subnet(context, fixed_ips):
             subnet_filtered.append(str(ip['ip_address']))
     if filter_fixed_ips:
         return subnet_filtered
-    else:
-        return [str(ip['ip_address']) for ip in fixed_ips]
+    return [str(ip['ip_address']) for ip in fixed_ips]
 
 
-def _create_port_in_external_dns_service(resource, event, trigger, **kwargs):
+def _create_port_in_external_dns_service(resource, event,
+                                         trigger, payload=None):
     dns_driver = _get_dns_driver()
     if not dns_driver:
         return
-    context = kwargs['context']
-    port = kwargs['port']
+    context = payload.context
+    port = payload.latest_state
     dns_data_db = port_obj.PortDNS.get_object(
         context, port_id=port['id'])
     if not (dns_data_db and dns_data_db['current_dns_name']):
@@ -474,37 +486,43 @@ def _send_data_to_external_dns_service(context, dns_driver, dns_domain,
                                        dns_name, records):
     try:
         dns_driver.create_record_set(context, dns_domain, dns_name, records)
-    except (dns_exc.DNSDomainNotFound, dns_exc.DuplicateRecordSet) as e:
-        LOG.exception("Error publishing port data in external DNS "
-                      "service. Name: '%(name)s'. Domain: '%(domain)s'. "
-                      "DNS service driver message '%(message)s'",
-                      {"name": dns_name,
-                       "domain": dns_domain,
-                       "message": e.msg})
+    except dns_exc.DNSDomainNotFound:
+        LOG.error("Error publishing port data. The DNS domain %(domain)s "
+                  "was not found, creation of recordset %(name)s in "
+                  "external DNS service will be skipped.",
+                  {"name": dns_name,
+                   "domain": dns_domain})
+    except dns_exc.DuplicateRecordSet:
+        LOG.error("Error publishing port data. A recordset for %(name)s in "
+                  "domain %(domain)s already exists, recordset creation in "
+                  "external DNS service will be skipped.",
+                  {"name": dns_name,
+                   "domain": dns_domain})
 
 
 def _remove_data_from_external_dns_service(context, dns_driver, dns_domain,
                                            dns_name, records):
     try:
         dns_driver.delete_record_set(context, dns_domain, dns_name, records)
-    except (dns_exc.DNSDomainNotFound, dns_exc.DuplicateRecordSet) as e:
-        LOG.exception("Error deleting port data from external DNS "
-                      "service. Name: '%(name)s'. Domain: '%(domain)s'. "
-                      "IP addresses '%(ips)s'. DNS service driver message "
-                      "'%(message)s'",
-                      {"name": dns_name,
-                       "domain": dns_domain,
-                       "message": e.msg,
-                       "ips": ', '.join(records)})
+    except dns_exc.DNSDomainNotFound:
+        LOG.error("Error deleting port data from external DNS service. "
+                  "The DNS domain %(domain)s was not found.",
+                  {"domain": dns_domain})
+    except dns_exc.DuplicateRecordSet:
+        LOG.error("Error deleting port data from external DNS service. "
+                  "Duplicate recordsets for %(name)s in domain %(domain)s "
+                  "were found.",
+                  {"name": dns_name,
+                   "domain": dns_domain})
 
 
-def _update_port_in_external_dns_service(resource, event, trigger, **kwargs):
+def _update_port_in_external_dns_service(resource, event, trigger, payload):
     dns_driver = _get_dns_driver()
     if not dns_driver:
         return
-    context = kwargs['context']
-    updated_port = kwargs['port']
-    original_port = kwargs.get('original_port')
+    context = payload.context
+    updated_port = payload.latest_state
+    original_port = payload.states[0]
     if not original_port:
         return
     original_ips = _filter_by_subnet(context, original_port['fixed_ips'])

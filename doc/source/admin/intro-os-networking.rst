@@ -71,7 +71,7 @@ at the cost of flexibility. By default only administrators can create or
 update provider networks because they require configuration of physical
 network infrastructure. It is possible to change the user who is allowed to
 create or update provider networks with the following parameters of
-``policy.json``:
+``policy.yaml``:
 
 * ``create_network:provider:physical_network``
 * ``update_network:provider:physical_network``
@@ -117,6 +117,9 @@ provide the routing.
 Routed provider networks offer performance at scale that is difficult to
 achieve with a plain provider network at the expense of guaranteed layer-2
 connectivity.
+
+Neutron port could be associated with only one network segment,
+but there is an exception for OVN distributed services like OVN Metadata.
 
 See :ref:`config-routed-provider-networks` for more information.
 
@@ -231,12 +234,17 @@ or more security groups in an additive fashion. The firewall driver
 translates security group rules to a configuration for the underlying packet
 filtering technology such as ``iptables``.
 
-Each project contains a ``default`` security group that allows all egress
-traffic and denies all ingress traffic. You can change the rules in the
-``default`` security group. If you launch an instance without specifying a
-security group, the ``default`` security group automatically applies to it.
-Similarly, if you create a port without specifying a security group, the
-``default`` security group automatically applies to it.
+Each project contains a ``default`` security group that by default allows all
+egress traffic and denies all ingress traffic. You can change the rules in the
+``default`` security group. Admin user can also define own set of security
+group rules which will be added by default to each new ``default`` and each new
+non-default (custom) security group created for every project in the cloud.
+There is ``security-group-default-rules`` API extension which allows to define
+such own set of the default security group rules.
+If you launch an instance without specifying a security group, the ``default``
+security group automatically applies to it.  Similarly, if you create a port
+without specifying a security group, the ``default`` security group
+automatically applies to it.
 
 .. note::
 
@@ -274,6 +282,10 @@ anti-spoofing rules that perform the following actions:
 * Allow egress non-IP traffic from the MAC address of the port for the
   instance and any additional MAC addresses in ``allowed-address-pairs`` on
   the port for the instance.
+
+Those rules mentioned above are added automatically by neutron and cannot be
+changed using ``default security group rules`` API provided by the
+``security-group-default-rules`` extensions.
 
 Although non-IP traffic, security groups do not implicitly allow all ARP
 traffic. Separate ARP filtering rules prevent instances from using ARP

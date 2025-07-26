@@ -1,15 +1,15 @@
 .. _neutron_teams:
 
-======================
-Neutron Team Structure
-======================
+==============
+Team Structure
+==============
 
 Neutron Core Reviewers
 ======================
 
 The `Neutron Core Reviewer Team <https://review.opendev.org/#/admin/groups/38,members>`_
-is responsible for many things related to Neutron. A lot of these things include mundane
-tasks such as the following:
+is responsible for many things related to Neutron. A lot of these things
+include mundane tasks such as the following:
 
 * Ensuring the bug count is low
 * Curating the gate and triaging failures
@@ -75,26 +75,34 @@ The following are the current Neutron Lieutenants.
 | Area                   | Lieutenant                | IRC nick             |
 +========================+===========================+======================+
 | API                    | Akihiro Motoki            | amotoki              |
+|                        +---------------------------+----------------------+
+|                        | Slawomir Kaplonski        | slaweq               |
 +------------------------+---------------------------+----------------------+
-| DB                     | Nate Johnston             | njohnston            |
+| DB                     | Rodolfo Alonso Hernandez  | ralonsoh             |
 +------------------------+---------------------------+----------------------+
 | Built-In Control Plane | Miguel Lavalle            | mlavalle             |
 +------------------------+---------------------------+----------------------+
 | Client                 | Akihiro Motoki            | amotoki              |
+|                        +---------------------------+----------------------+
+|                        | Slawomir Kaplonski        | slaweq               |
+|                        +---------------------------+----------------------+
+|                        | Lajos Katona              | lajoskatona          |
 +------------------------+---------------------------+----------------------+
 | Docs                   | Akihiro Motoki            | amotoki              |
+|                        +---------------------------+----------------------+
+|                        | Lajos Katona              | lajoskatona          |
 +------------------------+---------------------------+----------------------+
 | Infra                  | Rodolfo Alonso Hernandez  | ralonsoh             |
 |                        +---------------------------+----------------------+
-|                        | YAMAMOTO Takashi          | yamamoto             |
+|                        | Jens Harbott              | frickler             |
 +------------------------+---------------------------+----------------------+
-| L3                     | Brian Haley               | haleyb               |
-|                        +---------------------------+----------------------+
-|                        | Miguel Lavalle            | mlavalle             |
+| L3                     | Miguel Lavalle            | mlavalle             |
 |                        +---------------------------+----------------------+
 |                        | Yulong Liu                | liuyulong            |
 +------------------------+---------------------------+----------------------+
-| Testing                | Rodolfo Alonso Hernandez  | ralonsoh             |
+| Testing                | Lajos Katona              | lajoskatona          |
+|                        +---------------------------+----------------------+
+|                        | Slawomir Kaplonski        | slaweq               |
 +------------------------+---------------------------+----------------------+
 
 Some notes on the above:
@@ -112,8 +120,9 @@ Some notes on the above:
 Sub-project Lieutenants
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-Neutron also consists of several plugins, drivers, and agents that are developed
-effectively as sub-projects within Neutron in their own git repositories.
+Neutron also consists of several plugins, drivers, and agents that are
+developed effectively as sub-projects within Neutron in their own git
+repositories.
 Lieutenants are also named for these sub-projects to identify a clear point of
 contact and leader for that area.  The Lieutenant is also responsible for
 updating the core review team for the sub-project's repositories.
@@ -125,23 +134,25 @@ updating the core review team for the sub-project's repositories.
 | networking-bagpipe      +-----------------------------+-------------------+
 |                         | Thomas Morin                | tmorin            |
 +-------------------------+-----------------------------+-------------------+
-| neutron-dynamic-routing | Ryan Tidwell                | tidwellr          |
+| neutron-dynamic-routing | Tobias Urdin                | tobias-urdin      |
+|                         +-----------------------------+-------------------+
+|                         | Jens Harbott                | frickler          |
 +-------------------------+-----------------------------+-------------------+
-| neutron-fwaas           | Nate Johnston               | njohnston         |
+| neutron-fwaas           | ZhouHeng                    | zhouhenglc        |
 +-------------------------+-----------------------------+-------------------+
 | neutron-vpnaas          | YAMAMOTO Takashi            | yamamoto          |
 |                         +-----------------------------+-------------------+
 |                         | Dongcan Ye                  | yedongcan         |
 +-------------------------+-----------------------------+-------------------+
-| networking-midonet      | Ryu Ishimoto                | ryu25             |
-|                         +-----------------------------+-------------------+
-|                         | YAMAMOTO Takashi            | yamamoto          |
-+-------------------------+-----------------------------+-------------------+
-| networking-odl          | Lajos Katona                | lajoskatona       |
-+-------------------------+-----------------------------+-------------------+
-| networking-ovn          | Lucas Alvares Gomes         | lucasagomes       |
-+-------------------------+-----------------------------+-------------------+
 | networking-sfc          | Dharmendra Kushwaha         | dkushwaha         |
++-------------------------+-----------------------------+-------------------+
+| ovn-octavia-provider    | Luis Tomas Bolivar          | ltomasbo          |
+|                         +-----------------------------+-------------------+
+|                         | Fernando Royo               | froyo             |
++-------------------------+-----------------------------+-------------------+
+| ovsdbapp                | Terry Wilson                | otherwiseguy      |
++-------------------------+-----------------------------+-------------------+
+| os-ken                  | Rodolfo Alonso              | ralonsoh          |
 +-------------------------+-----------------------------+-------------------+
 
 Existing Core Reviewers
@@ -211,10 +222,10 @@ have +2 rights to the following git repositories:
 
 * `openstack/neutron-specs <https://opendev.org/openstack/neutron-specs/>`_
 
-The Neutron specs core reviewer team is responsible for reviewing specs targeted to
-all Neutron git repositories (Neutron + Advanced Services). It is worth noting that
-specs reviewers have the following attributes which are potentially different than
-code reviewers:
+The Neutron specs core reviewer team is responsible for reviewing specs
+targeted to all Neutron git repositories (Neutron + Advanced Services).
+It is worth noting that specs reviewers have the following attributes which
+are potentially different than code reviewers:
 
 * Broad understanding of cloud and networking technologies
 * Broad understanding of core OpenStack projects and technologies
@@ -230,11 +241,12 @@ Drivers Team
 ------------
 
 The `drivers team <https://review.opendev.org/#/admin/groups/464,members>`_ is
-the group of people who have full rights to the specs repo. This team, which matches
+the group of people who have full rights to the specs repo. This team, which
+matches
 `Launchpad Neutron Drivers team <https://launchpad.net/~neutron-drivers>`_, is
-instituted to ensure a consistent architectural vision for the Neutron project, and
-to continue to disaggregate and share the responsibilities of the Neutron PTL.
-The team is in charge of reviewing and commenting on
+instituted to ensure a consistent architectural vision for the Neutron
+project, and to continue to disaggregate and share the responsibilities of
+the Neutron PTL. The team is in charge of reviewing and commenting on
 :ref:`RFEs <request-for-feature-enhancement>`,
 and working with specification contributors to provide guidance on the process
 that govern contributions to the Neutron project as a whole. The team
@@ -247,7 +259,7 @@ Release Team
 
 The `release team <https://review.opendev.org/#/admin/groups/150,members>`_ is
 a group of people with some additional gerrit permissions primarily aimed at
-allowing release management of Neutron sub-projects.  These permissions include:
+allowing release management of Neutron sub-projects. These permissions include:
 
 * Ability to push signed tags to sub-projects whose releases are managed by the
   Neutron release team as opposed to the OpenStack release team.
@@ -319,10 +331,10 @@ maintain a level of review numbers relatively close to other core reviewers.
 There are no hard statistics around code review numbers, but in general we
 use 30, 60, 90 and 180 day stats when examining review stats.
 
-* `30 day review stats <http://stackalytics.com/report/contribution/neutron-group/30>`_
-* `60 day review stats <http://stackalytics.com/report/contribution/neutron-group/60>`_
-* `90 day review stats <http://stackalytics.com/report/contribution/neutron-group/90>`_
-* `180 day review stats <http://stackalytics.com/report/contribution/neutron-group/180>`_
+* `30 day review stats <https://www.stackalytics.io/report/contribution?module=neutron-group&project_type=openstack&days=30>`_
+* `60 day review stats <https://www.stackalytics.io/report/contribution?module=neutron-group&project_type=openstack&days=60>`_
+* `90 day review stats <https://www.stackalytics.io/report/contribution?module=neutron-group&project_type=openstack&days=90>`_
+* `180 day review stats <https://www.stackalytics.io/report/contribution?module=neutron-group&project_type=openstack&days=180>`_
 
 There are soft-touch items around being a Neutron core reviewer as well.
 Gaining trust with the existing Neutron core reviewers is important. Being

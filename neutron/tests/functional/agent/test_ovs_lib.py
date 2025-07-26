@@ -15,18 +15,14 @@
 
 import collections
 from unittest import mock
-import uuid
 
 from neutron_lib import constants as const
+from neutron_lib.plugins.ml2 import ovs_constants as agent_const
 from oslo_config import cfg
 from ovsdbapp.backend.ovs_idl import idlutils
 
 from neutron.agent.common import ovs_lib
-from neutron.agent.linux import ip_lib
 from neutron.common import utils
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import (
-    constants as agent_const)
-from neutron.tests.common.exclusive_resources import port
 from neutron.tests.common import net_helpers
 from neutron.tests.functional.agent.linux import base
 
@@ -35,7 +31,7 @@ class OVSBridgeTestBase(base.BaseOVSLinuxTestCase):
     # TODO(twilson) So far, only ovsdb-related tests are written. It would be
     # good to also add the openflow-related functions
     def setUp(self):
-        super(OVSBridgeTestBase, self).setUp()
+        super().setUp()
         self.ovs = ovs_lib.BaseOVS()
         self.br = self.useFixture(net_helpers.OVSBridgeFixture()).bridge
 
@@ -93,6 +89,10 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
                                                     'external_ids')['test'])
         self.assertEqual(agent_const.DEAD_VLAN_TAG,
                          self.br.db_get_val('Port', port_name, 'tag'))
+        self.assertEqual("trunk",
+                         self.br.db_get_val('Port', port_name, 'vlan_mode'))
+        self.assertEqual(4095,
+                         self.br.db_get_val('Port', port_name, 'trunks'))
 
     def test_attribute_lifecycle(self):
         (port_name, ofport) = self.create_ovs_port()
@@ -135,6 +135,15 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
         self.assertSetEqual(controllers, set(self.br.get_controller()))
         self.br.del_controller()
         self.assertEqual([], self.br.get_controller())
+
+    def test_disable_in_band(self):
+        self.br.disable_in_band()
+        br_other_config = self.ovs.ovsdb.db_find(
+            'Bridge', ('name', '=', self.br.br_name), columns=['other_config']
+        ).execute()[0]['other_config']
+        self.assertEqual(
+            'true',
+            br_other_config.get('disable-in-band', '').lower())
 
     def test_non_index_queries(self):
         controllers = ['tcp:127.0.0.1:6633']
@@ -195,9 +204,12 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
         br_other_config = self.ovs.ovsdb.db_find(
             'Bridge', ('name', '=', self.br.br_name), columns=['other_config']
         ).execute()[0]['other_config']
+        expected_flood_value = (
+            'false' if cfg.CONF.OVS.igmp_flood_unregistered else 'true')
         self.assertEqual(
-            str(state),
-            br_other_config['mcast-snooping-disable-flood-unregistered'])
+            expected_flood_value,
+            br_other_config.get(
+                'mcast-snooping-disable-flood-unregistered', '').lower())
 
     def test_set_igmp_snooping_enabled(self):
         self._test_set_igmp_snooping_state(True)
@@ -205,18 +217,12 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
     def test_set_igmp_snooping_disabled(self):
         self._test_set_igmp_snooping_state(False)
 
-    def test_get_datapath_id(self):
-        brdev = ip_lib.IPDevice(self.br.br_name)
-        dpid = brdev.link.attributes['link/ether'].replace(':', '')
-        self.br.set_db_attribute('Bridge',
-                                 self.br.br_name, 'datapath_id', dpid)
-        self.assertIn(dpid, self.br.get_datapath_id())
-
-    def _test_add_tunnel_port(self, attrs):
+    def _test_add_tunnel_port(self, attrs,
+                              expected_tunnel_type=const.TYPE_GRE):
         port_name = utils.get_rand_device_name(net_helpers.PORT_PREFIX)
         self.br.add_tunnel_port(port_name, attrs['remote_ip'],
                                 attrs['local_ip'])
-        self.assertEqual('gre',
+        self.assertEqual(expected_tunnel_type,
                          self.ovs.db_get_val('Interface', port_name, 'type'))
         options = self.ovs.db_get_val('Interface', port_name, 'options')
         for attr, val in attrs.items():
@@ -233,8 +239,10 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
         attrs = {
             'remote_ip': '2001:db8:200::1',
             'local_ip': '2001:db8:100::1',
+            'packet_type': 'legacy_l2',
         }
-        self._test_add_tunnel_port(attrs)
+        self._test_add_tunnel_port(
+            attrs, expected_tunnel_type=const.TYPE_GRE_IP6)
 
     def test_add_tunnel_port_custom_port(self):
         port_name = utils.get_rand_device_name(net_helpers.PORT_PREFIX)
@@ -285,7 +293,7 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
         # Nothing seems to use this function?
         (port_name, ofport) = self.create_ovs_port()
         stats = set(self.br.get_port_stats(port_name).keys())
-        self.assertTrue(set(['rx_packets', 'tx_packets']).issubset(stats))
+        self.assertTrue({'rx_packets', 'tx_packets'}.issubset(stats))
 
     def test_get_vif_ports(self):
         for i in range(2):
@@ -293,7 +301,7 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
         vif_ports = [self.create_ovs_vif_port() for i in range(3)]
         ports = self.br.get_vif_ports()
         self.assertEqual(3, len(ports))
-        self.assertTrue(all([isinstance(x, ovs_lib.VifPort) for x in ports]))
+        self.assertTrue(all(isinstance(x, ovs_lib.VifPort) for x in ports))
         self.assertEqual(sorted([x.port_name for x in vif_ports]),
                          sorted([x.port_name for x in ports]))
 
@@ -304,12 +312,13 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
         # bond ports don't have records in the Interface table but they do in
         # the Port table
         orig = self.br.get_port_name_list
-        new_port_name_list = lambda: orig() + ['bondport']
+        def new_port_name_list():
+            return orig() + ['bondport']
         mock.patch.object(self.br, 'get_port_name_list',
                           new=new_port_name_list).start()
         ports = self.br.get_vif_ports()
         self.assertEqual(3, len(ports))
-        self.assertTrue(all([isinstance(x, ovs_lib.VifPort) for x in ports]))
+        self.assertTrue(all(isinstance(x, ovs_lib.VifPort) for x in ports))
         self.assertEqual(sorted([x.port_name for x in vif_ports]),
                          sorted([x.port_name for x in ports]))
 
@@ -318,7 +327,7 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
             self.create_ovs_port()
         vif_ports = [self.create_ovs_vif_port() for i in range(2)]
         ports = self.br.get_vif_port_set()
-        expected = set([x.vif_id for x in vif_ports])
+        expected = {x.vif_id for x in vif_ports}
         self.assertEqual(expected, ports)
 
     def test_get_vif_port_set_with_missing_port(self):
@@ -327,11 +336,12 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
 
         # return an extra port to make sure the db list ignores it
         orig = self.br.get_port_name_list
-        new_port_name_list = lambda: orig() + ['anotherport']
+        def new_port_name_list():
+            return orig() + ['anotherport']
         mock.patch.object(self.br, 'get_port_name_list',
                           new=new_port_name_list).start()
         ports = self.br.get_vif_port_set()
-        expected = set([vif_ports[0].vif_id])
+        expected = {vif_ports[0].vif_id}
         self.assertEqual(expected, ports)
 
     def test_get_vif_port_set_on_empty_bridge_returns_empty_set(self):
@@ -387,82 +397,6 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
         self.br.delete_ports(all_ports=True)
         self.assertEqual(len(self.br.get_port_name_list()), 0)
 
-    def test_set_controller_connection_mode(self):
-        controllers = ['tcp:192.0.2.0:6633']
-        self._set_controllers_connection_mode(controllers)
-
-    def test_set_multi_controllers_connection_mode(self):
-        controllers = ['tcp:192.0.2.0:6633', 'tcp:192.0.2.1:55']
-        self._set_controllers_connection_mode(controllers)
-
-    def _set_controllers_connection_mode(self, controllers):
-        self.br.set_controller(controllers)
-        self.assertEqual(sorted(controllers), sorted(self.br.get_controller()))
-        self.br.set_controllers_connection_mode('out-of-band')
-        self._assert_controllers_connection_mode('out-of-band')
-        self.br.del_controller()
-        self.assertEqual([], self.br.get_controller())
-
-    def _assert_controllers_connection_mode(self, connection_mode):
-        controllers = self.br.db_get_val('Bridge', self.br.br_name,
-                                         'controller')
-        controllers = [controllers] if isinstance(
-            controllers, uuid.UUID) else controllers
-        for controller in controllers:
-            self.assertEqual(connection_mode,
-                             self.br.db_get_val('Controller',
-                                                controller,
-                                                'connection_mode'))
-
-    def test_egress_bw_limit(self):
-        port_name, _ = self.create_ovs_port()
-        self.br.create_egress_bw_limit_for_port(port_name, 700, 70)
-        max_rate, burst = self.br.get_egress_bw_limit_for_port(port_name)
-        self.assertEqual(700, max_rate)
-        self.assertEqual(70, burst)
-        self.br.delete_egress_bw_limit_for_port(port_name)
-        max_rate, burst = self.br.get_egress_bw_limit_for_port(port_name)
-        self.assertIsNone(max_rate)
-        self.assertIsNone(burst)
-
-    def test_ingress_bw_limit(self):
-        port_name, _ = self.create_ovs_port()
-        self.br.update_ingress_bw_limit_for_port(port_name, 700, 70)
-        max_rate, burst = self.br.get_ingress_bw_limit_for_port(port_name)
-        self.assertEqual(700, max_rate)
-        self.assertEqual(70, burst)
-
-        self.br.update_ingress_bw_limit_for_port(port_name, 750, 100)
-        max_rate, burst = self.br.get_ingress_bw_limit_for_port(port_name)
-        self.assertEqual(750, max_rate)
-        self.assertEqual(100, burst)
-
-        self.br.delete_ingress_bw_limit_for_port(port_name)
-        max_rate, burst = self.br.get_ingress_bw_limit_for_port(port_name)
-        self.assertIsNone(max_rate)
-        self.assertIsNone(burst)
-
-    def test_ingress_bw_limit_dpdk_port(self):
-        port_name, _ = self.create_ovs_port(
-            ('type', agent_const.OVS_DPDK_VHOST_USER))
-        self.br.update_ingress_bw_limit_for_port(port_name, 700, 70)
-        max_rate, burst = self.br.get_ingress_bw_limit_for_dpdk_port(
-            port_name)
-        self.assertEqual(700, max_rate)
-        self.assertEqual(70, burst)
-
-        self.br.update_ingress_bw_limit_for_port(port_name, 750, 100)
-        max_rate, burst = self.br.get_ingress_bw_limit_for_dpdk_port(
-            port_name)
-        self.assertEqual(750, max_rate)
-        self.assertEqual(100, burst)
-
-        self.br.delete_ingress_bw_limit_for_port(port_name)
-        max_rate, burst = self.br.get_ingress_bw_limit_for_dpdk_port(
-            port_name)
-        self.assertIsNone(max_rate)
-        self.assertIsNone(burst)
-
     def test_db_create_references(self):
         with self.ovs.ovsdb.transaction(check_error=True) as txn:
             queue = txn.add(self.ovs.ovsdb.db_create("Queue",
@@ -486,7 +420,7 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
         expected = self.br.initial_protocols.union(protocols)
         self.br.ovsdb.db_add("Bridge", self.br.br_name, "protocols",
                              *protocols).execute(check_error=True)
-        self.assertItemsEqual(expected,
+        self.assertCountEqual(expected,
                               self.br.db_get_val('Bridge',
                                                  self.br.br_name, "protocols"))
 
@@ -547,7 +481,7 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
                 txn.add(ovsdb.del_port(port_name, self.br.br_name,
                                        if_exists=False))
                 txn.add(ovsdb.db_set('Interface', port_name,
-                                     ('type', 'internal')))
+                                     ('type', 'internal'), if_exists=False))
         self.assertRaises((RuntimeError, idlutils.RowNotFound),
                           del_port_mod_iface)
 
@@ -568,43 +502,8 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
 class OVSLibTestCase(base.BaseOVSLinuxTestCase):
 
     def setUp(self):
-        super(OVSLibTestCase, self).setUp()
+        super().setUp()
         self.ovs = ovs_lib.BaseOVS()
-
-    def test_add_manager_appends(self):
-        port1 = self.useFixture(port.ExclusivePort(const.PROTO_NAME_TCP,
-            start=net_helpers.OVS_MANAGER_TEST_PORT_FIRST,
-            end=net_helpers.OVS_MANAGER_TEST_PORT_LAST)).port
-        port2 = self.useFixture(port.ExclusivePort(const.PROTO_NAME_TCP,
-            start=net_helpers.OVS_MANAGER_TEST_PORT_FIRST,
-            end=net_helpers.OVS_MANAGER_TEST_PORT_LAST)).port
-        manager_list = ["ptcp:%s:127.0.0.1" % port1,
-                        "ptcp:%s:127.0.0.1" % port2]
-        # Verify that add_manager does not override the existing manager
-        expected_manager_list = list()
-        for conn_uri in manager_list:
-            self.ovs.add_manager(conn_uri)
-            self.addCleanup(self.ovs.remove_manager, conn_uri)
-            self.assertIn(conn_uri, self.ovs.get_manager())
-            expected_manager_list.append(conn_uri)
-
-        # Verify that switch is configured with both the managers
-        for manager_uri in expected_manager_list:
-            self.assertIn(manager_uri, manager_list)
-
-    def test_add_manager_lifecycle_baseovs(self):
-        port1 = self.useFixture(port.ExclusivePort(const.PROTO_NAME_TCP,
-            start=net_helpers.OVS_MANAGER_TEST_PORT_FIRST,
-            end=net_helpers.OVS_MANAGER_TEST_PORT_LAST)).port
-        conn_uri = "ptcp:%s:127.0.0.1" % port1
-        self.addCleanup(self.ovs.remove_manager, conn_uri)
-        self.ovs.add_manager(conn_uri)
-        self.assertIn(conn_uri, self.ovs.get_manager())
-        self.assertEqual(self.ovs.db_get_val('Manager', conn_uri,
-                                             'inactivity_probe'),
-                         self.ovs.ovsdb_timeout * 1000)
-        self.ovs.remove_manager(conn_uri)
-        self.assertNotIn(conn_uri, self.ovs.get_manager())
 
     def test_bridge_lifecycle_baseovs(self):
         name = utils.get_rand_name(prefix=net_helpers.BR_PREFIX)
@@ -669,4 +568,4 @@ class OVSLibTestCase(base.BaseOVSLinuxTestCase):
         self.assertTrue(tags_present)
         tags_42 = [t for t in tags_present if t['tag'] == 42]
         self.assertEqual(tags_42, single_value.result)
-        self.assertItemsEqual(len_0_list.result, tags_present)
+        self.assertCountEqual(len_0_list.result, tags_present)

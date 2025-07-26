@@ -134,8 +134,8 @@ class TcPolicyClassTestCase(functional_base.BaseSudoTestCase):
 
         bytes = tc_classes[0]['stats']['bytes']
         packets = tc_classes[0]['stats']['packets']
-        net_helpers.assert_ping(self.ns[1], netaddr.IPNetwork(self.ip[0]).ip,
-                                count=1)
+        net_helpers.assert_ping(
+            self.ns[1], str(netaddr.IPNetwork(self.ip[0]).ip), count=1)
         tc_classes = tc_lib.list_tc_policy_class(self.device[0],
                                                  namespace=self.ns[0])
         self.assertGreater(tc_classes[0]['stats']['bytes'], bytes)
@@ -166,17 +166,17 @@ class TcPolicyClassTestCase(functional_base.BaseSudoTestCase):
                                        max_kbps=2000, burst_kb=1000,
                                        min_kbps=3, namespace=self.ns[0])
             mock_log.warning.assert_called_once_with(
-                *warning_args(3 * 128, tc_lib._calc_min_rate(1000 * 128)))
+                *warning_args(3 * 125, tc_lib._calc_min_rate(1000 * 125)))
 
-            # rate < min_rate: min_rate = 466 with burst = 0.8 ceil = 256000
+            # rate < min_rate: min_rate = 455 with burst = 0.8 ceil = 256000
             mock_log.reset_mock()
             tc_lib.add_tc_policy_class(self.device[0], '1:', '1:10',
                                        max_kbps=2000, burst_kb=None,
                                        min_kbps=5, namespace=self.ns[0])
             min_rate = tc_lib._calc_min_rate(qos_consts.DEFAULT_BURST_RATE *
-                                             2000 * 128)
+                                             2000 * 125)
             mock_log.warning.assert_called_once_with(
-                *warning_args(5 * 128, min_rate))
+                *warning_args(5 * 125, min_rate))
 
 
 class TcFiltersTestCase(functional_base.BaseSudoTestCase):
@@ -202,28 +202,28 @@ class TcFiltersTestCase(functional_base.BaseSudoTestCase):
         self.mac_vxlan = []
         self.ip = ['10.100.0.1/24', '10.100.0.2/24']
         self.ip_vxlan = ['10.200.0.1/24', '10.200.0.2/24']
-        for i in range(len(self.ns)):
-            priv_ip_lib.create_netns(self.ns[i])
-            self.addCleanup(self._remove_ns, self.ns[i])
-            ip_wrapper = ip_lib.IPWrapper(self.ns[i])
+        for i, ns in enumerate(self.ns):
+            priv_ip_lib.create_netns(ns)
+            self.addCleanup(self._remove_ns, ns)
+            ip_wrapper = ip_lib.IPWrapper(ns)
             if i == 0:
                 ip_wrapper.add_veth(self.device[0], self.device[1], self.ns[1])
             ip_wrapper.add_vxlan(self.device_vxlan[i], self.vxlan_id,
-                                 dev=self.device[i])
-            ip_device = ip_lib.IPDevice(self.device[i], self.ns[i])
+                                 self.device[i])
+            ip_device = ip_lib.IPDevice(self.device[i], ns)
             ip_device.link.set_up()
             ip_device.addr.add(self.ip[i])
-            ip_device_vxlan = ip_lib.IPDevice(self.device_vxlan[i], self.ns[i])
+            ip_device_vxlan = ip_lib.IPDevice(self.device_vxlan[i], ns)
             self.mac_vxlan.append(ip_device_vxlan.link.address)
             ip_device_vxlan.link.set_up()
             ip_device_vxlan.addr.add(self.ip_vxlan[i])
 
         bridge_lib.FdbInterface.append(
             '00:00:00:00:00:00', self.device_vxlan[0], namespace=self.ns[0],
-            ip_dst=str(netaddr.IPNetwork(self.ip[1]).ip))
+            dst_ip=str(netaddr.IPNetwork(self.ip[1]).ip))
         bridge_lib.FdbInterface.append(
             '00:00:00:00:00:00', self.device_vxlan[1], namespace=self.ns[1],
-            ip_dst=str(netaddr.IPNetwork(self.ip[0]).ip))
+            dst_ip=str(netaddr.IPNetwork(self.ip[0]).ip))
 
     def test_add_tc_filter_vxlan(self):
         # The traffic control is applied on the veth pair device of the first
@@ -256,7 +256,7 @@ class TcFiltersTestCase(functional_base.BaseSudoTestCase):
             self.vxlan_id, namespace=self.ns[0])
 
         tc_classes = tc_lib.list_tc_policy_class(self.device[0],
-                                              namespace=self.ns[0])
+                                                 namespace=self.ns[0])
         for tc_class in (c for c in tc_classes if
                          c['classid'] == chosen_class_id):
             bytes = tc_class['stats']['bytes']
@@ -268,7 +268,7 @@ class TcFiltersTestCase(functional_base.BaseSudoTestCase):
                                       'device': self.device[0]})
 
         net_helpers.assert_ping(
-            self.ns[1], netaddr.IPNetwork(self.ip_vxlan[0]).ip, count=1)
+            self.ns[1], str(netaddr.IPNetwork(self.ip_vxlan[0]).ip), count=1)
         tc_classes = tc_lib.list_tc_policy_class(self.device[0],
                                                  namespace=self.ns[0])
         for tc_class in tc_classes:

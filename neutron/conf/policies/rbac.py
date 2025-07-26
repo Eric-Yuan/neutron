@@ -10,72 +10,151 @@
 #  License for the specific language governing permissions and limitations
 #  under the License.
 
+from neutron_lib import policy as neutron_policy
+from oslo_log import versionutils
 from oslo_policy import policy
 
 from neutron.conf.policies import base
+
+DEPRECATED_REASON = """
+The RBAC API now supports system scope and default roles.
+"""
 
 
 COLLECTION_PATH = '/rbac-policies'
 RESOURCE_PATH = '/rbac-policies/{id}'
 
+# TODO(ralonsoh): remove "_create_rbac_target_tenant" and
+#  "_update_rbac_target_tenant" in E+2=G (next SLURP).
+_create_rbac_target_tenant = policy.DocumentedRuleDefault(
+    name='create_rbac_policy:target_tenant',
+    check_str=neutron_policy.policy_or(
+        base.ADMIN,
+        '(not field:rbac_policy:target_tenant=* and '
+        'not field:rbac_policy:target_project=*)'),
+    description='Specify ``target_tenant`` when creating an RBAC policy',
+    operations=[
+        {
+            'method': 'POST',
+            'path': COLLECTION_PATH,
+        },
+    ],
+    scope_types=['project'],
+    deprecated_rule=policy.DeprecatedRule(
+        name='create_rbac_policy:target_tenant',
+        check_str='rule:restrict_wildcard',
+        deprecated_reason=DEPRECATED_REASON,
+        deprecated_since=versionutils.deprecated.WALLABY),
+    deprecated_for_removal=True,
+    deprecated_reason='Replaced by "create_rbac_policy:target_project',
+    deprecated_since='2025.1',
+)
+_update_rbac_target_tenant = policy.DocumentedRuleDefault(
+    name='update_rbac_policy:target_tenant',
+    check_str=neutron_policy.policy_or(
+        base.ADMIN,
+        '(not field:rbac_policy:target_tenant=* and '
+        'not field:rbac_policy:target_project=*)'),
+    description='Update ``target_tenant`` attribute of an RBAC policy',
+    operations=[
+        {
+            'method': 'PUT',
+            'path': RESOURCE_PATH,
+        },
+    ],
+    scope_types=['project'],
+    deprecated_rule=policy.DeprecatedRule(
+        name='update_rbac_policy:target_tenant',
+        check_str=neutron_policy.policy_and(
+            'rule:restrict_wildcard',
+            neutron_policy.RULE_ADMIN_OR_OWNER),
+        deprecated_reason=DEPRECATED_REASON,
+        deprecated_since=versionutils.deprecated.WALLABY),
+    deprecated_for_removal=True,
+    deprecated_reason='Replaced by "update_rbac_policy:target_project',
+    deprecated_since='2025.1',
+)
 
 rules = [
+    # TODO(ralonsoh): remove 'target_tenant=*' reference.
     policy.RuleDefault(
-        'restrict_wildcard',
-        base.policy_or('(not field:rbac_policy:target_tenant=*)',
-                       base.RULE_ADMIN_ONLY),
-        'Definition of a wildcard target_tenant'),
+        name='restrict_wildcard',
+        check_str=neutron_policy.policy_or(
+            '(not field:rbac_policy:target_tenant=* and '
+            'not field:rbac_policy:target_project=*)',
+            neutron_policy.RULE_ADMIN_ONLY),
+        description='Definition of a wildcard target_project'),
 
     policy.DocumentedRuleDefault(
-        'create_rbac_policy',
-        base.RULE_ANY,
-        'Create an RBAC policy',
-        [
+        name='create_rbac_policy',
+        check_str=base.ADMIN_OR_PROJECT_MEMBER,
+        scope_types=['project'],
+        description='Create an RBAC policy',
+        operations=[
             {
                 'method': 'POST',
                 'path': COLLECTION_PATH,
             },
-        ]
+        ],
+        deprecated_rule=policy.DeprecatedRule(
+            name='create_rbac_policy',
+            check_str=neutron_policy.RULE_ANY,
+            deprecated_reason=DEPRECATED_REASON,
+            deprecated_since=versionutils.deprecated.WALLABY)
     ),
+    _create_rbac_target_tenant,
     policy.DocumentedRuleDefault(
-        'create_rbac_policy:target_tenant',
-        'rule:restrict_wildcard',
-        'Specify ``target_tenant`` when creating an RBAC policy',
-        [
+        name='create_rbac_policy:target_project',
+        check_str=neutron_policy.policy_or(
+            base.ADMIN,
+            'not field:rbac_policy:target_project=*'),
+        description='Specify ``target_project`` when creating an RBAC policy',
+        operations=[
             {
                 'method': 'POST',
                 'path': COLLECTION_PATH,
             },
-        ]
+        ],
+        scope_types=['project'],
     ),
     policy.DocumentedRuleDefault(
-        'update_rbac_policy',
-        base.RULE_ADMIN_OR_OWNER,
-        'Update an RBAC policy',
-        [
+        name='update_rbac_policy',
+        check_str=base.ADMIN_OR_PROJECT_MEMBER,
+        scope_types=['project'],
+        description='Update an RBAC policy',
+        operations=[
             {
                 'method': 'PUT',
                 'path': RESOURCE_PATH,
             },
-        ]
+        ],
+        deprecated_rule=policy.DeprecatedRule(
+            name='update_rbac_policy',
+            check_str=neutron_policy.RULE_ADMIN_OR_OWNER,
+            deprecated_reason=DEPRECATED_REASON,
+            deprecated_since=versionutils.deprecated.WALLABY)
     ),
+    _update_rbac_target_tenant,
     policy.DocumentedRuleDefault(
-        'update_rbac_policy:target_tenant',
-        base.policy_and('rule:restrict_wildcard',
-                        base.RULE_ADMIN_OR_OWNER),
-        'Update ``target_tenant`` attribute of an RBAC policy',
-        [
+        name='update_rbac_policy:target_project',
+        check_str=neutron_policy.policy_or(
+            base.ADMIN,
+            'not field:rbac_policy:target_project=*'),
+        description='Update ``target_project`` attribute of an RBAC policy',
+        operations=[
             {
                 'method': 'PUT',
                 'path': RESOURCE_PATH,
             },
-        ]
+        ],
+        scope_types=['project'],
     ),
     policy.DocumentedRuleDefault(
-        'get_rbac_policy',
-        base.RULE_ADMIN_OR_OWNER,
-        'Get an RBAC policy',
-        [
+        name='get_rbac_policy',
+        check_str=base.ADMIN_OR_PROJECT_READER,
+        scope_types=['project'],
+        description='Get an RBAC policy',
+        operations=[
             {
                 'method': 'GET',
                 'path': COLLECTION_PATH,
@@ -84,18 +163,29 @@ rules = [
                 'method': 'GET',
                 'path': RESOURCE_PATH,
             },
-        ]
+        ],
+        deprecated_rule=policy.DeprecatedRule(
+            name='get_rbac_policy',
+            check_str=neutron_policy.RULE_ADMIN_OR_OWNER,
+            deprecated_reason=DEPRECATED_REASON,
+            deprecated_since=versionutils.deprecated.WALLABY)
     ),
     policy.DocumentedRuleDefault(
-        'delete_rbac_policy',
-        base.RULE_ADMIN_OR_OWNER,
-        'Delete an RBAC policy',
-        [
+        name='delete_rbac_policy',
+        check_str=base.ADMIN_OR_PROJECT_MEMBER,
+        scope_types=['project'],
+        description='Delete an RBAC policy',
+        operations=[
             {
                 'method': 'DELETE',
                 'path': RESOURCE_PATH,
             },
-        ]
+        ],
+        deprecated_rule=policy.DeprecatedRule(
+            name='delete_rbac_policy',
+            check_str=neutron_policy.RULE_ADMIN_OR_OWNER,
+            deprecated_reason=DEPRECATED_REASON,
+            deprecated_since=versionutils.deprecated.WALLABY)
     ),
 ]
 

@@ -16,8 +16,8 @@
 
 from unittest import mock
 
-import neutron.plugins.ml2.drivers.openvswitch.agent.common.constants \
-    as ovs_const
+from neutron_lib.plugins.ml2 import ovs_constants as ovs_const
+
 from neutron.tests.unit.plugins.ml2.drivers.openvswitch.agent.openflow.native \
     import ovs_bridge_test_base
 
@@ -27,14 +27,14 @@ call = mock.call  # short hand
 
 class OVSPhysicalBridgeTest(ovs_bridge_test_base.OVSBridgeTestBase,
                             ovs_bridge_test_base.OVSDVRProcessTestMixin):
-    dvr_process_table_id = ovs_const.DVR_PROCESS_VLAN
+    dvr_process_table_id = ovs_const.DVR_PROCESS_PHYSICAL
     dvr_process_next_table_id = ovs_const.LOCAL_VLAN_TRANSLATION
 
     def setUp(self):
         conn_patcher = mock.patch(
             'neutron.agent.ovsdb.impl_idl._connection')
         conn_patcher.start()
-        super(OVSPhysicalBridgeTest, self).setUp()
+        super().setUp()
         self.addCleanup(conn_patcher.stop)
         self.setup_bridge_mock('br-phys', self.br_phys_cls)
         self.stamp = self.br.default_cookie
@@ -43,17 +43,19 @@ class OVSPhysicalBridgeTest(ovs_bridge_test_base.OVSBridgeTestBase,
         self.br.setup_default_table()
         (dp, ofp, ofpp) = self._get_dp()
         expected = [
-            call._send_msg(ofpp.OFPFlowMod(dp,
-                cookie=self.stamp,
-                instructions=[
-                    ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [
-                        ofpp.OFPActionOutput(ofp.OFPP_NORMAL, 0),
-                    ]),
-                ],
-                match=ofpp.OFPMatch(),
-                priority=0,
-                table_id=0),
-                           active_bundle=None),
+            call._send_msg(
+                ofpp.OFPFlowMod(
+                    dp,
+                    cookie=self.stamp,
+                    instructions=[
+                        ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [
+                            ofpp.OFPActionOutput(ofp.OFPP_NORMAL, 0),
+                        ]),
+                    ],
+                    match=ofpp.OFPMatch(),
+                    priority=0,
+                    table_id=0),
+                active_bundle=None),
         ]
         self.assertEqual(expected, self.mock.mock_calls)
 
@@ -67,21 +69,23 @@ class OVSPhysicalBridgeTest(ovs_bridge_test_base.OVSBridgeTestBase,
                                      distributed=distributed)
         (dp, ofp, ofpp) = self._get_dp()
         expected = [
-            call._send_msg(ofpp.OFPFlowMod(dp,
-                cookie=self.stamp,
-                instructions=[
-                    ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [
-                        ofpp.OFPActionSetField(
-                            vlan_vid=segmentation_id | ofp.OFPVID_PRESENT),
-                        ofpp.OFPActionOutput(ofp.OFPP_NORMAL, 0),
-                    ]),
-                ],
-                match=ofpp.OFPMatch(
-                    in_port=port,
-                    vlan_vid=lvid | ofp.OFPVID_PRESENT),
-                priority=4,
-                table_id=0),
-                           active_bundle=None),
+            call._send_msg(
+                ofpp.OFPFlowMod(
+                    dp,
+                    cookie=self.stamp,
+                    instructions=[
+                        ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [
+                            ofpp.OFPActionSetField(
+                                vlan_vid=segmentation_id | ofp.OFPVID_PRESENT),
+                            ofpp.OFPActionOutput(ofp.OFPP_NORMAL, 0),
+                        ]),
+                    ],
+                    match=ofpp.OFPMatch(
+                        in_port=port,
+                        vlan_vid=lvid | ofp.OFPVID_PRESENT),
+                    priority=4,
+                    table_id=0),
+                active_bundle=None),
         ]
         self.assertEqual(expected, self.mock.mock_calls)
 
@@ -95,20 +99,22 @@ class OVSPhysicalBridgeTest(ovs_bridge_test_base.OVSBridgeTestBase,
                                      distributed=distributed)
         (dp, ofp, ofpp) = self._get_dp()
         expected = [
-            call._send_msg(ofpp.OFPFlowMod(dp,
-                cookie=self.stamp,
-                instructions=[
-                    ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [
-                        ofpp.OFPActionPopVlan(),
-                        ofpp.OFPActionOutput(ofp.OFPP_NORMAL, 0),
-                    ]),
-                ],
-                match=ofpp.OFPMatch(
-                    in_port=port,
-                    vlan_vid=lvid | ofp.OFPVID_PRESENT),
-                priority=4,
-                table_id=0),
-                           active_bundle=None),
+            call._send_msg(
+                ofpp.OFPFlowMod(
+                    dp,
+                    cookie=self.stamp,
+                    instructions=[
+                        ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [
+                            ofpp.OFPActionPopVlan(),
+                            ofpp.OFPActionOutput(ofp.OFPP_NORMAL, 0),
+                        ]),
+                    ],
+                    match=ofpp.OFPMatch(
+                        in_port=port,
+                        vlan_vid=lvid | ofp.OFPVID_PRESENT),
+                    priority=4,
+                    table_id=0),
+                active_bundle=None),
         ]
         self.assertEqual(expected, self.mock.mock_calls)
 
@@ -125,23 +131,25 @@ class OVSPhysicalBridgeTest(ovs_bridge_test_base.OVSBridgeTestBase,
         ]
         self.assertEqual(expected, self.mock.mock_calls)
 
-    def test_add_dvr_mac_vlan(self):
+    def test_add_dvr_mac_physical(self):
         mac = '00:02:b3:13:fe:3d'
         port = 8888
-        self.br.add_dvr_mac_vlan(mac=mac, port=port)
+        self.br.add_dvr_mac_physical(mac=mac, port=port)
         (dp, ofp, ofpp) = self._get_dp()
         expected = [
-            call._send_msg(ofpp.OFPFlowMod(dp,
-                cookie=self.stamp,
-                instructions=[
-                    ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [
-                        ofpp.OFPActionOutput(port, 0),
-                    ]),
-                ],
-                match=ofpp.OFPMatch(eth_src=mac),
-                priority=2,
-                table_id=3),
-                           active_bundle=None),
+            call._send_msg(
+                ofpp.OFPFlowMod(
+                    dp,
+                    cookie=self.stamp,
+                    instructions=[
+                        ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [
+                            ofpp.OFPActionOutput(port, 0),
+                        ]),
+                    ],
+                    match=ofpp.OFPMatch(eth_src=mac),
+                    priority=2,
+                    table_id=3),
+                active_bundle=None),
         ]
         self.assertEqual(expected, self.mock.mock_calls)
 

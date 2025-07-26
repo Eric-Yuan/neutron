@@ -13,6 +13,7 @@
 import random
 from unittest import mock
 
+from neutron_lib import constants as lib_consts
 from neutron_lib.exceptions import qos as qos_exc
 from neutron_lib.services.qos import constants as qos_consts
 from oslo_utils import uuidutils
@@ -32,13 +33,15 @@ RULE_OBJ_CLS = {
     qos_consts.RULE_TYPE_BANDWIDTH_LIMIT: rule.QosBandwidthLimitRule,
     qos_consts.RULE_TYPE_DSCP_MARKING: rule.QosDscpMarkingRule,
     qos_consts.RULE_TYPE_MINIMUM_BANDWIDTH: rule.QosMinimumBandwidthRule,
+    qos_consts.RULE_TYPE_PACKET_RATE_LIMIT: rule.QosPacketRateLimitRule,
+    qos_consts.RULE_TYPE_MINIMUM_PACKET_RATE: rule.QosMinimumPacketRateRule,
 }
 
 
-class _QosPolicyRBACBase(object):
+class _QosPolicyRBACBase:
 
     def get_random_object_fields(self, obj_cls=None):
-        fields = (super(_QosPolicyRBACBase, self).
+        fields = (super().
                   get_random_object_fields(obj_cls))
         rnd_actions = self._test_class.db_model.get_valid_actions()
         idx = random.randint(0, len(rnd_actions) - 1)
@@ -53,7 +56,7 @@ class QosPolicyRBACDbObjectTestCase(_QosPolicyRBACBase,
     _test_class = policy.QosPolicyRBAC
 
     def setUp(self):
-        super(QosPolicyRBACDbObjectTestCase, self).setUp()
+        super().setUp()
         for obj in self.db_objs:
             policy_obj = policy.QosPolicy(self.context,
                                           id=obj['object_id'],
@@ -82,7 +85,7 @@ class QosPolicyObjectTestCase(test_base.BaseObjectIfaceTestCase):
     _test_class = policy.QosPolicy
 
     def setUp(self):
-        super(QosPolicyObjectTestCase, self).setUp()
+        super().setUp()
         mock.patch.object(policy.QosPolicy, 'get_default').start()
 
         # qos_policy_ids will be incorrect, but we don't care in this test
@@ -98,6 +101,10 @@ class QosPolicyObjectTestCase(test_base.BaseObjectIfaceTestCase):
             self.get_random_db_fields(rule.QosMinimumBandwidthRule)
             for _ in range(3)]
 
+        self.db_qos_minimum_packet_rate_rules = [
+            self.get_random_db_fields(rule.QosMinimumPacketRateRule)
+            for _ in range(3)]
+
         self.model_map.update({
             self._test_class.db_model: self.db_objs,
             binding.QosPolicyPortBinding.db_model: [],
@@ -105,7 +112,9 @@ class QosPolicyObjectTestCase(test_base.BaseObjectIfaceTestCase):
             rule.QosBandwidthLimitRule.db_model: self.db_qos_bandwidth_rules,
             rule.QosDscpMarkingRule.db_model: self.db_qos_dscp_rules,
             rule.QosMinimumBandwidthRule.db_model:
-                self.db_qos_minimum_bandwidth_rules})
+                self.db_qos_minimum_bandwidth_rules,
+            rule.QosMinimumPacketRateRule:
+                self.db_qos_minimum_packet_rate_rules})
 
     # TODO(ihrachys): stop overriding those test cases, instead base test cases
     # should be expanded if there are missing bits there to support QoS objects
@@ -113,12 +122,13 @@ class QosPolicyObjectTestCase(test_base.BaseObjectIfaceTestCase):
         objs = self._test_class.get_objects(self.context)
         self.get_objects_mock.assert_any_call(
             self._test_class, self.context, _pager=None)
-        self.assertItemsEqual(
+        self.assertCountEqual(
             [test_base.get_obj_persistent_fields(obj) for obj in self.objs],
             [test_base.get_obj_persistent_fields(obj) for obj in objs])
 
     def test_get_objects_valid_fields(self):
-        with mock.patch.object(db_api, 'get_objects',
+        with mock.patch.object(
+                db_api, 'get_objects',
                 return_value=[self.db_objs[0]]) as get_objects_mock:
             objs = self._test_class.get_objects(
                 self.context,
@@ -129,7 +139,8 @@ class QosPolicyObjectTestCase(test_base.BaseObjectIfaceTestCase):
         self._check_equal(self.objs[0], objs[0])
 
     def test_get_object(self):
-        with mock.patch.object(db_api, 'get_object',
+        with mock.patch.object(
+                db_api, 'get_object',
                 return_value=self.db_objs[0]) as get_object_mock:
             obj = self._test_class.get_object(self.context, id='fake_id')
             self.assertTrue(self._is_test_class(obj))
@@ -138,10 +149,10 @@ class QosPolicyObjectTestCase(test_base.BaseObjectIfaceTestCase):
                 self._test_class, self.context, id='fake_id')
 
     def test_to_dict_makes_primitive_field_value(self):
-        # is_shared_with_tenant requires DB
-        with mock.patch.object(self._test_class, 'is_shared_with_tenant',
+        # is_shared_with_project requires DB
+        with mock.patch.object(self._test_class, 'is_shared_with_project',
                                return_value=False):
-            (super(QosPolicyObjectTestCase, self).
+            (super().
              test_to_dict_makes_primitive_field_value())
 
     def test_get_policy_obj_not_found(self):
@@ -157,7 +168,7 @@ class QosPolicyDbObjectTestCase(test_base.BaseDbObjectTestCase,
     _test_class = policy.QosPolicy
 
     def setUp(self):
-        super(QosPolicyDbObjectTestCase, self).setUp()
+        super().setUp()
         self._network_id = self._create_test_network_id()
         self._port = self._create_test_port(network_id=self._network_id)
 
@@ -173,7 +184,11 @@ class QosPolicyDbObjectTestCase(test_base.BaseDbObjectTestCase,
                         for rule_type in rule_type):
             rule_fields = self.get_random_object_fields(obj_cls=obj_cls)
             rule_fields['qos_policy_id'] = policy_obj.id
-            if (obj_cls.rule_type == qos_consts.RULE_TYPE_BANDWIDTH_LIMIT and
+            if (obj_cls.rule_type in [
+                        qos_consts.RULE_TYPE_BANDWIDTH_LIMIT,
+                        qos_consts.RULE_TYPE_MINIMUM_BANDWIDTH,
+                        qos_consts.RULE_TYPE_PACKET_RATE_LIMIT,
+                        qos_consts.RULE_TYPE_MINIMUM_PACKET_RATE] and
                     bwlimit_direction is not None):
                 rule_fields['direction'] = bwlimit_direction
             rule_obj = obj_cls(self.context, **rule_fields)
@@ -183,6 +198,11 @@ class QosPolicyDbObjectTestCase(test_base.BaseDbObjectTestCase,
         if reload_rules:
             policy_obj.obj_load_attr('rules')
         return policy_obj, rules
+
+    @staticmethod
+    def _policy_through_version(obj, version):
+        primitive = obj.obj_to_primitive(target_version=version)
+        return policy.QosPolicy.clean_obj_from_primitive(primitive)
 
     def test_attach_network_get_network_policy(self):
 
@@ -270,13 +290,13 @@ class QosPolicyDbObjectTestCase(test_base.BaseDbObjectTestCase,
         port1_id = self._port['id']
         port2 = db_api.create_object(port_obj.Port, self.context,
                                      {'tenant_id': 'fake_tenant_id',
-                                     'name': 'test-port2',
-                                     'network_id': self._network_id,
-                                     'mac_address': 'fake_mac2',
-                                     'admin_state_up': True,
-                                     'status': 'ACTIVE',
-                                     'device_id': 'fake_device',
-                                     'device_owner': 'fake_owner'})
+                                      'name': 'test-port2',
+                                      'network_id': self._network_id,
+                                      'mac_address': 'fake_mac2',
+                                      'admin_state_up': True,
+                                      'status': 'ACTIVE',
+                                      'device_id': 'fake_device',
+                                      'device_owner': 'fake_owner'})
         port2_id = port2['id']
 
         obj = self._create_test_policy()
@@ -441,10 +461,10 @@ class QosPolicyDbObjectTestCase(test_base.BaseDbObjectTestCase,
         policy_obj._reload_is_default()
         self.assertTrue(policy_obj.is_default)
 
-    def test_get_bound_tenant_ids_returns_set_of_tenant_ids(self):
+    def test_get_bound_project_ids_returns_set_of_project_ids(self):
         obj = self._create_test_policy()
         obj.attach_port(self._port['id'])
-        ids = self._test_class.get_bound_tenant_ids(self.context, obj['id'])
+        ids = self._test_class.get_bound_project_ids(self.context, obj['id'])
         self.assertEqual(ids.pop(), self._port.project_id)
         self.assertEqual(len(ids), 0)
 
@@ -455,6 +475,36 @@ class QosPolicyDbObjectTestCase(test_base.BaseDbObjectTestCase,
         policy_obj = self._create_test_policy()
         self.assertRaises(exception.IncompatibleObjectVersion,
                           policy_obj.obj_to_primitive, '1.7')
+
+    def test_object_version_degradation_less_than_1_9(self):
+        policy_obj, rule_objs = self._create_test_policy_with_rules(
+            [qos_consts.RULE_TYPE_BANDWIDTH_LIMIT,
+             qos_consts.RULE_TYPE_DSCP_MARKING,
+             qos_consts.RULE_TYPE_MINIMUM_BANDWIDTH,
+             qos_consts.RULE_TYPE_PACKET_RATE_LIMIT], reload_rules=True,
+            bwlimit_direction=lib_consts.INGRESS_DIRECTION)
+        policy_obj_v1_8 = self._policy_through_version(policy_obj, '1.8')
+
+        self.assertIn(rule_objs[0], policy_obj_v1_8.rules)
+        self.assertIn(rule_objs[1], policy_obj_v1_8.rules)
+        self.assertIn(rule_objs[2], policy_obj_v1_8.rules)
+        self.assertNotIn(rule_objs[3], policy_obj_v1_8.rules)
+
+    def test_object_version_degradation_less_than_1_10(self):
+        policy_obj, rule_objs = self._create_test_policy_with_rules(
+            [qos_consts.RULE_TYPE_BANDWIDTH_LIMIT,
+             qos_consts.RULE_TYPE_DSCP_MARKING,
+             qos_consts.RULE_TYPE_MINIMUM_BANDWIDTH,
+             qos_consts.RULE_TYPE_PACKET_RATE_LIMIT,
+             qos_consts.RULE_TYPE_MINIMUM_PACKET_RATE], reload_rules=True,
+            bwlimit_direction=lib_consts.INGRESS_DIRECTION)
+        policy_obj_v1_9 = self._policy_through_version(policy_obj, '1.9')
+
+        self.assertIn(rule_objs[0], policy_obj_v1_9.rules)
+        self.assertIn(rule_objs[1], policy_obj_v1_9.rules)
+        self.assertIn(rule_objs[2], policy_obj_v1_9.rules)
+        self.assertIn(rule_objs[3], policy_obj_v1_9.rules)
+        self.assertNotIn(rule_objs[4], policy_obj_v1_9.rules)
 
     @mock.patch.object(policy.QosPolicy, 'unset_default')
     def test_filter_by_shared(self, *mocks):

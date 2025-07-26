@@ -31,11 +31,6 @@ class InvalidAddressType(exceptions.NeutronException):
     message = _("Unknown address type %(address_type)s")
 
 
-class IpAddressAllocationNotFound(exceptions.NeutronException):
-    message = _("Unable to find IP address %(ip_address)s on subnet "
-                "%(subnet_id)s")
-
-
 class IpAddressAlreadyAllocated(exceptions.Conflict):
     message = _("IP address %(ip)s already allocated in subnet %(subnet_id)s")
 
@@ -84,7 +79,7 @@ class IPAllocationFailed(exceptions.NeutronException):
 class IpamValueInvalid(exceptions.Conflict):
     def __init__(self, message=None):
         self.message = message
-        super(IpamValueInvalid, self).__init__()
+        super().__init__()
 
 
 class DeferIpam(exceptions.NeutronException):

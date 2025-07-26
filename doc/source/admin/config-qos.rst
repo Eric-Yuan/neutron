@@ -30,32 +30,40 @@ Supported QoS rule types
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 QoS supported rule types are now available as ``VALID_RULE_TYPES`` in `QoS rule types
-<https://opendev.org/openstack/neutron-lib/tree/neutron_lib/services/qos/constants.py>`_:
+<https://opendev.org/openstack/neutron-lib/src/branch/master/neutron_lib/services/qos/constants.py>`_:
 
 * bandwidth_limit: Bandwidth limitations on networks, ports or floating IPs.
+
+* packet_rate_limit: Packet rate limitations on certain types of traffic.
 
 * dscp_marking: Marking network traffic with a DSCP value.
 
 * minimum_bandwidth: Minimum bandwidth constraints on certain types of traffic.
 
+* minimum_packet_rate: Minimum packet rate constraints on certain types of
+  traffic.
+
 
 Any QoS driver can claim support for some QoS rule types
 by providing a driver property called
 ``supported_rules``, the QoS driver manager will recalculate rule types
-dynamically that the QoS driver supports.
+dynamically that the QoS driver supports. In the most simple case, the
+property can be represented by a simple Python list defined on the class.
 
 The following table shows the Networking back ends, QoS supported rules, and
 traffic directions (from the VM point of view).
 
 .. table:: **Networking back ends, supported rules, and traffic direction**
 
-    ====================  =======================  =======================  ===================  ===================
-     Rule \\ back end      Open vSwitch             SR-IOV                   Linux bridge         OVN
-    ====================  =======================  =======================  ===================  ===================
-     Bandwidth limit       Egress \\ Ingress        Egress (1)               Egress \\ Ingress    Egress \\ Ingress
-     Minimum bandwidth     Egress \\ Ingress (2)    Egress \\ Ingress (2)    -                    -
-     DSCP marking          Egress                   -                        Egress               Egress
-    ====================  =======================  =======================  ===================  ===================
+    ====================  =============================  =======================  ======================
+     Rule \\ back end      Open vSwitch                  SR-IOV                   OVN
+    ====================  =============================  =======================  ======================
+     Bandwidth limit       Egress \\ Ingress             Egress (1)               Egress \\ Ingress
+     Packet rate limit     Egress \\ Ingress             -                        -
+     Minimum bandwidth     Egress \\ Ingress (2)         Egress \\ Ingress (2)    Egress \\ Ingress (2)
+     Minimum packet rate   -                             -                        -
+     DSCP marking          Egress                        -                        Egress
+    ====================  =============================  =======================  ======================
 
 .. note::
 
@@ -66,20 +74,42 @@ traffic directions (from the VM point of view).
 
 .. table:: **Neutron backends, supported directions and enforcement types for Minimum Bandwidth rule**
 
-    ============================  ====================  ====================  ==============  =====
-     Enforcement type \ Backend    Open vSwitch          SR-IOV                Linux Bridge    OVN
-    ============================  ====================  ====================  ==============  =====
-     Dataplane                     -                     Egress (1)            -               -
-     Placement                     Egress/Ingress (2)    Egress/Ingress (2)    -               -
-    ============================  ====================  ====================  ==============  =====
+    ============================  ====================  ====================  ====================
+     Enforcement type \ Backend    Open vSwitch          SR-IOV                OVN
+    ============================  ====================  ====================  ====================
+     Dataplane                     Egress (3)            Egress (1)            Egress (4)
+     Placement                     Egress/Ingress (2)    Egress/Ingress (2)    Egress/Ingress (4)
+    ============================  ====================  ====================  ====================
 
 .. note::
 
     (1) Since Newton
     (2) Since Stein
+    (3) Open vSwitch minimum bandwidth support is only implemented for egress
+        direction and only for networks without tunneled traffic (only VLAN and
+        flat network types).
+    (4) Since Zed
 
-In the most simple case, the property can be represented by a simple Python
-list defined on the class.
+.. note:: The SR-IOV agent does not support dataplane enforcement for ports
+  with ``direct-physical`` vnic_type. However since Yoga the Placement
+  enforcement is supported for this vnic_type too.
+
+.. table:: **Neutron backends, supported directions and enforcement types for Minimum Packet Rate rule**
+
+    ============================  ==========================  ====================  =====
+     Enforcement type \ Backend    Open vSwitch                SR-IOV                OVN
+    ============================  ==========================  ====================  =====
+     Dataplane                     -                           -                     -
+     Placement                     Any(1)/Egress/Ingress (2)   -                     -
+    ============================  ==========================  ====================  =====
+
+.. note::
+
+    (1) Minimum packet rate rule supports ``any`` direction that can be used
+        with non-hardware-offloaded OVS deployments, where packets processed
+        from both ingress and egress directions are handled by the same set of
+        CPU cores.
+    (2) Since Yoga.
 
 For an ml2 plug-in, the list of supported QoS rule types and parameters is
 defined as a common subset of rules supported by all active mechanism drivers.
@@ -98,10 +128,48 @@ updated:
 Valid DSCP Marks
 ----------------
 
-Valid DSCP mark values are even numbers between 0 and 56, except 2-6, 42, 44,
-and 50-54.  The full list of valid DSCP marks is:
+Valid DSCP mark values are even numbers between 0 and 56, except 2-6, 42, and
+50-54.  The full list of valid DSCP marks is:
 
-0, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 46, 48, 56
+0, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 44, 46,
+48, 56
+
+
+L3 QoS support
+~~~~~~~~~~~~~~
+
+The Neutron L3 services have implemented their own QoS extensions. Currently
+only bandwidth limit QoS is provided. This is the L3 QoS extension list:
+
+* Floating IP bandwidth limit: the rate limit is applied per floating IP
+  address independently.
+
+* Gateway IP bandwidth limit: the rate limit is applied in the router namespace
+  gateway port (or in the SNAT namespace in case of DVR edge router). The rate
+  limit applies to the gateway IP; that means all traffic using this gateway IP
+  will be limited. This rate limit does not apply to the floating IP traffic.
+
+
+L3 services that provide QoS extensions:
+
+* L3 router: implements the rate limit using `Linux TC
+  <https://man7.org/linux/man-pages/man8/tc.8.html>`_.
+
+* OVN L3: implements the rate limit using the `OVN QoS metering rules
+  <https://man7.org/linux/man-pages/man8/ovn-nbctl.8.html#LOGICAL_SWITCH_QOS_RULE_COMMANDS>`_.
+
+
+The following table shows the L3 service, the QoS supported extension, and
+traffic directions (from the VM point of view) for **bandwidth limiting**.
+
+.. table:: **L3 service, supported extension, and traffic direction**
+
+    ====================  ===================  ===================
+     Rule \\ L3 service    L3 router            OVN L3
+    ====================  ===================  ===================
+     Floating IP           Egress \\ Ingress    Egress \\ Ingress
+     Gateway IP            Egress \\ Ingress    Egress \\ Ingress
+    ====================  ===================  ===================
 
 
 Configuration
@@ -116,12 +184,9 @@ On the controller nodes:
 #. Add the QoS service to the ``service_plugins`` setting in
    ``/etc/neutron/neutron.conf``. For example:
 
-   .. code-block:: none
+   .. code-block:: ini
 
-      service_plugins = \
-      neutron.services.l3_router.l3_router_plugin.L3RouterPlugin,
-      neutron.services.metering.metering_plugin.MeteringPlugin,
-      neutron.services.qos.qos_plugin.QoSPlugin
+      service_plugins = router,metering,qos
 
 #. Optionally, set the needed ``notification_drivers`` in the ``[qos]``
    section in ``/etc/neutron/neutron.conf`` (``message_queue`` is the
@@ -131,7 +196,7 @@ On the controller nodes:
    set the ``service_plugins`` option in ``/etc/neutron/neutron.conf`` to
    include both ``router`` and ``qos``. For example:
 
-   .. code-block:: none
+   .. code-block:: ini
 
       service_plugins = router,qos
 
@@ -169,6 +234,15 @@ On the network and compute nodes:
       [agent]
       extensions = qos
 
+#. Optionally, for Neutron openvswitch agent, set the ``qos_meter_bandwidth``
+   in the ``[ovs]`` section to enable the OVS meter bandwith limit.
+   For example:
+
+   .. code-block:: ini
+
+      [ovs]
+      qos_meter_bandwidth = True
+
 #. Optionally, in order to enable QoS for floating IPs, set the ``extensions``
    option in the ``[agent]`` section of ``/etc/neutron/l3_agent.ini`` to
    include ``fip_qos``. If ``dvr`` is enabled, this has to be done for all the
@@ -205,21 +279,20 @@ On the network and compute nodes:
       [agent]
       extensions = fip_qos, gateway_ip_qos
 
-
 #. As rate limit doesn't work on Open vSwitch's ``internal`` ports,
    optionally, as a workaround, to make QoS bandwidth limit work on
    router's gateway ports, set ``ovs_use_veth`` to ``True`` in ``DEFAULT``
    section in ``/etc/neutron/l3_agent.ini``
 
-  .. code-block:: ini
+   .. code-block:: ini
 
       [DEFAULT]
       ovs_use_veth = True
 
 .. note::
 
-   QoS currently works with ml2 only (SR-IOV, Open vSwitch, and linuxbridge
-   are drivers enabled for QoS).
+   QoS currently works with ml2 only (SR-IOV and Open vSwitch are drivers
+   enabled for QoS).
 
 DSCP marking on outer header for overlay networks
 -------------------------------------------------
@@ -251,58 +324,67 @@ not automatically copied to the outer header.
    If the ``dscp_inherit`` option is set to true, the previous ``dscp`` option
    is overwritten.
 
-Trusted projects policy.json configuration
+Trusted projects policy.yaml configuration
 ------------------------------------------
 
 If projects are trusted to administrate their own QoS policies in
-your cloud, neutron's file ``policy.json`` can be modified to allow this.
+your cloud, neutron's file ``policy.yaml`` can be modified to allow this.
 
-Modify ``/etc/neutron/policy.json`` policy entries as follows:
+Modify ``/etc/neutron/policy.yaml`` policy entries as follows:
 
-.. code-block:: none
+.. code-block:: yaml
 
-   "get_policy": "rule:regular_user",
-   "create_policy": "rule:regular_user",
-   "update_policy": "rule:regular_user",
-   "delete_policy": "rule:regular_user",
-   "get_rule_type": "rule:regular_user",
+   "get_policy": "rule:regular_user"
+   "create_policy": "rule:regular_user"
+   "update_policy": "rule:regular_user"
+   "delete_policy": "rule:regular_user"
+   "get_rule_type": "rule:regular_user"
 
 To enable bandwidth limit rule:
 
-.. code-block:: none
+.. code-block:: yaml
 
-   "get_policy_bandwidth_limit_rule": "rule:regular_user",
-   "create_policy_bandwidth_limit_rule": "rule:regular_user",
-   "delete_policy_bandwidth_limit_rule": "rule:regular_user",
-   "update_policy_bandwidth_limit_rule": "rule:regular_user",
+   "get_policy_bandwidth_limit_rule": "rule:regular_user"
+   "create_policy_bandwidth_limit_rule": "rule:regular_user"
+   "delete_policy_bandwidth_limit_rule": "rule:regular_user"
+   "update_policy_bandwidth_limit_rule": "rule:regular_user"
 
 To enable DSCP marking rule:
 
-.. code-block:: none
+.. code-block:: yaml
 
-   "get_policy_dscp_marking_rule": "rule:regular_user",
-   "create_dscp_marking_rule": "rule:regular_user",
-   "delete_dscp_marking_rule": "rule:regular_user",
-   "update_dscp_marking_rule": "rule:regular_user",
+   "get_policy_dscp_marking_rule": "rule:regular_user"
+   "create_policy_dscp_marking_rule": "rule:regular_user"
+   "delete_policy_dscp_marking_rule": "rule:regular_user"
+   "update_policy_dscp_marking_rule": "rule:regular_user"
 
 To enable minimum bandwidth rule:
 
-.. code-block:: none
+.. code-block:: yaml
 
-    "get_policy_minimum_bandwidth_rule": "rule:regular_user",
-    "create_policy_minimum_bandwidth_rule": "rule:regular_user",
-    "delete_policy_minimum_bandwidth_rule": "rule:regular_user",
-    "update_policy_minimum_bandwidth_rule": "rule:regular_user",
+    "get_policy_minimum_bandwidth_rule": "rule:regular_user"
+    "create_policy_minimum_bandwidth_rule": "rule:regular_user"
+    "delete_policy_minimum_bandwidth_rule": "rule:regular_user"
+    "update_policy_minimum_bandwidth_rule": "rule:regular_user"
+
+To enable minimum packet rate rule:
+
+.. code-block:: yaml
+
+    "get_policy_minimum_packet_rate_rule": "rule:regular_user"
+    "create_policy_minimum_packet_rate_rule": "rule:regular_user"
+    "delete_policy_minimum_packet_rate_rule": "rule:regular_user"
+    "update_policy_minimum_packet_rate_rule": "rule:regular_user"
 
 User workflow
 ~~~~~~~~~~~~~
 
-QoS policies are only created by admins with the default ``policy.json``.
+QoS policies are only created by admins with the default ``policy.yaml``.
 Therefore, you should have the cloud operator set them up on
 behalf of the cloud projects.
 
 If projects are trusted to create their own policies, check the trusted
-projects ``policy.json`` configuration section.
+projects ``policy.yaml`` configuration section.
 
 First, create a QoS policy and its bandwidth limit rule:
 
@@ -339,7 +421,7 @@ First, create a QoS policy and its bandwidth limit rule:
 .. note::
 
    The QoS implementation requires a burst value to ensure proper behavior of
-   bandwidth limit rules in the Open vSwitch and Linux bridge agents.
+   bandwidth limit rules in the Open vSwitch agent.
    Configuring the proper burst value is very important. If the burst value is
    set too low, bandwidth usage will be throttled even with a proper bandwidth
    limit setting. This issue is discussed in various documentation sources, for
@@ -564,6 +646,60 @@ be used.
     | shared            | False                                |
     +-------------------+--------------------------------------+
 
+Create qos policy with packet rate limit rules:
+
+.. code-block:: console
+
+    $ openstack network qos policy create pps-limiter
+    +-------------+--------------------------------------+
+    | Field       | Value                                |
+    +-------------+--------------------------------------+
+    | description |                                      |
+    | id          | 97f0ac37-7dd6-4579-8359-3bef0751a505 |
+    | is_default  | False                                |
+    | name        | pps-limiter                          |
+    | project_id  | 1d70739f831b421fb38a27adb368fc17     |
+    | rules       | []                                   |
+    | shared      | False                                |
+    | tags        | []                                   |
+    +-------------+--------------------------------------+
+
+    $ openstack network qos rule create --max-kpps 1000 --max-burst-kpps 100 --ingress --type packet-rate-limit pps-limiter
+    +----------------+--------------------------------------+
+    | Field          | Value                                |
+    +----------------+--------------------------------------+
+    | direction      | ingress                              |
+    | id             | 4a1cb166-9661-48d7-bddb-00b7d75846cd |
+    | max_burst_kpps | 100                                  |
+    | max_kpps       | 1000                                 |
+    | name           | None                                 |
+    | project_id     |                                      |
+    +----------------+--------------------------------------+
+
+    $ openstack network qos rule create --max-kpps 1000 --max-burst-kpps 100 --egress --type packet-rate-limit pps-limiter
+    +----------------+--------------------------------------+
+    | Field          | Value                                |
+    +----------------+--------------------------------------+
+    | direction      | egress                               |
+    | id             | 6abd67f7-0bde-4ad3-ac54-b0a6103b0449 |
+    | max_burst_kpps | 100                                  |
+    | max_kpps       | 1000                                 |
+    | name           | None                                 |
+    | project_id     |                                      |
+    +----------------+--------------------------------------+
+
+.. note:: The unit for the rate and burst is kilo (1000) packets per second.
+
+Now apply the packet rate limit QoS policy to a Port:
+
+.. code-block:: console
+
+    $ openstack port set --qos-policy pps-limiter 251948bd-08e4-4569-a47f-ecbc1fd4af4d
+
+.. note:: Packet rate limit is only supported by the ml2 ovs driver. And it leverages
+          the meter actions of the ovs kernel datapath or the userspace ovs dpdk datapath.
+          The meter action is only supported when the datapath is in user mode
+          or ovs kernel datapath with kernerl version >= 4.15.
 
 Administrator enforcement
 -------------------------

@@ -16,6 +16,7 @@
 from unittest import mock
 
 from neutron_lib.callbacks import events
+from neutron_lib.callbacks import priority_group
 from neutron_lib import exceptions
 from neutron_lib import fixture
 from neutron_lib.services.logapi import constants as log_const
@@ -23,7 +24,6 @@ from neutron_lib.services.logapi import constants as log_const
 from neutron.services.logapi.common import exceptions as log_exc
 from neutron.services.logapi.drivers import base as log_driver_base
 from neutron.services.logapi.drivers import manager as driver_mgr
-from neutron.tests import tools
 from neutron.tests.unit.services.logapi import base
 
 
@@ -48,7 +48,7 @@ class TestGetParameter(base.BaseLogTestCase):
 class TestLogDriversManagerBase(base.BaseLogTestCase):
 
     def setUp(self):
-        super(TestLogDriversManagerBase, self).setUp()
+        super().setUp()
         self.config_parse()
         self.setup_coreplugin(load_plugins=False)
 
@@ -101,7 +101,7 @@ class TestLogDriversManagerLoggingTypes(TestLogDriversManagerBase):
                           'supported_logging_types':
                               ['security_group', 'firewall']}
              })
-        self.assertEqual(set(['security_group', 'firewall']),
+        self.assertEqual({'security_group', 'firewall'},
                          driver_manager.supported_logging_types)
 
 
@@ -109,7 +109,7 @@ class TestLogDriversCalls(TestLogDriversManagerBase):
     """Test log driver calls"""
 
     def setUp(self):
-        super(TestLogDriversCalls, self).setUp()
+        super().setUp()
         self.driver_manager = self._create_manager_with_drivers(
             {'driver-A': {'is_loaded': True}})
 
@@ -135,7 +135,7 @@ class TestHandleResourceCallback(TestLogDriversManagerBase):
     """Test handle resource callback"""
 
     def setUp(self):
-        super(TestHandleResourceCallback, self).setUp()
+        super().setUp()
         self._cb_mgr = mock.Mock()
         self.useFixture(fixture.CallbackRegistryFixture(
             callback_manager=self._cb_mgr))
@@ -162,28 +162,28 @@ class TestHandleResourceCallback(TestLogDriversManagerBase):
             'fake_resource2', self.driver_manager.call)
         assert_calls = [
             mock.call(
-                *tools.get_subscribe_args(
-                    fake_resource_cb1.handle_event,
-                    'fake_resource1', events.AFTER_CREATE)),
+                fake_resource_cb1.handle_event,
+                'fake_resource1', events.AFTER_CREATE,
+                priority_group.PRIORITY_DEFAULT, False),
             mock.call(
-                *tools.get_subscribe_args(
-                    fake_resource_cb1.handle_event,
-                    'fake_resource1', events.AFTER_UPDATE)),
+                fake_resource_cb1.handle_event,
+                'fake_resource1', events.AFTER_UPDATE,
+                priority_group.PRIORITY_DEFAULT, False),
             mock.call(
-                *tools.get_subscribe_args(
-                    fake_resource_cb1.handle_event,
-                    'fake_resource1', events.AFTER_DELETE)),
+                fake_resource_cb1.handle_event,
+                'fake_resource1', events.AFTER_DELETE,
+                priority_group.PRIORITY_DEFAULT, False),
             mock.call(
-                *tools.get_subscribe_args(
-                    fake_resource_cb2.handle_event,
-                    'fake_resource2', events.AFTER_CREATE)),
+                fake_resource_cb2.handle_event,
+                'fake_resource2', events.AFTER_CREATE,
+                priority_group.PRIORITY_DEFAULT, False),
             mock.call(
-                *tools.get_subscribe_args(
-                    fake_resource_cb2.handle_event,
-                    'fake_resource2', events.AFTER_UPDATE)),
+                fake_resource_cb2.handle_event,
+                'fake_resource2', events.AFTER_UPDATE,
+                priority_group.PRIORITY_DEFAULT, False),
             mock.call(
-                *tools.get_subscribe_args(
-                    fake_resource_cb2.handle_event,
-                    'fake_resource2', events.AFTER_DELETE)),
+                fake_resource_cb2.handle_event,
+                'fake_resource2', events.AFTER_DELETE,
+                priority_group.PRIORITY_DEFAULT, False),
         ]
         self._cb_mgr.subscribe.assert_has_calls(assert_calls)

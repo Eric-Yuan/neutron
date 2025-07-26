@@ -39,6 +39,7 @@ def setup_conf():
     """
 
     conf = cfg.CONF
+    config.register_common_config_options()
     cmd.register_cmd_opts(cmd.ovs_opts, conf)
     l3_config.register_l3_agent_config_opts(l3_config.OPTS, conf)
     agent_config.register_interface_driver_opts_helper(conf)
@@ -58,11 +59,12 @@ def main():
     conf = setup_conf()
     conf()
     config.setup_logging()
+    agent_config.setup_privsep()
     do_main(conf)
 
 
 def do_main(conf):
-    configuration_bridges = set([conf.OVS.integration_bridge])
+    configuration_bridges = {conf.OVS.integration_bridge}
     ovs = ovs_lib.BaseOVS()
     ovs_bridges = set(ovs.get_bridges())
     available_configuration_bridges = configuration_bridges & ovs_bridges

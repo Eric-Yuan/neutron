@@ -41,7 +41,7 @@ HOSTNAME = 'myhost'
 class QosExtensionBaseTestCase(test_agent.BasicRouterOperationsFramework):
 
     def setUp(self):
-        super(QosExtensionBaseTestCase, self).setUp()
+        super().setUp()
 
         self.gw_ip_qos_ext = gateway_ip_qos.RouterGatewayIPQosAgentExtension()
         self.context = context.get_admin_context()
@@ -159,7 +159,7 @@ class RouterGatewayIPQosAgentExtensionTestCase(
         QosExtensionBaseTestCase):
 
     def setUp(self):
-        super(RouterGatewayIPQosAgentExtensionTestCase, self).setUp()
+        super().setUp()
         self.gw_ip_qos_ext.initialize(
             self.connection, lib_const.L3_AGENT_MODE)
         self._set_pull_mock()
@@ -188,7 +188,7 @@ class RouterGatewayIPQosAgentExtensionTestCase(
 
             self.assertEqual(
                 {self.router_info.router_id: self.policy.id},
-                self.gw_ip_qos_ext.gateway_ip_qos_map.resource_policies)
+                self.gw_ip_qos_ext.gateway_ip_qos_map.resource_2_qos_policies)
 
     def test_add_router(self):
         self._test_gateway_ip_add(self.gw_ip_qos_ext.add_router)
@@ -229,7 +229,7 @@ class RouterGatewayIPQosAgentExtensionTestCase(
             self.gw_ip_qos_ext._process_update_policy(new_policy)
             self.assertEqual(
                 {self.router_info.router_id: self.policy.id},
-                self.gw_ip_qos_ext.gateway_ip_qos_map.resource_policies)
+                self.gw_ip_qos_ext.gateway_ip_qos_map.resource_2_qos_policies)
             tc_wrapper.set_ip_rate_limit.assert_has_calls(
                 [mock.call(lib_const.INGRESS_DIRECTION,
                            TEST_QOS_GW_IP, 5555, 6666),

@@ -13,9 +13,7 @@
 from neutron_lib.objects import common_types
 from neutron_lib.plugins import constants
 from neutron_lib.plugins import directory
-from neutron_lib.services.qos import constants as qos_consts
-from oslo_utils import versionutils
-from oslo_versionedobjects import exception
+from neutron_lib.services.qos import constants as qos_constants
 from oslo_versionedobjects import fields as obj_fields
 
 from neutron.objects import base
@@ -25,8 +23,8 @@ class RuleTypeField(obj_fields.BaseEnumField):
 
     def __init__(self, **kwargs):
         self.AUTO_TYPE = obj_fields.Enum(
-            valid_values=qos_consts.VALID_RULE_TYPES)
-        super(RuleTypeField, self).__init__(**kwargs)
+            valid_values=qos_constants.VALID_RULE_TYPES)
+        super().__init__(**kwargs)
 
 
 @base.NeutronObjectRegistry.register
@@ -35,7 +33,9 @@ class QosRuleType(base.NeutronObject):
     # Version 1.1: Added QosDscpMarkingRule
     # Version 1.2: Added QosMinimumBandwidthRule
     # Version 1.3: Added drivers field
-    VERSION = '1.3'
+    # Version 1.4: Added QosPacketRateLimitRule
+    # Version 1.5: Added QosMinimumPacketRateRule
+    VERSION = '1.5'
 
     fields = {
         'type': RuleTypeField(),
@@ -53,32 +53,27 @@ class QosRuleType(base.NeutronObject):
         drivers_obj = [QosRuleTypeDriver(
             name=driver['name'],
             supported_parameters=driver['supported_parameters'])
-            for driver in drivers]
+                       for driver in drivers]
 
         return cls(type=rule_type_name, drivers=drivers_obj)
 
     # we don't receive context because we don't need db access at all
     @classmethod
     def get_objects(cls, validate_filters=True, **kwargs):
+        all_supported = kwargs.pop('all_supported', None)
+        all_rules = kwargs.pop('all_rules', None)
         if validate_filters:
             cls.validate_filters(**kwargs)
 
-        rule_types = (
-            directory.get_plugin(alias=constants.QOS).supported_rule_types)
-
-        # TODO(ihrachys): apply filters to returned result
+        rule_types = directory.get_plugin(
+            alias=constants.QOS).supported_rule_types(
+                all_supported=all_supported, all_rules=all_rules)
         return [cls(type=type_) for type_ in rule_types]
 
     # we don't receive context because we don't need db access at all
     @classmethod
     def get_values(cls, field, **kwargs):
         return [getattr(obj, field) for obj in cls.get_objects(**kwargs)]
-
-    def obj_make_compatible(self, primitive, target_version):
-        _target_version = versionutils.convert_version_to_tuple(target_version)
-        if _target_version < (1, 3):
-            raise exception.IncompatibleObjectVersion(
-                objver=target_version, objtype=self.__class__.__name__)
 
 
 @base.NeutronObjectRegistry.register

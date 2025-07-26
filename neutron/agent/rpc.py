@@ -13,7 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from datetime import datetime
+import collections
 import itertools
 
 import netaddr
@@ -25,17 +25,21 @@ from neutron_lib.callbacks import resources as callback_resources
 from neutron_lib import constants
 from neutron_lib.plugins import utils
 from neutron_lib import rpc as lib_rpc
+from neutron_lib.services.qos import constants as qos_consts
+from oslo_config import cfg
 from oslo_log import log as logging
 import oslo_messaging
+from oslo_serialization import jsonutils
+from oslo_utils import timeutils
 from oslo_utils import uuidutils
 
 from neutron.agent import resource_cache
 from neutron.api.rpc.callbacks import resources
-from neutron.common import _constants as n_const
 from neutron import objects
 
 LOG = logging.getLogger(__name__)
 BINDING_DEACTIVATE = 'binding_deactivate'
+DeviceInfo = collections.namedtuple('DeviceInfo', 'mac pci_slot')
 
 
 def create_consumers(endpoints, prefix, topic_details, start_listening=True):
@@ -59,7 +63,7 @@ def create_consumers(endpoints, prefix, topic_details, start_listening=True):
         topic_name = topics.get_topic_name(prefix, topic, operation)
         connection.create_consumer(topic_name, endpoints, fanout=True)
         if node_name:
-            node_topic_name = '%s.%s' % (topic_name, node_name)
+            node_topic_name = f'{topic_name}.{node_name}'
             connection.create_consumer(node_topic_name,
                                        endpoints,
                                        fanout=False)
@@ -68,7 +72,7 @@ def create_consumers(endpoints, prefix, topic_details, start_listening=True):
     return connection
 
 
-class PluginReportStateAPI(object):
+class PluginReportStateAPI:
     """RPC client used to report state back to plugin.
 
     This class implements the client side of an rpc interface.  The server side
@@ -77,17 +81,17 @@ class PluginReportStateAPI(object):
     doc/source/contributor/internals/rpc_api.rst.
     """
     def __init__(self, topic):
-        target = oslo_messaging.Target(topic=topic, version='1.2',
+        target = oslo_messaging.Target(topic=topic, version='1.4',
                                        namespace=constants.RPC_NAMESPACE_STATE)
         self.client = lib_rpc.get_client(target)
+        self.timeout = cfg.CONF.AGENT.report_interval
 
     def has_alive_neutron_server(self, context, **kwargs):
         cctxt = self.client.prepare()
         return cctxt.call(context, 'has_alive_neutron_server', **kwargs)
 
     def report_state(self, context, agent_state, use_call=False):
-        cctxt = self.client.prepare(
-            timeout=lib_rpc.TRANSPORT.conf.rpc_response_timeout)
+        cctxt = self.client.prepare(timeout=self.timeout)
         # add unique identifier to a report
         # that can be logged on server side.
         # This create visible correspondence between events on
@@ -95,14 +99,22 @@ class PluginReportStateAPI(object):
         agent_state['uuid'] = uuidutils.generate_uuid()
         kwargs = {
             'agent_state': {'agent_state': agent_state},
-            'time': datetime.utcnow().strftime(constants.ISO8601_TIME_FORMAT),
+            'time': timeutils.utcnow().strftime(constants.ISO8601_TIME_FORMAT),
         }
         method = cctxt.call if use_call else cctxt.cast
         return method(context, 'report_state', **kwargs)
 
+    def get_agents(self, context, **filters):
+        cctxt = self.client.prepare(timeout=self.timeout)
+        return cctxt.call(context, 'get_agents', **filters)
 
-class PluginApi(object):
-    '''Agent side of the rpc API.
+    def delete_agent(self, context, **kwargs):
+        cctxt = self.client.prepare(timeout=self.timeout)
+        return cctxt.call(context, 'delete_agent', **kwargs)
+
+
+class PluginApi:
+    """Agent side of the rpc API.
 
     API version history:
         1.0 - Initial version.
@@ -116,19 +128,26 @@ class PluginApi(object):
         1.7 - Support get_ports_by_vnic_type_and_host
         1.8 - Rename agent_restarted to refresh_tunnels in
               update_device_list to reflect its expanded purpose
-    '''
+        1.9 - Support for device definition as DeviceInfo(mac, pci_info) for:
+              - get_device_details
+              - get_devices_details_list (indirectly, calls get_device_details)
+              - update_device_down
+              - update_device_up
+              - update_device_list (indirectly, called from update_device_down
+                and update_device_up)
+    """
 
     def __init__(self, topic):
-        target = oslo_messaging.Target(topic=topic, version='1.0')
+        target = oslo_messaging.Target(topic=topic, version='1.9')
         self.client = lib_rpc.get_client(target)
 
     def get_device_details(self, context, device, agent_id, host=None):
-        cctxt = self.client.prepare()
+        cctxt = self.client.prepare(version='1.9')
         return cctxt.call(context, 'get_device_details', device=device,
                           agent_id=agent_id, host=host)
 
     def get_devices_details_list(self, context, devices, agent_id, host=None):
-        cctxt = self.client.prepare(version='1.3')
+        cctxt = self.client.prepare(version='1.9')
         return cctxt.call(context, 'get_devices_details_list',
                           devices=devices, agent_id=agent_id, host=host)
 
@@ -153,25 +172,25 @@ class PluginApi(object):
                           agent_id=agent_id, host=host)
 
     def update_device_down(self, context, device, agent_id, host=None):
-        cctxt = self.client.prepare()
+        cctxt = self.client.prepare(version='1.9')
         return cctxt.call(context, 'update_device_down', device=device,
                           agent_id=agent_id, host=host)
 
     def update_device_up(self, context, device, agent_id, host=None):
-        cctxt = self.client.prepare()
+        cctxt = self.client.prepare(version='1.9')
         return cctxt.call(context, 'update_device_up', device=device,
                           agent_id=agent_id, host=host)
 
     def update_device_list(self, context, devices_up, devices_down,
                            agent_id, host, refresh_tunnels=False):
-        cctxt = self.client.prepare(version='1.8')
+        cctxt = self.client.prepare(version='1.9')
 
         ret_devices_up = []
         failed_devices_up = []
         ret_devices_down = []
         failed_devices_down = []
 
-        step = n_const.RPC_RES_PROCESSING_STEP
+        step = cfg.CONF.rpc_resources_processing_step
         devices_up = list(devices_up)
         devices_down = list(devices_down)
         for i in range(0, max(len(devices_up), len(devices_down)), step):
@@ -208,10 +227,11 @@ class CacheBackedPluginApi(PluginApi):
                       resources.SECURITYGROUP,
                       resources.SECURITYGROUPRULE,
                       resources.NETWORK,
-                      resources.SUBNET]
+                      resources.SUBNET,
+                      resources.ADDRESSGROUP]
 
     def __init__(self, *args, **kwargs):
-        super(CacheBackedPluginApi, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.remote_resource_cache = None
         self._create_cache_for_l2_agent()
 
@@ -226,17 +246,18 @@ class CacheBackedPluginApi(PluginApi):
             for r in (resources.PORT, resources.NETWORK):
                 registry.subscribe(self._legacy_notifier, r, e)
 
-    def _legacy_notifier(self, rtype, event, trigger, context, resource_id,
-                         **kwargs):
+    def _legacy_notifier(self, rtype, event, trigger, payload):
         """Checks if legacy interface is expecting calls for resource.
 
         looks for port_update, network_delete, etc and calls them with
         the payloads the handlers are expecting (an ID).
         """
+        context = payload.context
+        resource_id = payload.resource_id
         rtype = rtype.lower()  # all legacy handlers don't camelcase
-        agent_restarted = kwargs.pop("agent_restarted", None)
+        agent_restarted = payload.metadata.pop("agent_restarted", None)
         method, host_with_activation, host_with_deactivation = (
-            self._get_method_host(rtype, event, **kwargs))
+            self._get_method_host(rtype, event, payload))
         if not hasattr(self._legacy_interface, method):
             # TODO(kevinbenton): once these notifications are stable, emit
             # a deprecation warning for legacy handlers
@@ -256,7 +277,7 @@ class CacheBackedPluginApi(PluginApi):
                 payload["agent_restarted"] = agent_restarted
             getattr(self._legacy_interface, method)(context, **payload)
 
-    def _get_method_host(self, rtype, event, **kwargs):
+    def _get_method_host(self, rtype, event, payload):
         """Constructs the name of method to be called in the legacy interface.
 
         If the event received is a port update that contains a binding
@@ -267,7 +288,7 @@ class CacheBackedPluginApi(PluginApi):
         """
         is_delete = event == callback_events.AFTER_DELETE
         suffix = 'delete' if is_delete else 'update'
-        method = "%s_%s" % (rtype, suffix)
+        method = "{}_{}".format(rtype, suffix)
         host_with_activation = None
         host_with_deactivation = None
         if is_delete or rtype != callback_resources.PORT:
@@ -276,20 +297,21 @@ class CacheBackedPluginApi(PluginApi):
         # A port update was received. Find out if it is a binding activation
         # where a previous binding was deactivated
         BINDINGS = pb_ext.COLLECTION_NAME
-        if BINDINGS in kwargs.get('changed_fields', set()):
+        changed_fields = payload.metadata['changed_fields']
+        if BINDINGS in changed_fields:
             existing_active_binding = (
                 utils.get_port_binding_by_status_and_host(
-                    getattr(kwargs['existing'], 'bindings', []),
+                    getattr(payload.states[0], 'bindings', []),
                     constants.ACTIVE))
             updated_active_binding = (
                 utils.get_port_binding_by_status_and_host(
-                    getattr(kwargs['updated'], 'bindings', []),
+                    getattr(payload.latest_state, 'bindings', []),
                     constants.ACTIVE))
             if (existing_active_binding and updated_active_binding and
                     existing_active_binding.host !=
                     updated_active_binding.host):
                 if (utils.get_port_binding_by_status_and_host(
-                        getattr(kwargs['updated'], 'bindings', []),
+                        getattr(payload.latest_state, 'bindings', []),
                         constants.INACTIVE,
                         host=existing_active_binding.host)):
                     method = BINDING_DEACTIVATE
@@ -328,7 +350,8 @@ class CacheBackedPluginApi(PluginApi):
         binding = utils.get_port_binding_by_status_and_host(
             port_obj.bindings, constants.ACTIVE, raise_if_not_found=True,
             port_id=port_obj.id)
-        if (port_obj.device_owner.startswith(
+        migrating_to = migrating_to_host(port_obj.bindings)
+        if (not migrating_to and port_obj.device_owner.startswith(
                 constants.DEVICE_OWNER_COMPUTE_PREFIX) and
                 binding[pb_ext.HOST] != host):
             LOG.debug("Device %s has no active binding in this host",
@@ -337,7 +360,8 @@ class CacheBackedPluginApi(PluginApi):
                     constants.NO_ACTIVE_BINDING: True}
         net = self.remote_resource_cache.get_resource_by_id(
             resources.NETWORK, port_obj.network_id)
-        net_qos_policy_id = net.qos_policy_id
+        qos_network_policy_id = getattr(net, 'qos_policy_id', None)
+
         # match format of old RPC interface
         mac_addr = str(netaddr.EUI(str(port_obj.mac_address),
                                    dialect=netaddr.mac_unix_expanded))
@@ -348,6 +372,7 @@ class CacheBackedPluginApi(PluginApi):
             'port_id': port_obj.id,
             'mac_address': mac_addr,
             'admin_state_up': port_obj.admin_state_up,
+            'status': port_obj.status,
             'network_type': segment.network_type,
             'segmentation_id': segment.segmentation_id,
             'physical_network': segment.physical_network,
@@ -360,12 +385,14 @@ class CacheBackedPluginApi(PluginApi):
                                       for o in port_obj.allowed_address_pairs],
             'port_security_enabled': getattr(port_obj.security,
                                              'port_security_enabled', True),
-            'qos_policy_id': port_obj.qos_policy_id,
-            'network_qos_policy_id': net_qos_policy_id,
+            qos_consts.QOS_POLICY_ID: port_obj.qos_policy_id,
+            qos_consts.QOS_NETWORK_POLICY_ID: qos_network_policy_id,
             'profile': binding.profile,
             'vif_type': binding.vif_type,
             'vnic_type': binding.vnic_type,
-            'security_groups': list(port_obj.security_group_ids)
+            'security_groups': list(port_obj.security_group_ids),
+            'migrating_to': migrating_to,
+            'hints': port_obj.hints.hints if port_obj.hints else None,
         }
         LOG.debug("Returning: %s", entry)
         return entry
@@ -380,3 +407,33 @@ class CacheBackedPluginApi(PluginApi):
         rcache = resource_cache.RemoteResourceCache(self.RESOURCE_TYPES)
         rcache.start_watcher()
         self.remote_resource_cache = rcache
+
+    def stop(self):
+        self.remote_resource_cache.stop_watcher()
+
+
+# TODO(ralonsoh): move this method to neutron_lib.plugins.utils
+def migrating_to_host(bindings, host=None):
+    """Return the host the port is being migrated.
+
+    If the host is passed, the port binding profile with the "migrating_to",
+    that contains the host the port is being migrated, is compared to this
+    value. If no value is passed, this method will return if the port is
+    being migrated ("migrating_to" is present in any port binding profile).
+
+    The function returns None or the matching host.
+    """
+    for binding in (binding for binding in bindings if
+                    binding[pb_ext.STATUS] == constants.ACTIVE):
+        profile = binding.get('profile')
+        if not profile:
+            continue
+        profile = (jsonutils.loads(profile) if isinstance(profile, str) else
+                   profile)
+        migrating_to = profile.get('migrating_to')
+        if migrating_to:
+            if not host:  # Just know if the port is being migrated.
+                return migrating_to
+            if migrating_to == host:
+                return migrating_to
+    return None

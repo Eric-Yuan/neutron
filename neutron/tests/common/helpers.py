@@ -13,10 +13,10 @@
 #    under the License.
 
 import datetime
-from distutils import version
-import functools
+import math
 import os
 import random
+import signal
 
 from neutron_lib.agent import topics
 from neutron_lib import constants
@@ -24,7 +24,6 @@ from neutron_lib import context
 from oslo_utils import timeutils
 
 import neutron
-from neutron.agent.common import ovs_lib
 from neutron.db import agents_db
 
 HOST = 'localhost'
@@ -57,7 +56,7 @@ def _get_l3_agent_dict(host, agent_mode, internal_only=True,
                        az=DEFAULT_AZ):
     return {
         'agent_type': constants.AGENT_TYPE_L3,
-        'binary': 'neutron-l3-agent',
+        'binary': constants.AGENT_PROCESS_L3,
         'host': host,
         'topic': topics.L3_AGENT,
         'availability_zone': az,
@@ -82,7 +81,7 @@ def register_l3_agent(host=HOST, agent_mode=constants.L3_AGENT_MODE_LEGACY,
 
 def _get_dhcp_agent_dict(host, networks=0, az=DEFAULT_AZ):
     agent = {
-        'binary': 'neutron-dhcp-agent',
+        'binary': constants.AGENT_PROCESS_DHCP,
         'host': host,
         'topic': topics.DHCP_AGENT,
         'agent_type': constants.AGENT_TYPE_DHCP,
@@ -161,11 +160,13 @@ def _get_l2_agent_dict(host, agent_type, binary, tunnel_types=None,
 
 
 def register_ovs_agent(host=HOST, agent_type=constants.AGENT_TYPE_OVS,
-                       binary='neutron-openvswitch-agent',
-                       tunnel_types=['vxlan'], tunneling_ip='20.0.0.1',
+                       binary=constants.AGENT_PROCESS_OVS,
+                       tunnel_types=None, tunneling_ip='20.0.0.1',
                        interface_mappings=None, bridge_mappings=None,
                        l2pop_network_types=None, plugin=None, start_flag=True,
                        integration_bridge=None):
+    if tunnel_types is None:
+        tunnel_types = ['vxlan']
     agent = _get_l2_agent_dict(host, agent_type, binary, tunnel_types,
                                tunneling_ip, interface_mappings,
                                bridge_mappings, l2pop_network_types,
@@ -174,22 +175,9 @@ def register_ovs_agent(host=HOST, agent_type=constants.AGENT_TYPE_OVS,
     return _register_agent(agent, plugin)
 
 
-def register_linuxbridge_agent(host=HOST,
-                               agent_type=constants.AGENT_TYPE_LINUXBRIDGE,
-                               binary='neutron-linuxbridge-agent',
-                               tunnel_types=['vxlan'], tunneling_ip='20.0.0.1',
-                               interface_mappings=None, bridge_mappings=None,
-                               plugin=None):
-    agent = _get_l2_agent_dict(host, agent_type, binary, tunnel_types,
-                               tunneling_ip=tunneling_ip,
-                               interface_mappings=interface_mappings,
-                               bridge_mappings=bridge_mappings)
-    return _register_agent(agent, plugin)
-
-
 def register_macvtap_agent(host=HOST,
                            agent_type=constants.AGENT_TYPE_MACVTAP,
-                           binary='neutron-macvtap-agent',
+                           binary=constants.AGENT_PROCESS_MACVTAP,
                            interface_mappings=None, plugin=None):
     agent = _get_l2_agent_dict(host, agent_type, binary,
                                interface_mappings=interface_mappings)
@@ -198,7 +186,7 @@ def register_macvtap_agent(host=HOST,
 
 def register_sriovnicswitch_agent(host=HOST,
                                   agent_type=constants.AGENT_TYPE_NIC_SWITCH,
-                                  binary='neutron-sriov-nic-agent',
+                                  binary=constants.AGENT_PROCESS_NIC_SWITCH,
                                   device_mappings=None, plugin=None):
     agent = _get_l2_agent_dict(host, agent_type, binary,
                                device_mappings=device_mappings)
@@ -213,19 +201,46 @@ def get_not_used_vlan(bridge, vlan_range):
     return random.choice(list(available_vlans))
 
 
-def skip_if_ovs_older_than(ovs_version):
-    """Decorator for test method to skip if OVS version doesn't meet
-       minimal requirement.
+class TestTimerTimeout(Exception):
+    pass
+
+
+class TestTimer:
+    """Timer context manager class for testing.
+
+    This class can be used inside a fixtures._fixtures.timeout.Timeout context.
+    This class will halt the timeout counter and divert temporary the fixtures
+    timeout exception. The goal of this class is to use the SIGALRM event
+    without affecting the test case timeout counter.
     """
-    def skip_if_bad_ovs(f):
-        @functools.wraps(f)
-        def check_ovs_and_skip(test):
-            ovs = ovs_lib.BaseOVS()
-            current_ovs_version = version.StrictVersion(
-                ovs.config['ovs_version'])
-            if current_ovs_version < version.StrictVersion(ovs_version):
-                test.skipTest("This test requires OVS version %s or higher." %
-                              ovs_version)
-            return f(test)
-        return check_ovs_and_skip
-    return skip_if_bad_ovs
+    def __init__(self, timeout):
+        self._timeout = int(timeout)
+        self._old_handler = None
+        self._old_timer = None
+        self._alarm_fn = getattr(signal, 'alarm', None)
+
+    def _timeout_handler(self, *args, **kwargs):
+        raise TestTimerTimeout()
+
+    def __enter__(self):
+        self._old_handler = signal.signal(signal.SIGALRM,
+                                          self._timeout_handler)
+        self._old_timer = math.ceil(signal.getitimer(signal.ITIMER_REAL)[0])
+        if self._alarm_fn:
+            self._alarm_fn(self._timeout)
+        return self
+
+    def __exit__(self, exc, value, traceback):
+        if self._old_handler is not None:
+            signal.signal(signal.SIGALRM, self._old_handler)
+
+        if self._old_timer == 0:
+            timeout = 0
+        else:
+            # If timer has expired, set the minimum required value (1) to
+            # activate the SIGALRM event.
+            timeout = self._old_timer - self._timeout
+            timeout = 1 if timeout <= 0 else timeout
+
+        if self._alarm_fn:
+            self._alarm_fn(timeout)

@@ -27,7 +27,7 @@ from neutron.tests.unit.objects import test_rbac
 from neutron.tests.unit import testlib_api
 
 
-class SubnetPoolTestMixin(object):
+class SubnetPoolTestMixin:
     def _create_test_subnetpool(self, snp_id=None):
 
         if not snp_id:
@@ -63,14 +63,14 @@ class SubnetPoolDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
         pool.update()
 
         new_pool = self._test_class.get_object(self.context, id=pool.id)
-        self.assertItemsEqual(prefixes, new_pool.prefixes)
+        self.assertCountEqual(prefixes, new_pool.prefixes)
 
         prefixes.pop()
         pool.prefixes = prefixes
         pool.update()
 
         new_pool = self._test_class.get_object(self.context, id=pool.id)
-        self.assertItemsEqual(prefixes, new_pool.prefixes)
+        self.assertCountEqual(prefixes, new_pool.prefixes)
 
     def test_get_objects_queries_constant(self):
         # TODO(korzen) SubnetPool is using SubnetPoolPrefix object to reload
@@ -84,7 +84,7 @@ class SubnetPoolDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
     @mock.patch.object(obj_db_api, 'get_object')
     def test_rbac_policy_create_no_address_scope(self, mock_get_object,
                                                  mock_query_with_hooks):
-        context = mock.Mock(is_admin=False, tenant_id='db_obj_owner_id')
+        context = mock.Mock(is_admin=False, project_id='db_obj_owner_id')
         payload = mock.Mock(
             context=context, request_body=dict(object_id="fake_id")
         )
@@ -100,7 +100,7 @@ class SubnetPoolDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
                                    address_scope_id):
         filter_mock.assert_called_once()
         self.assertEqual(
-            "addressscoperbacs.target_tenant IN ('*', '%(project_id)s') "
+            "addressscoperbacs.target_project IN ('*', '%(project_id)s') "
             "AND addressscoperbacs.object_id = '%(address_scope_id)s'" % {
                 "project_id": project_id,
                 "address_scope_id": address_scope_id,
@@ -114,12 +114,12 @@ class SubnetPoolDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
     @mock.patch.object(obj_db_api, 'get_object')
     def test_rbac_policy_create_no_matching_policies(self, mock_get_object,
                                                      mock_query_with_hooks):
-        context = mock.Mock(is_admin=False, tenant_id='db_obj_owner_id')
-        fake_project_id = "fake_target_tenant_id"
+        context = mock.Mock(is_admin=False, project_id='db_obj_owner_id')
+        fake_project_id = "fake_target_project_id"
         payload = mock.Mock(
             context=context, request_body=dict(
                 object_id="fake_id",
-                target_tenant=fake_project_id
+                target_project=fake_project_id
             )
         )
         fake_address_scope_id = "fake_as_id"
@@ -146,12 +146,12 @@ class SubnetPoolDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
     @mock.patch.object(obj_db_api, 'get_object')
     def test_rbac_policy_create_valid(self, mock_get_object,
                                       mock_query_with_hooks):
-        context = mock.Mock(is_admin=False, tenant_id='db_obj_owner_id')
-        fake_project_id = "fake_target_tenant_id"
+        context = mock.Mock(is_admin=False, project_id='db_obj_owner_id')
+        fake_project_id = "fake_target_project_id"
         payload = mock.Mock(
             context=context, request_body=dict(
                 object_id="fake_id",
-                target_tenant=fake_project_id
+                target_project=fake_project_id
             )
         )
         fake_address_scope_id = "fake_as_id"
@@ -184,7 +184,7 @@ class SubnetPoolPrefixDbObjectTestCase(
     _test_class = subnetpool.SubnetPoolPrefix
 
     def setUp(self):
-        super(SubnetPoolPrefixDbObjectTestCase, self).setUp()
+        super().setUp()
         self.update_obj_fields(
             {'subnetpool_id': lambda: self._create_test_subnetpool().id})
 
@@ -195,9 +195,10 @@ class SubnetPoolRBACDbObjectTestCase(test_rbac.TestRBACObjectMixin,
                                      SubnetPoolTestMixin):
 
     _test_class = subnetpool.SubnetPoolRBAC
+    _parent_class = subnetpool.SubnetPool
 
     def setUp(self):
-        super(SubnetPoolRBACDbObjectTestCase, self).setUp()
+        super().setUp()
         for obj in self.db_objs:
             self._create_test_subnetpool(obj['object_id'])
 

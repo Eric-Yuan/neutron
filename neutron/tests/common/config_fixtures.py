@@ -12,10 +12,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import configparser
 import os.path
 
 import fixtures
-import six
 
 from neutron.tests import base
 
@@ -23,7 +23,7 @@ from neutron.tests import base
 class ConfigDict(base.AttributeDict):
     def update(self, other):
         self.convert_to_attr_dict(other)
-        super(ConfigDict, self).update(other)
+        super().update(other)
 
     def convert_to_attr_dict(self, other):
         """Convert nested dicts to AttributeDict.
@@ -46,7 +46,7 @@ class ConfigFileFixture(fixtures.Fixture):
     """
 
     def __init__(self, base_filename, config, temp_dir):
-        super(ConfigFileFixture, self).__init__()
+        super().__init__()
         self.base_filename = base_filename
         self.config = config
         self.temp_dir = temp_dir
@@ -63,7 +63,7 @@ class ConfigFileFixture(fixtures.Fixture):
             f.flush()
 
     def dict_to_config_parser(self, config_dict):
-        config_parser = six.moves.configparser.ConfigParser()
+        config_parser = configparser.ConfigParser()
         for section, section_dict in config_dict.items():
             if section != 'DEFAULT':
                 config_parser.add_section(section)

@@ -32,8 +32,11 @@ Testing
 
    testing
    fullstack
-   coverage
+   ml2_ovs_devstack
+   ci_jobs
+   ml2_ovn_devstack
+   tempest
    template_model_sync_test
+   coverage
    db_transient_failure_injection
-   ci_scenario_jobs
-   ovn_devstack
+   neutron_wsgi_api_server

@@ -24,9 +24,10 @@ Frequently Asked Questions
 |               | VRRP traffic.             | tunnel endpoints to detect     |
 |               |                           | connectivity issues to nodes.  |
 +---------------+---------------------------+--------------------------------+
-| DVR           | exposes the "distributed" | no "distributed" flag is shown |
-| API           | flag on routers only      | or available on routers via    |
-|               | modifiable by admin.      | API.                           |
+| DVR           | exposes the "distributed" | exposes the "distributed" flag |
+| API           | flag on routers only      | based on the configuration     |
+|               | modifiable by admin.      | option                         |
+|               |                           | enable_distributed_floating_ip |
 +---------------+---------------------------+--------------------------------+
 | DVR           | uses namespaces, veths,   | Uses OpenFlow rules on the     |
 | dataplane     | ip routing, ip rules and  | compute nodes.                 |
@@ -107,5 +108,15 @@ active/passive HA process.  Clients would be pointed at a virtual IP
 address.  When the HA manager detects a failure of the master, the
 virtual IP would be moved and the passive replica would become the
 new master.
+
+**Q: Which core OVN version should I use for my OpenStack installation?**
+
+OpenStack doesn't set explicit version requirements for OVN installation, but
+it's recommended to follow at least the version that is used in upstream CI,
+e.g.:
+https://github.com/openstack/neutron/blob/4d31284373e89cb2b29539d6718f90a4c4d8284b/zuul.d/tempest-singlenode.yaml#L310
+
+Some new features may require the latest core OVN version to work. For example,
+to be able to use VXLAN network type, one must run OVN 20.09+.
 
 See :doc:`/admin/ovn/ovn` for links to more details on OVN's architecture.

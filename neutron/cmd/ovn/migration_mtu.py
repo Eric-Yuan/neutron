@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 # Copyright 2018 Red Hat, Inc.
 # All Rights Reserved.
 #
@@ -16,21 +18,64 @@
 import os
 import sys
 
+from neutron_lib import constants as const
 from openstack import connection
 
-# TODO(dalvarez): support also GRE
-GENEVE_TO_VXLAN_OVERHEAD = 8
+
+# Overhead size of Geneve is configurable, use the recommended value
+GENEVE_ENCAP_OVERHEAD = 38
+# map of network types to migrate and the difference in overhead size when
+# converted to Geneve.
+NETWORK_TYPE_OVERHEAD_DIFF = {
+    const.TYPE_VXLAN: GENEVE_ENCAP_OVERHEAD - const.VXLAN_ENCAP_OVERHEAD,
+    const.TYPE_GRE: GENEVE_ENCAP_OVERHEAD - const.GRE_ENCAP_OVERHEAD,
+}
 
 
 def get_connection():
-    user_domain_id = os.environ.get('OS_USER_DOMAIN_ID', 'default')
-    project_domain_id = os.environ.get('OS_PROJECT_DOMAIN_ID', 'default')
+    """Get OpenStack SDK Connection object with parameters from environment.
+
+    Project scoped authorization is used and the following environment
+    variables are required:
+
+        OS_AUTH_URL     URL to OpenStack Identity service
+        OS_PROJECT_NAME Name of project for authorization
+        OS_USERNAME     Username for authentication
+        OS_PASSWORD     Password for authentication
+
+    Which domain to use for authentication and authorization may be specified
+    by domain name or domain ID. If none of the domain selection variables are
+    set the tool will default to use the domain with literal ID of 'default'.
+
+    To select domain by name set both of these environment variables:
+
+        OS_USER_DOMAIN_NAME    Name of domain to authenticate to
+        OS_PROJECT_DOMAIN_NAME Name of domain for authorization
+
+    To select domain by ID set both of these environment variables:
+
+        OS_USER_DOMAIN_ID    ID of domain to authenticate to
+        OS_PROJECT_DOMAIN_ID ID of domain for authorization
+
+    NOTE: If both OS_*_DOMAIN_NAME and OS_*_DOMAIN_ID variables are present in
+    the environment the OS_*_DOMAIN_NAME variables will be used.
+    """
+    user_domain_name = os.environ.get('OS_USER_DOMAIN_NAME')
+    project_domain_name = os.environ.get('OS_PROJECT_DOMAIN_NAME')
+    user_domain_id = os.environ.get(
+        'OS_USER_DOMAIN_ID',
+        'default') if not user_domain_name else None
+    project_domain_id = os.environ.get(
+        'OS_PROJECT_DOMAIN_ID',
+        'default') if not project_domain_name else None
     conn = connection.Connection(auth_url=os.environ['OS_AUTH_URL'],
                                  project_name=os.environ['OS_PROJECT_NAME'],
                                  username=os.environ['OS_USERNAME'],
                                  password=os.environ['OS_PASSWORD'],
                                  user_domain_id=user_domain_id,
-                                 project_domain_id=project_domain_id)
+                                 project_domain_id=project_domain_id,
+                                 user_domain_name=user_domain_name,
+                                 project_domain_name=project_domain_name)
     return conn
 
 
@@ -40,8 +85,9 @@ def verify_network_mtu():
     success = True
     for network in conn.network.networks():
         if network.provider_physical_network is None and (
-            network.provider_network_type == 'vxlan') and (
-                'adapted_mtu' not in network.tags):
+                network.provider_network_type in
+                NETWORK_TYPE_OVERHEAD_DIFF) and (
+                    'adapted_mtu' not in network.tags):
             print("adapted_mtu tag is not set for the Network "
                   "[" + str(network.name) + "]")
             success = False
@@ -60,7 +106,8 @@ def update_network_mtu():
     for network in conn.network.networks():
         try:
             if network.provider_physical_network is None and (
-                    network.provider_network_type == 'vxlan') and (
+                    network.provider_network_type in
+                    NETWORK_TYPE_OVERHEAD_DIFF) and (
                         'adapted_mtu' not in network.tags):
                 print("Updating the mtu and the tag 'adapted_mtu"
                       " of the network - " + str(network.name))
@@ -68,10 +115,11 @@ def update_network_mtu():
                 new_tags.append('adapted_mtu')
                 conn.network.update_network(
                     network,
-                    mtu=int(network.mtu) - GENEVE_TO_VXLAN_OVERHEAD)
+                    mtu=int(network.mtu) - NETWORK_TYPE_OVERHEAD_DIFF[
+                        network.provider_network_type])
                 conn.network.set_tags(network, new_tags)
         except Exception as e:
-            print("Exception occured while updating the MTU:" + str(e))
+            print("Exception occurred while updating the MTU:" + str(e))
             return False
     return True
 

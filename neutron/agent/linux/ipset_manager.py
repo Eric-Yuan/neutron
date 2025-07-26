@@ -24,7 +24,7 @@ SWAP_SUFFIX = '-n'
 IPSET_NAME_MAX_LENGTH = 31 - len(SWAP_SUFFIX)
 
 
-class IpsetManager(object):
+class IpsetManager:
     """Smart wrapper for ipset.
 
        Keeps track of ip addresses per set, using bulk
@@ -120,10 +120,10 @@ class IpsetManager(object):
     def _refresh_set(self, set_name, member_ips, ethertype):
         new_set_name = set_name + SWAP_SUFFIX
         set_type = self._get_ipset_set_type(ethertype)
-        process_input = ["create %s hash:net family %s" % (new_set_name,
-                                                           set_type)]
+        process_input = ["create {} hash:net family {}".format(new_set_name,
+                                                               set_type)]
         for ip in member_ips:
-            process_input.append("add %s %s" % (new_set_name, ip))
+            process_input.append(f"add {new_set_name} {ip}")
 
         self._restore_sets(process_input)
         self._swap_sets(new_set_name, set_name)
@@ -148,7 +148,7 @@ class IpsetManager(object):
             cmd_ns.extend(['ip', 'netns', 'exec', self.namespace])
         cmd_ns.extend(cmd)
         self.execute(cmd_ns, run_as_root=True, process_input=input,
-                     check_exit_code=fail_on_errors)
+                     check_exit_code=fail_on_errors, privsep_exec=True)
 
     def _get_new_set_ips(self, set_name, expected_ips):
         new_member_ips = (set(expected_ips) -

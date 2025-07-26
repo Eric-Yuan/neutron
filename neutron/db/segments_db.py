@@ -50,11 +50,12 @@ def add_network_segment(context, network_id, segment, segment_index=0,
             segmentation_id=segment.get(SEGMENTATION_ID),
             segment_index=segment_index, is_dynamic=is_dynamic)
         netseg_obj.create()
-        registry.notify(resources.SEGMENT,
-                        events.PRECOMMIT_CREATE,
-                        trigger=add_network_segment,
-                        context=context,
-                        segment=netseg_obj)
+        registry.publish(resources.SEGMENT,
+                         events.PRECOMMIT_CREATE,
+                         add_network_segment,
+                         payload=events.DBEventPayload(
+                             context, resource_id=netseg_obj.id,
+                             states=(netseg_obj,)))
         segment['id'] = netseg_obj.id
     LOG.info("Added segment %(id)s of type %(network_type)s for network "
              "%(network_id)s",
@@ -123,14 +124,13 @@ def get_dynamic_segment(context, network_id, physical_network=None,
 
         if objs:
             return _make_segment_dict(objs[0])
-        else:
-            LOG.debug("No dynamic segment found for "
-                      "Network:%(network_id)s, "
-                      "Physical network:%(physnet)s, "
-                      "segmentation_id:%(segmentation_id)s",
-                      {'network_id': network_id,
-                       'physnet': physical_network,
-                       'segmentation_id': segmentation_id})
+        LOG.debug("No dynamic segment found for "
+                  "Network:%(network_id)s, "
+                  "Physical network:%(physnet)s, "
+                  "segmentation_id:%(segmentation_id)s",
+                  {'network_id': network_id,
+                   'physnet': physical_network,
+                   'segmentation_id': segmentation_id})
 
 
 def delete_network_segment(context, segment_id):
@@ -184,10 +184,9 @@ def min_max_actual_segments_in_range(context, network_type, physical_network,
         if segment_objs:
             return (segment_objs[0].segmentation_id,
                     segment_objs[-1].segmentation_id)
-        else:
-            LOG.debug("No existing segment found for "
-                      "Network type:%(network_type)s, "
-                      "Physical network:%(physical_network)s",
-                      {'network_type': network_type,
-                       'physical_network': physical_network})
-            return None, None
+        LOG.debug(
+            "No existing segment found for Network type:%(network_type)s, "
+            "Physical network:%(physical_network)s",
+            {'network_type': network_type,
+             'physical_network': physical_network})
+        return None, None

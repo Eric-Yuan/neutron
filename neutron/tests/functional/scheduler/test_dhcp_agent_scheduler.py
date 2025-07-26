@@ -27,6 +27,7 @@ from neutron.db import agentschedulers_db
 from neutron.objects import network
 from neutron.scheduler import dhcp_agent_scheduler
 from neutron.tests.common import helpers
+from neutron.tests.functional import base
 from neutron.tests.unit.plugins.ml2 import test_plugin
 from neutron.tests.unit.scheduler import (test_dhcp_agent_scheduler as
                                           test_dhcp_sch)
@@ -35,7 +36,7 @@ from neutron.tests.unit.scheduler import (test_dhcp_agent_scheduler as
 load_tests = testscenarios.load_tests_apply_scenarios
 
 
-class BaseTestScheduleNetwork(object):
+class BaseTestScheduleNetwork:
     """Base class which defines scenarios for schedulers.
 
         agent_count
@@ -105,7 +106,8 @@ class BaseTestScheduleNetwork(object):
 class TestChanceScheduleNetwork(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
                                 agentschedulers_db.DhcpAgentSchedulerDbMixin,
                                 agents_db.AgentDbMixin,
-                                BaseTestScheduleNetwork):
+                                BaseTestScheduleNetwork,
+                                base.BaseLoggingTestCase):
     """Test various scenarios for ChanceScheduler.schedule."""
 
     def test_schedule_network(self):
@@ -142,7 +144,8 @@ class TestChanceScheduleNetwork(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
 class TestWeightScheduleNetwork(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
                                 agentschedulers_db.DhcpAgentSchedulerDbMixin,
                                 agents_db.AgentDbMixin,
-                                BaseTestScheduleNetwork):
+                                BaseTestScheduleNetwork,
+                                base.BaseLoggingTestCase):
     """Test various scenarios for WeightScheduler.schedule."""
 
     def test_weight_schedule_network(self):
@@ -171,7 +174,7 @@ class TestWeightScheduleNetwork(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
             sorted_unscheduled_active_agents = sorted(
                 unscheduled_active_agents,
                 key=attrgetter('load'))[0:self.expected_scheduled_agent_count]
-            self.assertItemsEqual(
+            self.assertCountEqual(
                 (agent['id'] for agent in actual_scheduled_agents),
                 (agent['id'] for agent in sorted_unscheduled_active_agents))
             self.assertEqual(self.expected_scheduled_agent_count,
@@ -187,7 +190,8 @@ class TestWeightScheduleNetwork(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
 
 class TestAutoSchedule(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
                        agentschedulers_db.DhcpAgentSchedulerDbMixin,
-                       agents_db.AgentDbMixin):
+                       agents_db.AgentDbMixin,
+                       base.BaseLoggingTestCase):
     """Test various scenarios for ChanceScheduler.auto_schedule_networks.
 
         Below is the brief description of the scenario variables
@@ -348,7 +352,7 @@ class TestAutoSchedule(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
         subnets = []
         for net in self._networks:
             enable_dhcp = (net['name'] not in
-              self.networks_with_dhcp_disabled)
+                           self.networks_with_dhcp_disabled)
             subnets.append({'network_id': net.id,
                             'enable_dhcp': enable_dhcp,
                             'segment_id': None})
@@ -382,8 +386,8 @@ class TestAutoSchedule(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
                 name='network-%s' % i)
             for i in range(self.network_count)
         ]
-        for i in range(len(self._networks)):
-            self._networks[i].create()
+        for net in self._networks:
+            net.create()
         network_ids = [net.id for net in self._networks]
 
         # pre schedule the networks to the agents defined in
@@ -409,13 +413,14 @@ class TestAutoSchedule(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
                 network.Network.get_objects(self.ctx, id=hosted_net_ids)]
             expected_hosted_networks = self.expected_hosted_networks[
                 'agent-%s' % host_index]
-            self.assertItemsEqual(
+            self.assertCountEqual(
                 hosted_net_names, expected_hosted_networks, msg)
 
 
 class TestAZAwareWeightScheduler(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
                                  agentschedulers_db.DhcpAgentSchedulerDbMixin,
-                                 agents_db.AgentDbMixin):
+                                 agents_db.AgentDbMixin,
+                                 base.BaseLoggingTestCase):
     """Test various scenarios for AZAwareWeightScheduler.schedule.
 
         az_count
@@ -519,7 +524,7 @@ class TestAZAwareWeightScheduler(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
         # create dhcp agents
         for i in range(self.az_count):
             az = 'az%s' % i
-            hosts = ['%s-host-%s' % (az, j)
+            hosts = [f'{az}-host-{j}'
                      for j in range(self.agent_count[i])]
             dhcp_agents = self._create_and_set_agents_down(
                 hosts, down_agent_count=self.down_agent_count[i], az=az)
@@ -554,7 +559,8 @@ class TestAZAwareWeightScheduler(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
 
 
 class TestDHCPSchedulerWithNetworkAccessibility(
-        test_plugin.Ml2PluginV2TestCase):
+        test_plugin.Ml2PluginV2TestCase,
+        base.BaseLoggingTestCase):
 
     _mechanism_drivers = ['openvswitch']
 

@@ -18,6 +18,7 @@ from unittest import mock
 
 from neutron_lib import constants
 from neutron_lib import context as neutron_context
+from neutron_lib.plugins.ml2 import ovs_constants as ovs_consts
 from oslo_config import cfg
 from oslo_log import log as logging
 import testscenarios
@@ -25,8 +26,6 @@ import testscenarios
 from neutron.objects.logapi import logging_resource as log_object
 from neutron.plugins.ml2.drivers.openvswitch.agent import (
     ovs_agent_extension_api as ovs_ext_api)
-from neutron.plugins.ml2.drivers.openvswitch.agent.common import (
-    constants as ovs_consts)
 from neutron.services.logapi.drivers.openvswitch import (
     ovs_firewall_log as ovs_fw_log)
 from neutron.tests.functional.agent import test_firewall
@@ -50,7 +49,7 @@ FAKE_LOG_OBJECT = log_object.Log(**log_object_dict)
 class LoggingExtensionTestFramework(test_firewall.BaseFirewallTestCase):
 
     def setUp(self):
-        super(LoggingExtensionTestFramework, self).setUp()
+        super().setUp()
         cfg.CONF.set_override('extensions', ['log'], group='agent')
         self.context = neutron_context.get_admin_context_without_session()
         self._set_resource_rpc_mock()
@@ -101,7 +100,7 @@ class TestLoggingExtension(LoggingExtensionTestFramework):
     def _is_log_flow_set(self, table, actions):
         flows = self.log_driver.int_br.br.dump_flows_for_table(table)
         pattern = re.compile(
-            r"^.* table=%s.* actions=%s" % (table, actions)
+            fr"^.* table={table}.* actions={actions}"
         )
         for flow in flows.splitlines():
             if pattern.match(flow.strip()):

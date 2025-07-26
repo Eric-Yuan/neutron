@@ -10,10 +10,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import functools
+
 from neutron_lib.db import api as db_api
 from oslo_config import cfg
 from oslo_log import log
-import six
 
 from neutron._i18n import _
 from neutron.quota import resource
@@ -89,7 +90,7 @@ def mark_resources_dirty(f):
     of the decorated function.
     """
 
-    @six.wraps(f)
+    @functools.wraps(f)
     def wrapper(_self, context, *args, **kwargs):
         ret_val = f(_self, context, *args, **kwargs)
         set_resources_dirty(context)
@@ -98,7 +99,7 @@ def mark_resources_dirty(f):
     return wrapper
 
 
-class tracked_resources(object):
+class tracked_resources:
     """Decorator for specifying resources for which usage should be tracked.
 
     A plugin class can use this decorator to specify for which resources
@@ -112,7 +113,7 @@ class tracked_resources(object):
 
     def __call__(self, f):
 
-        @six.wraps(f)
+        @functools.wraps(f)
         def wrapper(*args, **kwargs):
             registry = ResourceRegistry.get_instance()
             for resource_name in self._tracked_resources:
@@ -125,7 +126,7 @@ class tracked_resources(object):
         return wrapper
 
 
-class ResourceRegistry(object):
+class ResourceRegistry:
     """Registry for resource subject to quota limits.
 
     This class keeps track of Neutron resources for which quota limits are
@@ -172,13 +173,11 @@ class ResourceRegistry(object):
             return resource.CountableResource(
                 resource_name, resource._count_resource,
                 'quota_%s' % resource_name)
-        else:
-            LOG.info("Creating instance of TrackedResource for "
-                     "resource:%s", resource_name)
-            return resource.TrackedResource(
-                resource_name,
-                self._tracked_resource_mappings[resource_name],
-                'quota_%s' % resource_name)
+        LOG.info("Creating instance of TrackedResource for resource:%s",
+                 resource_name)
+        return resource.TrackedResource(
+            resource_name, self._tracked_resource_mappings[resource_name],
+            'quota_%s' % resource_name)
 
     def set_tracked_resource(self, resource_name, model_class, override=False):
         # Do not do anything if tracking is disabled by config

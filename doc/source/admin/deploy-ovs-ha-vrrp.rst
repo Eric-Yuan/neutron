@@ -27,7 +27,7 @@ Architecture
    :alt: High-availability using VRRP with Linux bridge - overview
 
 The following figure shows components and connectivity for one self-service
-network and one untagged (flat) network. The master router resides on network
+network and one untagged (flat) network. The primary router resides on network
 node 1. In this particular case, the instance resides on the same compute
 node as the DHCP agent for the network. If the DHCP agent resides on another
 compute node, the latter only contains a DHCP namespace and Linux bridge
@@ -113,13 +113,6 @@ Network node 2
    Replace ``OVERLAY_INTERFACE_IP_ADDRESS`` with the IP address of the
    interface that handles VXLAN overlays for self-service networks.
 
-#. In the ``l3_agent.ini`` file, configure the layer-3 agent.
-
-   .. code-block:: ini
-
-      [DEFAULT]
-      interface_driver = openvswitch
-
 #. Start the following services:
 
    * Open vSwitch agent
@@ -178,6 +171,6 @@ Network traffic flow
 ~~~~~~~~~~~~~~~~~~~~
 
 This high-availability mechanism simply augments :ref:`deploy-ovs-selfservice`
-with failover of layer-3 services to another router if the master router
+with failover of layer-3 services to another router if the primary router
 fails. Thus, you can reference :ref:`Self-service network traffic flow
 <deploy-ovs-selfservice-networktrafficflow>` for normal operation.

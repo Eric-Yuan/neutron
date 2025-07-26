@@ -10,6 +10,8 @@
 #  License for the specific language governing permissions and limitations
 #  under the License.
 
+from neutron_lib import policy as neutron_policy
+from oslo_log import versionutils
 from oslo_policy import policy
 
 from neutron.conf.policies import base
@@ -17,29 +19,44 @@ from neutron.conf.policies import base
 
 RESOURCE_PATH = '/auto-allocated-topology/{project_id}'
 
+DEPRECATION_REASON = (
+    "The Auto allocated topology API now supports system scope "
+    "and default roles.")
 
 rules = [
     policy.DocumentedRuleDefault(
-        'get_auto_allocated_topology',
-        base.RULE_ADMIN_OR_OWNER,
-        "Get a project's auto-allocated topology",
-        [
+        name='get_auto_allocated_topology',
+        check_str=base.ADMIN_OR_PROJECT_READER,
+        description="Get a project's auto-allocated topology",
+        operations=[
             {
                 'method': 'GET',
                 'path': RESOURCE_PATH,
             },
-        ]
+        ],
+        scope_types=['project'],
+        deprecated_rule=policy.DeprecatedRule(
+            name='get_auto_allocated_topology',
+            check_str=neutron_policy.RULE_ADMIN_OR_OWNER,
+            deprecated_reason=DEPRECATION_REASON,
+            deprecated_since=versionutils.deprecated.WALLABY)
     ),
     policy.DocumentedRuleDefault(
-        'delete_auto_allocated_topology',
-        base.RULE_ADMIN_OR_OWNER,
-        "Delete a project's auto-allocated topology",
-        [
+        name='delete_auto_allocated_topology',
+        check_str=base.ADMIN_OR_PROJECT_MEMBER,
+        description="Delete a project's auto-allocated topology",
+        operations=[
             {
                 'method': 'DELETE',
                 'path': RESOURCE_PATH,
             },
-        ]
+        ],
+        scope_types=['project'],
+        deprecated_rule=policy.DeprecatedRule(
+            name='delete_auto_allocated_topology',
+            check_str=neutron_policy.RULE_ADMIN_OR_OWNER,
+            deprecated_reason=DEPRECATION_REASON,
+            deprecated_since=versionutils.deprecated.WALLABY)
     ),
 ]
 

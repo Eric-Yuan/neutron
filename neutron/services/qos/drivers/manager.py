@@ -35,7 +35,7 @@ SKIPPED_VIF_TYPES = [
 ]
 
 
-class QosServiceDriverManager(object):
+class QosServiceDriverManager:
 
     def __init__(self):
         self._drivers = []
@@ -154,15 +154,33 @@ class QosServiceDriverManager(object):
 
         return False
 
-    @property
-    def supported_rule_types(self):
+    def validate_rule_for_network(self, context, rule, network_id):
+        for driver in self._drivers:
+            if (driver.is_rule_supported(rule) and
+                    driver.validate_rule_for_network(context, rule,
+                                                     network_id)):
+                return True
+
+        return False
+
+    def supported_rule_types(self, all_supported=None, all_rules=None):
+        rule_types = set(qos_consts.VALID_RULE_TYPES)
+        if all_rules:
+            LOG.debug('All supported QoS rule types: %s', rule_types)
+            return rule_types
+
         if not self._drivers:
             return []
 
-        rule_types = set(qos_consts.VALID_RULE_TYPES)
-
         # Recalculate on every call to allow drivers determine supported rule
         # types dynamically
+        if all_supported:
+            rule_types = set.union(*[set(driver.supported_rules) for driver in
+                                     self._drivers])
+            LOG.debug('All QoS rule types supported by at least one loaded '
+                      'driver: %s', rule_types)
+            return rule_types
+
         for driver in self._drivers:
             new_rule_types = rule_types & set(driver.supported_rules)
             dropped_rule_types = rule_types - new_rule_types

@@ -19,6 +19,7 @@ import sys
 from unittest import mock
 
 from neutron_lib.agent import topics
+from neutron_lib import constants
 from neutron_lib.utils import helpers
 from oslo_config import cfg
 from oslo_service import service
@@ -39,7 +40,7 @@ NETWORK_SEGMENT_FLAT = amb.NetworkSegment('flat', 'physnet1', None)
 
 class TestMacvtapRPCCallbacks(base.BaseTestCase):
     def setUp(self):
-        super(TestMacvtapRPCCallbacks, self).setUp()
+        super().setUp()
 
         agent = mock.Mock()
         agent.mgr = mock.Mock()
@@ -67,12 +68,12 @@ class TestMacvtapRPCCallbacks(base.BaseTestCase):
     def test_port_update(self):
         port = {'id': 'port-id123', 'mac_address': 'mac1'}
         self.rpc.port_update(context=None, port=port)
-        self.assertEqual(set(['mac1']), self.rpc.updated_devices)
+        self.assertEqual({'mac1'}, self.rpc.updated_devices)
 
 
 class TestMacvtapManager(base.BaseTestCase):
     def setUp(self):
-        super(TestMacvtapManager, self).setUp()
+        super().setUp()
         with mock.patch.object(ip_lib, 'device_exists', return_value=True):
             self.mgr = macvtap_neutron_agent.MacvtapManager(INTERFACE_MAPPINGS)
 
@@ -123,7 +124,7 @@ class TestMacvtapManager(base.BaseTestCase):
 
             result = self.mgr.get_all_devices()
             mock_ld.assert_called_once_with(macvtap_neutron_agent.MACVTAP_FS)
-            self.assertEqual(set(['mac0', 'mac1']), result)
+            self.assertEqual({'mac0', 'mac1'}, result)
             self.assertEqual({'mac0': 'macvtap0', 'mac1': 'macvtap1'},
                              self.mgr.mac_device_name_mappings)
 
@@ -252,7 +253,7 @@ class TestMacvtapMain(base.BaseTestCase):
             self.assertTrue(mock_pim.called)
             mock_manager.assert_called_with(INTERFACE_MAPPINGS)
             mock_loop.assert_called_with(mock_manager_return, 2, 1,
-                                         'Macvtap agent',
-                                         'neutron-macvtap-agent')
+                                         constants.AGENT_TYPE_MACVTAP,
+                                         constants.AGENT_PROCESS_MACVTAP)
             self.assertTrue(mock_launch.called)
             self.assertTrue(mock_launch_return.wait.called)
